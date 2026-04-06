@@ -3,6 +3,7 @@ __pycache__/
 .vscode
 output
 build
+**/build/
 diff_rasterization/diff_rast.egg-info
 diff_rasterization/dist
 tensorboard_3d
@@ -12,3 +13,10 @@ test_camera.py
 *.pth
 *.npy
 *.so
+*.pyd
+*.o
+*.obj
+*.a
+*.lib
+*.exp
+*.whl
