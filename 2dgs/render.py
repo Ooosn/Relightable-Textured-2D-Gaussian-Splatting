@@ -47,7 +47,20 @@ if __name__ == "__main__":
 
 
     dataset, iteration, pipe = model.extract(args), args.iteration, pipeline.extract(args)
-    gaussians = GaussianModel(dataset.sh_degree)
+    gaussians = GaussianModel(
+        dataset.sh_degree,
+        dataset.use_textures,
+        dataset.texture_resolution,
+        dataset.use_mbrdf,
+        dataset.basis_asg_num,
+        dataset.phasefunc_hidden_size,
+        dataset.phasefunc_hidden_layers,
+        dataset.phasefunc_frequency,
+        dataset.neural_material_size,
+        dataset.asg_channel_num,
+        dataset.asg_mlp,
+        dataset.asg_alpha_num,
+    )
     scene = Scene(dataset, gaussians, load_iteration=iteration, shuffle=False)
     bg_color = [1,1,1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")

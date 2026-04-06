@@ -75,16 +75,16 @@ class Scene:
             self.test_cameras[resolution_scale] = cameraList_from_camInfos(scene_info.test_cameras, resolution_scale, args)
         
         if self.loaded_iter:
-            self.gaussians.load_ply(os.path.join(self.model_path,
-                                                           "point_cloud",
-                                                           "iteration_" + str(self.loaded_iter),
-                                                           "point_cloud.ply"))
+            iteration_path = os.path.join(self.model_path, "point_cloud", "iteration_" + str(self.loaded_iter))
+            self.gaussians.load_ply(os.path.join(iteration_path, "point_cloud.ply"))
+            self.gaussians.load_appearance(os.path.join(iteration_path, "appearance.pt"))
         else:
             self.gaussians.create_from_pcd(scene_info.point_cloud, self.cameras_extent)
 
     def save(self, iteration):
         point_cloud_path = os.path.join(self.model_path, "point_cloud/iteration_{}".format(iteration))
         self.gaussians.save_ply(os.path.join(point_cloud_path, "point_cloud.ply"))
+        self.gaussians.save_appearance(os.path.join(point_cloud_path, "appearance.pt"))
 
     def getTrainCameras(self, scale=1.0):
         return self.train_cameras[scale]

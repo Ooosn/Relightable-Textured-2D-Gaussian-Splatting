@@ -34,6 +34,8 @@ class CameraInfo(NamedTuple):
     image_name: str
     width: int
     height: int
+    pl_pos: np.array = None
+    pl_intensity: np.array = None
 
 class SceneInfo(NamedTuple):
     point_cloud: BasicPointCloud
@@ -181,11 +183,21 @@ def readCamerasFromTransforms(path, transformsfile, white_background, extension=
 
     with open(os.path.join(path, transformsfile)) as json_file:
         contents = json.load(json_file)
-        fovx = contents["camera_angle_x"]
+        dataset_has_fov = "camera_angle_x" in contents
+        if dataset_has_fov:
+            fovx = contents["camera_angle_x"]
+            cx_0 = cy_0 = fx_0 = fy_0 = None
+        else:
+            cx_0, cy_0, fx_0, fy_0 = contents["camera_intrinsics"]
 
         frames = contents["frames"]
         for idx, frame in enumerate(frames):
-            cam_name = os.path.join(path, frame["file_path"] + extension)
+            file_ext = frame.get("file_ext", extension)
+            file_path = frame["file_path"]
+            if file_path.endswith((".png", ".jpg", ".jpeg", ".exr")):
+                cam_name = os.path.join(path, file_path)
+            else:
+                cam_name = os.path.join(path, file_path + file_ext)
 
             # NeRF 'transform_matrix' is a camera-to-world transform
             c2w = np.array(frame["transform_matrix"])
@@ -209,12 +221,22 @@ def readCamerasFromTransforms(path, transformsfile, white_background, extension=
             arr = norm_data[:,:,:3] * norm_data[:, :, 3:4] + bg * (1 - norm_data[:, :, 3:4])
             image = Image.fromarray(np.array(arr*255.0, dtype=np.byte), "RGB")
 
-            fovy = focal2fov(fov2focal(fovx, image.size[0]), image.size[1])
-            FovY = fovy 
-            FovX = fovx
+            if "camera_intrinsics" in frame:
+                cx, cy, fx, fy = frame["camera_intrinsics"]
+            else:
+                cx, cy, fx, fy = cx_0, cy_0, fx_0, fy_0
+
+            if dataset_has_fov:
+                fovy = focal2fov(fov2focal(fovx, image.size[0]), image.size[1])
+                FovY = fovy 
+                FovX = fovx
+            else:
+                FovY = focal2fov(fy, image.size[1])
+                FovX = focal2fov(fx, image.size[0])
 
             cam_infos.append(CameraInfo(uid=idx, R=R, T=T, FovY=FovY, FovX=FovX, image=image,
-                            image_path=image_path, image_name=image_name, width=image.size[0], height=image.size[1]))
+                            image_path=image_path, image_name=image_name, width=image.size[0], height=image.size[1],
+                            pl_pos=frame.get("pl_pos"), pl_intensity=frame.get("pl_intensity")))
             
     return cam_infos
 

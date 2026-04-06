@@ -31,7 +31,20 @@ except ImportError:
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint):
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset)
-    gaussians = GaussianModel(dataset.sh_degree)
+    gaussians = GaussianModel(
+        dataset.sh_degree,
+        dataset.use_textures,
+        dataset.texture_resolution,
+        dataset.use_mbrdf,
+        dataset.basis_asg_num,
+        dataset.phasefunc_hidden_size,
+        dataset.phasefunc_hidden_layers,
+        dataset.phasefunc_frequency,
+        dataset.neural_material_size,
+        dataset.asg_channel_num,
+        dataset.asg_mlp,
+        dataset.asg_alpha_num,
+    )
     scene = Scene(dataset, gaussians)
     gaussians.training_setup(opt)
     if checkpoint:

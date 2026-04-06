@@ -47,6 +47,17 @@ class ParamGroup:
 class ModelParams(ParamGroup): 
     def __init__(self, parser, sentinel=False):
         self.sh_degree = 3
+        self.use_textures = False
+        self.texture_resolution = 4
+        self.use_mbrdf = False
+        self.basis_asg_num = 8
+        self.phasefunc_hidden_size = 32
+        self.phasefunc_hidden_layers = 3
+        self.phasefunc_frequency = 4
+        self.neural_material_size = 6
+        self.asg_channel_num = 1
+        self.asg_mlp = False
+        self.asg_alpha_num = 1
         self._source_path = ""
         self._model_path = ""
         self._images = "images"
@@ -68,6 +79,10 @@ class PipelineParams(ParamGroup):
         self.compute_cov3D_python = False
         self.depth_ratio = 0.0
         self.debug = False
+        self.shadow_pass = False
+        self.shadow_offset = 0.15
+        self.shadow_light_scale = 10.0
+        self.shadow_resolution_scale = 1.0
         super().__init__(parser, "Pipeline Parameters")
 
 class OptimizationParams(ParamGroup):
@@ -78,9 +93,24 @@ class OptimizationParams(ParamGroup):
         self.position_lr_delay_mult = 0.01
         self.position_lr_max_steps = 30_000
         self.feature_lr = 0.0025
+        self.texture_lr = 0.0025
         self.opacity_lr = 0.05
         self.scaling_lr = 0.005
         self.rotation_lr = 0.001
+        self.kd_lr = 0.01
+        self.ks_lr = 0.01
+        self.asg_lr_init = 0.01
+        self.asg_lr_final = 0.0001
+        self.asg_lr_delay_mult = 0.01
+        self.asg_lr_max_steps = 50_000
+        self.local_q_lr_init = 0.01
+        self.local_q_lr_final = 0.0001
+        self.local_q_lr_delay_mult = 0.01
+        self.local_q_lr_max_steps = 50_000
+        self.neural_phasefunc_lr_init = 0.001
+        self.neural_phasefunc_lr_final = 0.00001
+        self.neural_phasefunc_lr_delay_mult = 0.01
+        self.neural_phasefunc_lr_max_steps = 50_000
         self.percent_dense = 0.01
         self.lambda_dssim = 0.2
         self.lambda_dist = 0.0

@@ -16,6 +16,14 @@ from utils.graphics_utils import fov2focal
 
 WARNED = False
 
+
+def _maybe_to_list(value):
+    if value is None:
+        return None
+    if hasattr(value, "detach"):
+        return value.detach().cpu().tolist()
+    return value
+
 def loadCam(args, id, cam_info, resolution_scale):
     orig_w, orig_h = cam_info.image.size
 
@@ -51,7 +59,11 @@ def loadCam(args, id, cam_info, resolution_scale):
     return Camera(colmap_id=cam_info.uid, R=cam_info.R, T=cam_info.T, 
                   FoVx=cam_info.FovX, FoVy=cam_info.FovY, 
                   image=gt_image, gt_alpha_mask=loaded_mask,
-                  image_name=cam_info.image_name, uid=id, data_device=args.data_device)
+                  image_name=cam_info.image_name, uid=id,
+                  pl_pos=getattr(cam_info, "pl_pos", None),
+                  pl_intensity=getattr(cam_info, "pl_intensity", None),
+                  image_path=getattr(cam_info, "image_path", None),
+                  data_device=args.data_device)
 
 def cameraList_from_camInfos(cam_infos, resolution_scale, args):
     camera_list = []
@@ -81,4 +93,8 @@ def camera_to_JSON(id, camera : Camera):
         'fy' : fov2focal(camera.FovY, camera.height),
         'fx' : fov2focal(camera.FovX, camera.width)
     }
+    if camera.pl_pos is not None:
+        camera_entry['pl_pos'] = _maybe_to_list(camera.pl_pos)
+    if camera.pl_intensity is not None:
+        camera_entry['pl_intensity'] = _maybe_to_list(camera.pl_intensity)
     return camera_entry

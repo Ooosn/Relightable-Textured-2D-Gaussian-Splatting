@@ -16,7 +16,8 @@ from utils.graphics_utils import getWorld2View2, getProjectionMatrix
 
 class Camera(nn.Module):
     def __init__(self, colmap_id, R, T, FoVx, FoVy, image, gt_alpha_mask,
-                 image_name, uid,
+                 image_name, uid, pl_pos=None, pl_intensity=None,
+                 image_path=None,
                  trans=np.array([0.0, 0.0, 0.0]), scale=1.0, data_device = "cuda"
                  ):
         super(Camera, self).__init__()
@@ -28,6 +29,9 @@ class Camera(nn.Module):
         self.FoVx = FoVx
         self.FoVy = FoVy
         self.image_name = image_name
+        self.image_path = image_path
+        self.pl_pos = torch.tensor(pl_pos, device=data_device).float() if pl_pos is not None else None
+        self.pl_intensity = torch.tensor(pl_intensity, device=data_device).float() if pl_intensity is not None else None
 
         try:
             self.data_device = torch.device(data_device)
@@ -39,6 +43,8 @@ class Camera(nn.Module):
         self.original_image = image.clamp(0.0, 1.0) # move to device at dataloader to reduce VRAM requirement
         self.image_width = self.original_image.shape[2]
         self.image_height = self.original_image.shape[1]
+        self.width = self.image_width
+        self.height = self.image_height
 
         if gt_alpha_mask is not None:
             # self.original_image *= gt_alpha_mask.to(self.data_device)
@@ -70,4 +76,3 @@ class MiniCam:
         self.full_proj_transform = full_proj_transform
         view_inv = torch.inverse(self.world_view_transform)
         self.camera_center = view_inv[3][:3]
-
