@@ -12,7 +12,9 @@
 import os
 import random
 import json
+import torch
 from utils.system_utils import searchForMaxIteration
+from utils.general_utils import get_expon_lr_func
 from scene.dataset_readers import sceneLoadTypeCallbacks
 from scene.gaussian_model import GaussianModel
 from arguments import ModelParams
@@ -22,7 +24,7 @@ class Scene:
 
     gaussians : GaussianModel
 
-    def __init__(self, args : ModelParams, gaussians : GaussianModel, load_iteration=None, shuffle=True, resolution_scales=[1.0]):
+    def __init__(self, args : ModelParams, gaussians : GaussianModel, load_iteration=None, shuffle=True, resolution_scales=[1.0], opt=None):
         """b
         :param path: Path to colmap scene main folder.
         """
@@ -44,7 +46,8 @@ class Scene:
             scene_info = sceneLoadTypeCallbacks["Colmap"](args.source_path, args.images, args.eval)
         elif os.path.exists(os.path.join(args.source_path, "transforms_train.json")):
             print("Found transforms_train.json file, assuming Blender data set!")
-            scene_info = sceneLoadTypeCallbacks["Blender"](args.source_path, args.white_background, args.eval)
+            view_num = getattr(args, "view_num", -1)
+            scene_info = sceneLoadTypeCallbacks["Blender"](args.source_path, args.white_background, args.eval, view_num)
         else:
             assert False, "Could not recognize scene type!"
 
@@ -80,6 +83,54 @@ class Scene:
             self.gaussians.load_appearance(os.path.join(iteration_path, "appearance.pt"))
         else:
             self.gaussians.create_from_pcd(scene_info.point_cloud, self.cameras_extent)
+
+        # ── Camera & light pose optimizer ────────────────────────────────────
+        self.cam_opt = getattr(args, "cam_opt", False)
+        self.pl_opt  = getattr(args, "pl_opt",  False)
+        self.pose_optimizer = None
+
+        if (self.cam_opt or self.pl_opt) and opt is not None:
+            self.cam_scheduler_args = get_expon_lr_func(
+                lr_init=opt.opt_cam_lr_init,
+                lr_final=opt.opt_cam_lr_final,
+                lr_delay_steps=opt.opt_cam_lr_delay_step,
+                lr_delay_mult=opt.opt_cam_lr_delay_mult,
+                max_steps=opt.opt_cam_lr_max_steps,
+            )
+            self.pl_scheduler_args = get_expon_lr_func(
+                lr_init=opt.opt_pl_lr_init,
+                lr_final=opt.opt_pl_lr_final,
+                lr_delay_steps=opt.opt_pl_lr_delay_step,
+                lr_delay_mult=opt.opt_pl_lr_delay_mult,
+                max_steps=opt.opt_pl_lr_max_steps,
+            )
+            cam_params, pl_params = [], []
+            for scale in resolution_scales:
+                for cam in self.train_cameras[scale]:
+                    cam_params.append(cam.cam_pose_adj)
+                    pl_params.append(cam.pl_adj)
+                for cam in self.test_cameras[scale]:
+                    cam_params.append(cam.cam_pose_adj)
+                    pl_params.append(cam.pl_adj)
+            self.pose_optimizer = torch.optim.Adam(
+                [
+                    {"params": cam_params, "lr": 0.0, "name": "cam_adj"},
+                    {"params": pl_params,  "lr": 0.0, "name": "pl_adj"},
+                ],
+                lr=0, eps=1e-15,
+            )
+
+    def update_lr(self, iteration, opt):
+        """Unfreeze and update learning rates for camera/light optimizers."""
+        if self.pose_optimizer is None:
+            return
+        for pg in self.pose_optimizer.param_groups:
+            if pg["name"] == "cam_adj":
+                pg["lr"] = 0.0 if (not self.cam_opt or iteration < opt.train_cam_freeze_step) \
+                           else self.cam_scheduler_args(iteration)
+            elif pg["name"] == "pl_adj":
+                pg["lr"] = 0.0 if (not self.pl_opt or iteration < opt.train_pl_freeze_step) \
+                           else self.pl_scheduler_args(iteration)
 
     def save(self, iteration):
         point_cloud_path = os.path.join(self.model_path, "point_cloud/iteration_{}".format(iteration))

@@ -45,7 +45,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         dataset.asg_mlp,
         dataset.asg_alpha_num,
     )
-    scene = Scene(dataset, gaussians)
+    scene = Scene(dataset, gaussians, opt=opt)
     gaussians.training_setup(opt)
     if checkpoint:
         (model_params, first_iter) = torch.load(checkpoint)
@@ -62,6 +62,23 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     ema_dist_for_log = 0.0
     ema_normal_for_log = 0.0
 
+    # ── Multi-phase training schedule (mirrors gs3) ──────────────────────────
+    # Retrieve phase thresholds (with safe defaults for models that don't use mBRDF)
+    unfreeze_iter   = getattr(opt, "unfreeze_iterations", 5000)
+    spcular_freeze  = getattr(opt, "spcular_freeze_step", 9000)
+    fit_linear      = getattr(opt, "fit_linear_step", 7000)
+    asg_freeze      = getattr(opt, "asg_freeze_step", 22000)
+    use_mbrdf       = getattr(dataset, "use_mbrdf", False)
+
+    if use_mbrdf and gaussians.neural_phasefunc is not None:
+        if first_iter < unfreeze_iter:
+            gaussians.neural_phasefunc.freeze()
+        elif first_iter < spcular_freeze + fit_linear:
+            gaussians.neural_phasefunc.freeze()
+        else:
+            gaussians.neural_phasefunc.unfreeze()
+    asg_freezed = True
+
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
     for iteration in range(first_iter, opt.iterations + 1):        
@@ -69,6 +86,57 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         iter_start.record()
 
         gaussians.update_learning_rate(iteration)
+
+        # ── Camera / light pose optimization ──────────────────────────────────
+        scene.update_lr(iteration, opt)
+
+        # ── Phase control ─────────────────────────────────────────────────────
+        if use_mbrdf and gaussians.neural_phasefunc is not None:
+            if iteration == unfreeze_iter:
+                gaussians.neural_phasefunc.unfreeze()
+                print(f"\n[ITER {iteration}] Phase 1: unfreeze neural_phasefunc, shadow ON")
+            elif iteration == spcular_freeze:
+                gaussians.neural_phasefunc.freeze()
+                if hasattr(gaussians, "neural_material"):
+                    gaussians.neural_material.requires_grad_(False)
+                print(f"\n[ITER {iteration}] Phase 2: re-freeze phasefunc, diffuse-only fit")
+            elif iteration == spcular_freeze + fit_linear:
+                gaussians.neural_phasefunc.unfreeze()
+                if hasattr(gaussians, "neural_material"):
+                    gaussians.neural_material.requires_grad_(True)
+                print(f"\n[ITER {iteration}] Phase 3: unfreeze phasefunc + specular ks")
+
+        if use_mbrdf and gaussians.asg_func is not None:
+            if iteration <= asg_freeze:
+                gaussians.asg_func.asg_scales.requires_grad_(False)
+                gaussians.asg_func.asg_rotation.requires_grad_(False)
+            elif asg_freezed:
+                asg_freezed = False
+                gaussians.asg_func.asg_scales.requires_grad_(True)
+                gaussians.asg_func.asg_rotation.requires_grad_(True)
+                print(f"\n[ITER {iteration}] Phase 4: unfreeze ASG anisotropic params")
+
+        # Determine render flags for this phase, mirroring gs3 exactly:
+        #  Phase 0 (0 → unfreeze):                   kd flat,  no shadow  (geometry warmup)
+        #  Phase 1 (unfreeze → spcular_freeze):       kd*decay, shadow ON  (phasefunc learns shadow)
+        #  Phase 2 (spcular_freeze → +fit_linear):    kd*decay, shadow ON  (phasefunc frozen, kd fit)
+        #  Phase 3 (spcular_freeze+fit_linear → asg): full BRDF*decay, shadow ON
+        #  Phase 4 (asg_freeze → ):                   full BRDF*decay + ASG aniso
+        if not use_mbrdf:
+            fix_lambert  = False
+            apply_shadow = False
+        elif iteration <= unfreeze_iter:
+            # Phase 0: geometry warmup, pure kd, no phasefunc cost
+            fix_lambert  = True
+            apply_shadow = False
+        elif iteration <= spcular_freeze + fit_linear:
+            # Phase 1 & 2: kd * phasefunc_decay (specular OFF, shadow ON)
+            fix_lambert  = True
+            apply_shadow = True
+        else:
+            # Phase 3 & 4: full BRDF * decay
+            fix_lambert  = False
+            apply_shadow = True
 
         # Every 1000 its we increase the levels of SH up to a maximum degree
         if iteration % 1000 == 0:
@@ -78,8 +146,13 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         if not viewpoint_stack:
             viewpoint_stack = scene.getTrainCameras().copy()
         viewpoint_cam = viewpoint_stack.pop(randint(0, len(viewpoint_stack)-1))
-        
-        render_pkg = render(viewpoint_cam, gaussians, pipe, background)
+
+        # Apply learned pose / light adjustment before rendering
+        if scene.pose_optimizer is not None:
+            viewpoint_cam.update()
+
+        render_pkg = render(viewpoint_cam, gaussians, pipe, background,
+                            fix_lambert=fix_lambert, apply_shadow=apply_shadow)
         image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
         
         gt_image = viewpoint_cam.original_image.cuda()
@@ -97,10 +170,19 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         normal_loss = lambda_normal * (normal_error).mean()
         dist_loss = lambda_dist * (rend_dist).mean()
 
-        # loss
-        total_loss = loss + dist_loss + normal_loss
-        
+        # Camera / light pose regularization
+        if scene.pose_optimizer is not None:
+            pose_reg = viewpoint_cam.get_loss()
+            total_loss = loss + dist_loss + normal_loss + pose_reg
+        else:
+            total_loss = loss + dist_loss + normal_loss
+
         total_loss.backward()
+
+        # Step pose optimizer (camera + light)
+        if scene.pose_optimizer is not None:
+            scene.pose_optimizer.step()
+            scene.pose_optimizer.zero_grad(set_to_none=True)
 
         iter_end.record()
 

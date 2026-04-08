@@ -48,6 +48,8 @@ class ModelParams(ParamGroup):
     def __init__(self, parser, sentinel=False):
         self.sh_degree = 3
         self.use_textures = False
+        self.cam_opt = False
+        self.pl_opt = False
         self.texture_resolution = 4
         self.use_mbrdf = False
         self.basis_asg_num = 8
@@ -65,6 +67,7 @@ class ModelParams(ParamGroup):
         self._white_background = False
         self.data_device = "cuda"
         self.eval = False
+        self.view_num = -1
         self.render_items = ['RGB', 'Alpha', 'Normal', 'Depth', 'Edge', 'Curvature']
         super().__init__(parser, "Loading Parameters", sentinel)
 
@@ -111,6 +114,21 @@ class OptimizationParams(ParamGroup):
         self.neural_phasefunc_lr_final = 0.00001
         self.neural_phasefunc_lr_delay_mult = 0.01
         self.neural_phasefunc_lr_max_steps = 50_000
+        # Camera & light pose optimization (mirroring gs3)
+        self.opt_cam_lr_init = 1e-4
+        self.opt_cam_lr_final = 1e-6
+        self.opt_cam_lr_delay_step = 0
+        self.opt_cam_lr_delay_mult = 1.0
+        self.opt_cam_lr_max_steps = 30_000
+        self.train_cam_freeze_step = 5_000
+
+        self.opt_pl_lr_init = 1e-3
+        self.opt_pl_lr_final = 1e-5
+        self.opt_pl_lr_delay_step = 0
+        self.opt_pl_lr_delay_mult = 1.0
+        self.opt_pl_lr_max_steps = 30_000
+        self.train_pl_freeze_step = 15_000
+
         self.percent_dense = 0.01
         self.lambda_dssim = 0.2
         self.lambda_dist = 0.0
@@ -122,6 +140,12 @@ class OptimizationParams(ParamGroup):
         self.densify_from_iter = 500
         self.densify_until_iter = 15_000
         self.densify_grad_threshold = 0.0002
+
+        # Multi-phase training schedule (mirrors gs3)
+        self.unfreeze_iterations = 5000
+        self.spcular_freeze_step = 9000
+        self.fit_linear_step = 7000
+        self.asg_freeze_step = 22000
         super().__init__(parser, "Optimization Parameters")
 
 def get_combined_args(parser : ArgumentParser):

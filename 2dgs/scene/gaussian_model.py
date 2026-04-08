@@ -335,7 +335,7 @@ class GaussianModel:
             tex_color = fused_color_rgb[:, :, None, None].repeat(1, 1, self.texture_resolution, self.texture_resolution)
             tex_alpha = torch.full(
                 (fused_point_cloud.shape[0], 1, self.texture_resolution, self.texture_resolution),
-                0.1,
+                1.0,
                 dtype=torch.float32,
                 device="cuda",
             )
@@ -546,9 +546,8 @@ class GaussianModel:
             return
 
         base_color = torch.clamp(SH2RGB(self._features_dc.detach().squeeze(1)), 1e-6, 1 - 1e-6)
-        base_alpha = torch.clamp(self.get_opacity.detach(), 1e-6, 1 - 1e-6)
         tex_color = base_color[:, :, None, None].repeat(1, 1, tex_res, tex_res)
-        tex_alpha = base_alpha[:, :, None, None].repeat(1, 1, tex_res, tex_res)
+        tex_alpha = torch.ones((num_points, 1, tex_res, tex_res), dtype=torch.float32, device="cuda")
         self._tex_color = nn.Parameter(inverse_sigmoid(tex_color).requires_grad_(True))
         self._tex_alpha = nn.Parameter(inverse_sigmoid(tex_alpha).requires_grad_(True))
 
@@ -598,18 +597,23 @@ class GaussianModel:
 
     def _prune_optimizer(self, mask):
         optimizable_tensors = {}
+        n_gaussians = mask.shape[0]
         for group in self.optimizer.param_groups:
             if len(group["params"]) != 1:
                 continue
-            stored_state = self.optimizer.state.get(group["params"][0], None)
+            param = group["params"][0]
+            # Skip global (non-per-Gaussian) parameters whose first dim != N
+            if param.shape[0] != n_gaussians:
+                continue
+            stored_state = self.optimizer.state.get(param, None)
             if stored_state is not None:
                 stored_state["exp_avg"] = stored_state["exp_avg"][mask]
                 stored_state["exp_avg_sq"] = stored_state["exp_avg_sq"][mask]
                 del self.optimizer.state[group["params"][0]]
-                group["params"][0] = nn.Parameter(group["params"][0][mask].requires_grad_(True))
+                group["params"][0] = nn.Parameter(param[mask].requires_grad_(True))
                 self.optimizer.state[group["params"][0]] = stored_state
             else:
-                group["params"][0] = nn.Parameter(group["params"][0][mask].requires_grad_(True))
+                group["params"][0] = nn.Parameter(param[mask].requires_grad_(True))
             optimizable_tensors[group["name"]] = group["params"][0]
         return optimizable_tensors
 
@@ -639,6 +643,10 @@ class GaussianModel:
         optimizable_tensors = {}
         for group in self.optimizer.param_groups:
             if len(group["params"]) != 1:
+                continue
+            if group["name"] not in tensors_dict:
+                # Global (non-per-Gaussian) parameters like asg_sigma, neural_phasefunc
+                # are not replicated during densification.
                 continue
             extension_tensor = tensors_dict[group["name"]]
             stored_state = self.optimizer.state.get(group["params"][0], None)
