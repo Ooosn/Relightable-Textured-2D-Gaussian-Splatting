@@ -1,45 +1,20 @@
 import math
-import os
-import sys
-
 import torch
+from typing import NamedTuple
 
-from utils.point_utils import depth_to_normal
-
-_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-_TEX_RAST_ROOT = os.path.join(_ROOT, "submodules", "diff-surfel-rasterization-texture")
-if os.path.isdir(_TEX_RAST_ROOT) and _TEX_RAST_ROOT not in sys.path:
-    sys.path.insert(0, _TEX_RAST_ROOT)
-
-from diff_surfel_rasterization_texture import (  # noqa: E402
-    GaussianRasterizationSettings,
-    GaussianRasterizer,
-)
+from surfel_texture import GaussianRasterizationSettings
+from surfel_texture import GaussianRasterizer
+from surfel_texture_deferred import GaussianRasterizer as GaussianRasterizer_deferred
 
 
-def render_textured(viewpoint_camera, pc, pipe, bg_color, scaling_modifier=1.0,
-                    override_color=None, shadow_pkg=None, mbrdf=None, deferred=False):
-    """Textured 2DGS render via diff-surfel-rasterization-texture.
+class TextureRenderInputs(NamedTuple):
+    mbrdf: dict
+    texture_color: torch.Tensor
+    enable_texture: bool
 
-    mbrdf dict keys: basecolor [N,3,R,R], shadow [N,R,R], other_effects [N,3]
 
-    Direct  (deferred=False):
-        final_tex = basecolor * shadow.unsqueeze(1) + other_effects[:,:,None,None]
-        → single textured rasterizer pass → 3-ch image
-
-    Deferred (deferred=True):
-        TODO: 7-channel CUDA kernel: concat [basecolor(3)+shadow(1)+other_effects(3)]
-        Python composition: out[:3] * out[3:4] + out[4:7]
-    """
-    from gaussian_renderer import _build_output_dict
-
-    means2D = torch.zeros_like(pc.get_xyz, requires_grad=True, device="cuda") + 0
-    try:
-        means2D.retain_grad()
-    except Exception:
-        pass
-
-    # ── Raster settings (uses textured module's own Settings class) ────────
+def _build_raster_settings(viewpoint_camera, pc, pipe, bg_color, scaling_modifier, enable_texture):
+    """Build GaussianRasterizationSettings + covariance tensors (shared by all paths)."""
     tanfovx = math.tan(viewpoint_camera.FoVx * 0.5)
     tanfovy = math.tan(viewpoint_camera.FoVy * 0.5)
     raster_settings = GaussianRasterizationSettings(
@@ -55,8 +30,8 @@ def render_textured(viewpoint_camera, pc, pipe, bg_color, scaling_modifier=1.0,
         campos=viewpoint_camera.camera_center,
         prefiltered=False,
         debug=getattr(pipe, "debug", False),
+        enable_texture=enable_texture
     )
-
     scales, rotations, cov3D_precomp = None, None, None
     if pipe.compute_cov3D_python:
         W, H = viewpoint_camera.image_width, viewpoint_camera.image_height
@@ -74,45 +49,49 @@ def render_textured(viewpoint_camera, pc, pipe, bg_color, scaling_modifier=1.0,
     else:
         scales = pc.get_scaling
         rotations = pc.get_rotation
+    return raster_settings, scales, rotations, cov3D_precomp
 
-    rasterizer = GaussianRasterizer(raster_settings=raster_settings)
 
-    def _splat(tex_color):
-        img, radii, allmap = rasterizer(
-            means3D=pc.get_xyz, means2D=means2D,
-            shs=None, colors_precomp=None,
-            opacities=pc.get_opacity,
-            scales=scales, rotations=rotations, cov3D_precomp=cov3D_precomp,
-            texture_color=tex_color, texture_alpha=pc.get_texture_alpha,
-        )
-        return img, radii, allmap
-
-    # ── Route ──────────────────────────────────────────────────────────────
-    if override_color is not None:
-        # Debug override: broadcast [N,3] → [N,3,R,R]
-        R = pc.get_texture_color.shape[-1]
-        tex = override_color[:, :, None, None].expand(-1, -1, R, R).contiguous()
-        rendered_image, radii, allmap = _splat(tex)
-
-    elif deferred:
-        # TODO: 7-channel CUDA kernel
-        #   concat [basecolor(3), shadow(1), other_effects(3)] → rasterizer_7ch
-        #   rendered_image = raw[:3] * raw[3:4] + raw[4:7]
-        raise NotImplementedError("Deferred 7-channel kernel not yet implemented.")
-
-    else:
-        # Direct: final_tex = basecolor * shadow + other_effects  [N,3,R,R]
-        if mbrdf is not None:
-            basecolor = mbrdf["basecolor"]                         # [N, 3, R, R]
-            shadow    = mbrdf["shadow"]                            # [N, R, R]
-            oe        = mbrdf["other_effects"]                     # [N, 3] or None
-            tex = basecolor * shadow.unsqueeze(1)
-            if oe is not None:
-                tex = tex + oe[:, :, None, None]
-            tex = torch.clamp_min(tex, 0.0)
+def rasterize_with_texture_module(viewpoint_camera, pc, pipe, bg_color, scaling_modifier, inputs):
+    raster_settings, scales, rotations, cov3D_precomp = _build_raster_settings(viewpoint_camera, pc, pipe, bg_color, 
+                                                                               scaling_modifier, inputs.enable_texture)
+    mbrdf = inputs.mbrdf      
+    deferred = inputs.deferred 
+    colors_precomp = inputs.colors_precomp
+    means2D = torch.zeros((pc.get_xyz.shape[0], 2), dtype=torch.float32, device=pc.get_xyz.device)  
+    shs = None
+           
+    if not deferred:
+        mbrdf_colors = mbrdf["basecolor"] * mbrdf["shadow"] + mbrdf["other_effects"] if mbrdf is not None else None
+        # original 2dgs rasterizer
+        if pc.use_textures:
+            texture_color = mbrdf_colors if mbrdf_colors is not None else pc.get_texture_color
         else:
-            tex = pc.get_texture_color                             # [N, 3, R, R]
-        rendered_image, radii, allmap = _splat(tex)
+            texture_color = None
+            shs = pc.get_features if colors_precomp is None else None
 
-    return _build_output_dict(means2D, radii, rendered_image, allmap,
-                              viewpoint_camera, pc, pipe, shadow_pkg)
+        rendered_image, radii, allmap = GaussianRasterizer(raster_settings)(means3D=pc.get_xyz, means2D=means2D,
+                                                                                    shs=shs, colors_precomp=colors_precomp,
+                                                                                    opacities=pc.get_opacity,
+                                                                                    scales=scales, rotations=rotations, cov3D_precomp=cov3D_precomp,
+                                                                                    texture_color=texture_color, texture_alpha=pc.get_texture_alpha,
+                                                                                    )
+    else:
+        mbrdf_colors = torch.concat([mbrdf["basecolor"], mbrdf["shadow"], mbrdf["other_effects"]], dim=1) if mbrdf is not None else None
+        # original 2dgs rasterizer
+        if pc.use_textures:
+            texture_color = mbrdf_colors if mbrdf_colors is not None else pc.get_texture_color
+        else:
+            texture_color = None
+            shs = None
+            if colors_precomp is None:
+                assert False, "sh cannot be calculated in deferred mode when colors_precomp is None"
+
+        rendered_image, radii, allmap = GaussianRasterizer_deferred(raster_settings)(means3D=pc.get_xyz, means2D=means2D,
+                                                                                    shs=shs, colors_precomp=colors_precomp,
+                                                                                    opacities=pc.get_opacity,
+                                                                                    scales=scales, rotations=rotations, cov3D_precomp=cov3D_precomp,
+                                                                                    texture_color=texture_color, texture_alpha=pc.get_texture_alpha,
+                                                                                    )
+
+    return rendered_image, radii, allmap, means2D

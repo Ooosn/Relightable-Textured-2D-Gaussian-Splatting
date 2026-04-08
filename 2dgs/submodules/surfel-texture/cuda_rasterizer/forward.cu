@@ -266,6 +266,7 @@ renderCUDA(
 	const float* __restrict__ transMats,
 	const float* __restrict__ depths,
 	const float4* __restrict__ normal_opacity,
+	const bool enable_texture,
 	const float* __restrict__ texture_color,
 	const float* __restrict__ texture_alpha,
 	int texture_resolution,
@@ -390,21 +391,24 @@ renderCUDA(
 			float du_dsx = 0.0f;
 			float dv_dsy = 0.0f;
 
-			compute_texture_uv(s, texture_sigma_factor, u, v, du_dsx, dv_dsy);
-			sample_texture_bilinear(
-				texture_color,
-				texture_alpha,
-				collected_id[j],
-				texture_resolution,
-				u,
-				v,
-				tex_rgb,
-				tex_a,
-				tex_rgb_du,
-				tex_rgb_dv,
-				tex_a_du,
-				tex_a_dv
-			);
+			if (enable_texture && texture_color != nullptr && texture_resolution > 0)
+			{
+				compute_texture_uv(s, texture_sigma_factor, u, v, du_dsx, dv_dsy);
+				sample_texture_bilinear(
+					texture_color,
+					texture_alpha,
+					collected_id[j],
+					texture_resolution,
+					u,
+					v,
+					tex_rgb,
+					tex_a,
+					tex_rgb_du,
+					tex_rgb_dv,
+					tex_a_du,
+					tex_a_dv
+				);
+			}
 
 			float power = -0.5f * rho;
 			if (power > 0.0f)
@@ -489,6 +493,7 @@ void FORWARD::render(
 	const float* transMats,
 	const float* depths,
 	const float4* normal_opacity,
+	bool enable_texture,
 	const float* texture_color,
 	const float* texture_alpha,
 	int texture_resolution,
@@ -509,6 +514,7 @@ void FORWARD::render(
 		transMats,
 		depths,
 		normal_opacity,
+		enable_texture,
 		texture_color,
 		texture_alpha,
 		texture_resolution,

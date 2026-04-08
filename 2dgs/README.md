@@ -6,6 +6,14 @@
 
 This repo contains the official implementation for the paper "2D Gaussian Splatting for Geometrically Accurate Radiance Fields". Our work represents a scene with a set of 2D oriented disks (surface elements) and rasterizes the surfels with [perspective correct differentiable raseterization](https://colab.research.google.com/drive/1qoclD7HJ3-o0O1R8cvV3PxLhoDCMsH8W?usp=sharing). Our work also develops regularizations that enhance the reconstruction quality. We also devise meshing approaches for Gaussian splatting.
 
+## Rendering Architecture Status (fork updates)
+
+- See `docs/rendering-architecture-status.md` for the current mBRDF/shadow/texture architecture status:
+  - agreed target design
+  - implemented parts
+  - pending parts
+  - next priorities
+
 
 ## ⭐ New Features 
 - 2025/12/19: Our work is featured in an in-depth blog post on [LearnOpenCV](https://learnopencv.com/)! Thanks to [Shubham Anand](https://www.linkedin.com/in/shubham-anand-91a10b211/).

@@ -673,7 +673,7 @@ __global__ void preprocessCUDA(
 		dL_drots
 	);
 
-	if (shs)
+	if (M > 0 && shs != nullptr)
 		computeColorFromSH(idx, D, M, (glm::vec3*)means3D, *campos, shs, clamped, (glm::vec3*)dL_dcolors, (glm::vec3*)dL_dmean3Ds, (glm::vec3*)dL_dshs);
 	
 	// hack the gradient here for densitification

@@ -16,11 +16,12 @@ import sys
 import numpy as np
 import torch
 import torch.nn.functional as F
+from gaussian_renderer.textured import rasterize_with_texture_module, TextureRenderInputs
 
 from diff_surfel_rasterization import GaussianRasterizationSettings, GaussianRasterizer
+from diff_surfel_rasterization_deferred import GaussianRasterizationSettings as GaussianRasterizationSettings_7ch, GaussianRasterizer as GaussianRasterizer_7ch
 from scene.gaussian_model import GaussianModel
 from utils.point_utils import depth_to_normal
-from utils.sh_utils import eval_sh
 
 _SHADOW_ROOT = os.path.abspath(
     os.path.join(os.path.dirname(__file__), "..", "submodules", "diff-surfel-rasterization-shadow")
@@ -136,7 +137,6 @@ def _compute_shadow_pass(viewpoint_camera, pc: GaussianModel, pipe, bg_color: to
     Returns a dict with:
         per_point_shadow  – [N, 1]  (mean over UV map, used as mBRDF hint)
         per_uv_shadow     – [N, R, R] or None
-        shadow_image      – [1, H, W] rendered shadow channel
         light_viewmatrix / light_projmatrix
     """
     if viewpoint_camera.pl_pos is None or pc.get_xyz.numel() == 0:
@@ -154,14 +154,9 @@ def _compute_shadow_pass(viewpoint_camera, pc: GaussianModel, pipe, bg_color: to
     # With texture: use real per-UV texture_alpha → per_uv_shadow [N, R, R]
     # Without texture: use 1×1 uniform opacity as texture_alpha → per_uv_shadow [N, 1, 1]
     # Both paths use ShadowRasterizer (2DGS surfel rasterizer, not 3DGS)
-    has_tex_alpha = (
-        getattr(pc, "use_textures", False)
-        and hasattr(pc, "get_texture_alpha")
-        and pc.get_texture_alpha is not None
-        and pc.get_texture_alpha.numel() > 0
-    )
+    use_textures = bool(getattr(pc, "use_textures", False))
 
-    if has_tex_alpha:
+    if use_textures:
         texture_alpha = pc.get_texture_alpha  # [N, 1, R, R] → kernel uses per-UV path
     else:
         texture_alpha = torch.empty(0, device="cuda")  # texture_resolution=0 → kernel uses per-Gaussian path
@@ -180,7 +175,8 @@ def _compute_shadow_pass(viewpoint_camera, pc: GaussianModel, pipe, bg_color: to
         prefiltered=False,
         debug=getattr(pipe, "debug", False),
         low_pass_filter_radius=0.3,
-        ortho=True,
+        ortho=False,
+        use_textures=use_textures,
     )
     shadow_rasterizer = ShadowRasterizer(raster_settings=shadow_settings)
     light_colors = torch.ones((means3d.shape[0], 3), dtype=torch.float32, device="cuda")
@@ -204,7 +200,7 @@ def _compute_shadow_pass(viewpoint_camera, pc: GaussianModel, pipe, bg_color: to
     non_trans_safe = torch.clamp_min(non_trans, 1e-6)
     N = means3d.shape[0]
 
-    if has_tex_alpha:
+    if use_textures:
         # out_trans / non_trans: [N*R*R] flat → reshape to [N, R, R]
         R = int(round((out_trans.numel() / max(N, 1)) ** 0.5))
         per_uv_shadow = torch.clamp(
@@ -216,49 +212,12 @@ def _compute_shadow_pass(viewpoint_camera, pc: GaussianModel, pipe, bg_color: to
         per_uv_shadow = None
         per_point_shadow = torch.clamp(out_trans / non_trans_safe, 0.0, 1.0).unsqueeze(-1)  # [N, 1]
 
-    shadow_img = _render_shadow_image(
-        viewpoint_camera, pc, pipe, bg_color, scaling_modifier,
-        per_point_shadow, tanfovx, tanfovy
-    )
     return {
         "per_point_shadow": per_point_shadow.detach(),
         "per_uv_shadow": per_uv_shadow.detach() if per_uv_shadow is not None else None,
-        "shadow_image": shadow_img,
         "light_viewmatrix": lt["world_view_transform_light"],
         "light_projmatrix": lt["full_ortho_proj_transform_light"],
     }
-
-
-def _render_shadow_image(viewpoint_camera, pc, pipe, bg_color, scaling_modifier,
-                         per_point_shadow, tanfovx, tanfovy):
-    """Splat per_point_shadow [N,1] into a [1,H,W] image using the 2DGS rasterizer."""
-    raster_settings = GaussianRasterizationSettings(
-        image_height=int(viewpoint_camera.image_height),
-        image_width=int(viewpoint_camera.image_width),
-        tanfovx=tanfovx,
-        tanfovy=tanfovy,
-        bg=bg_color[:3],
-        scale_modifier=scaling_modifier,
-        viewmatrix=viewpoint_camera.world_view_transform,
-        projmatrix=viewpoint_camera.full_proj_transform,
-        sh_degree=pc.active_sh_degree,
-        campos=viewpoint_camera.camera_center,
-        prefiltered=False,
-        debug=getattr(pipe, "debug", False),
-    )
-    rasterizer = GaussianRasterizer(raster_settings=raster_settings)
-    shadow_color = per_point_shadow.expand(-1, 3).contiguous()  # [N,3] grey
-    rendered, _radii, _allmap = rasterizer(
-        means3D=pc.get_xyz,
-        means2D=torch.zeros_like(pc.get_xyz, requires_grad=False),
-        shs=None,
-        colors_precomp=shadow_color,
-        opacities=pc.get_opacity,
-        scales=pc.get_scaling,
-        rotations=pc.get_rotation,
-        cov3D_precomp=None,
-    )
-    return rendered[:1]  # [1, H, W]
 
 
 def _safe_normalize(vec):
@@ -378,44 +337,6 @@ def _compute_mbrdf_colors(viewpoint_camera, pc: GaussianModel, shadow_pkg, fix_l
     return {"basecolor": basecolor, "shadow": decay, "other_effects": other_effects}
 
 
-def _build_raster_settings(viewpoint_camera, pc, pipe, bg_color, scaling_modifier):
-    """Build GaussianRasterizationSettings + covariance tensors (shared by all paths)."""
-    tanfovx = math.tan(viewpoint_camera.FoVx * 0.5)
-    tanfovy = math.tan(viewpoint_camera.FoVy * 0.5)
-    raster_settings = GaussianRasterizationSettings(
-        image_height=int(viewpoint_camera.image_height),
-        image_width=int(viewpoint_camera.image_width),
-        tanfovx=tanfovx,
-        tanfovy=tanfovy,
-        bg=bg_color,
-        scale_modifier=scaling_modifier,
-        viewmatrix=viewpoint_camera.world_view_transform,
-        projmatrix=viewpoint_camera.full_proj_transform,
-        sh_degree=pc.active_sh_degree,
-        campos=viewpoint_camera.camera_center,
-        prefiltered=False,
-        debug=getattr(pipe, "debug", False),
-    )
-    scales, rotations, cov3D_precomp = None, None, None
-    if pipe.compute_cov3D_python:
-        W, H = viewpoint_camera.image_width, viewpoint_camera.image_height
-        near, far = viewpoint_camera.znear, viewpoint_camera.zfar
-        ndc2pix = torch.tensor([
-            [W / 2, 0, 0, (W - 1) / 2],
-            [0, H / 2, 0, (H - 1) / 2],
-            [0, 0, far - near, near],
-            [0, 0, 0, 1],
-        ]).float().cuda().T
-        splat2world = pc.get_covariance(scaling_modifier)
-        cov3D_precomp = (
-            splat2world[:, [0, 1, 3]] @ (viewpoint_camera.full_proj_transform @ ndc2pix)[:, [0, 1, 3]]
-        ).permute(0, 2, 1).reshape(-1, 9)
-    else:
-        scales = pc.get_scaling
-        rotations = pc.get_rotation
-    return raster_settings, scales, rotations, cov3D_precomp
-
-
 def _build_output_dict(means2D, radii, rendered_image, allmap, viewpoint_camera, pc, pipe, shadow_pkg):
     """Pack rasterizer outputs into the standard return dict."""
     render_alpha = allmap[1:2]
@@ -436,7 +357,6 @@ def _build_output_dict(means2D, radii, rendered_image, allmap, viewpoint_camera,
         "rend_dist":         allmap[6:7],
         "surf_depth":        surf_depth,
         "surf_normal":       surf_normal,
-        "shadow":            shadow_pkg["shadow_image"]    if shadow_pkg else None,
         "pre_shadow":        shadow_pkg["per_point_shadow"] if shadow_pkg else None,
     }
 
@@ -469,88 +389,45 @@ def render(viewpoint_camera, pc: GaussianModel, pipe, bg_color: torch.Tensor,
     if getattr(pipe, "shadow_pass", False) and apply_shadow:
         shadow_pkg = _compute_shadow_pass(viewpoint_camera, pc, pipe, bg_color, scaling_modifier)
 
-    # ══ Step 2: mBRDF — compute decay + other_effects ════════════════════
-    # Phase 0 (no shadow): flat kd, skip phasefunc
-    # Phase 1+ (shadow on): phasefunc → decay (optimised shadow) + other_effects
+    # ══ Step 2: Appearance parameterization (mBRDF vs SH) ════════════════════
+    # mBRDF is the semantic model; SH is an alternative parameterization.
+    # If pc.use_mbrdf=True, we always construct an mbrdf dict (Phase 0 uses decay=1, other=0).
     mbrdf = None
-    if getattr(pc, "use_mbrdf", False) and override_color is None:
+    use_mbrdf = getattr(pc, "use_mbrdf", False) and override_color is None
+    if use_mbrdf:
         if not apply_shadow:
-            # Phase 0 warmup: no phasefunc, no shadow
-            # tex path: mbrdf=None → render raw texture_color directly
-            # no-tex path: flat kd/π as per-Gaussian color
-            if not getattr(pc, "use_textures", False):
-                N = pc.get_xyz.shape[0]
+            # Phase 0: no phasefunc, no shadow. Keep mBRDF representation explicit.
+            N = pc.get_xyz.shape[0]
+            if getattr(pc, "use_textures", False):
+                # basecolor comes from texture in render_textured; only provide scalar decay + zero other.
+                mbrdf = {
+                    "basecolor": None,
+                    "shadow": torch.ones((N, 1), dtype=torch.float32, device=pc.get_xyz.device),
+                    "other_effects": torch.zeros((N, 3), dtype=torch.float32, device=pc.get_xyz.device),
+                }
+            else:
                 mbrdf = {
                     "basecolor": (pc.get_kd / math.pi).expand(-1, 3).contiguous(),  # [N,3]
                     "shadow": torch.ones((N, 1), dtype=torch.float32, device=pc.get_xyz.device),
-                    "other_effects": None,
+                    "other_effects": torch.zeros((N, 3), dtype=torch.float32, device=pc.get_xyz.device),
                 }
-            # else: mbrdf stays None → render_textured uses raw texture_color
         else:
             mbrdf = _compute_mbrdf_colors(viewpoint_camera, pc, shadow_pkg, fix_lambert=fix_lambert)
 
-    # ══ Step 3: Route to textured / plain renderer ════════════════════════
-    if getattr(pc, "use_textures", False):
-        from gaussian_renderer.textured import render_textured
-        return render_textured(
-            viewpoint_camera, pc, pipe, bg_color,
-            scaling_modifier=scaling_modifier,
-            override_color=override_color,
-            shadow_pkg=shadow_pkg,
-            mbrdf=mbrdf,
+    # ══ Step 3: Rasterization ═══════════════════════════════════════════════
+    colors_precomp = None
+    rendered_image, radii, allmap, means2D = rasterize_with_texture_module(
+        viewpoint_camera=viewpoint_camera,
+        pc=pc,
+        pipe=pipe,
+        bg_color=bg_color,
+        scaling_modifier=scaling_modifier,
+        inputs=TextureRenderInputs(
             deferred=deferred,
-        )
-
-    # ══ No-tex path ═══════════════════════════════════════════════════════
-    means2D = torch.zeros_like(pc.get_xyz, requires_grad=True, device="cuda") + 0
-    try:
-        means2D.retain_grad()
-    except Exception:
-        pass
-
-    raster_settings, scales, rotations, cov3D_precomp = _build_raster_settings(
-        viewpoint_camera, pc, pipe, bg_color, scaling_modifier
+            mbrdf = mbrdf,
+            colors_precomp=colors_precomp,
+        ),
     )
-    rasterizer = GaussianRasterizer(raster_settings=raster_settings)
-
-    def _splat(colors_precomp, shs=None):
-        img, radii, allmap = rasterizer(
-            means3D=pc.get_xyz, means2D=means2D,
-            shs=shs, colors_precomp=colors_precomp,
-            opacities=pc.get_opacity,
-            scales=scales, rotations=rotations, cov3D_precomp=cov3D_precomp,
-        )
-        return img, radii, allmap
-    
-    def _splat_7ch(colors_precomp, shs=None):
-        img, radii, allmap = rasterizer_7ch(
-            means3D=pc.get_xyz, means2D=means2D,
-            shs=shs, colors_precomp=colors_precomp,
-            opacities=pc.get_opacity,
-            scales=scales, rotations=rotations, cov3D_precomp=cov3D_precomp,
-        )
-        return img, radii, allmap
-
-    if deferred:
-        # ── Deferred: requires 7-channel CUDA kernel (TODO) ───────────────
-        # When ready, replace with:
-        #   raw, radii, allmap = rasterizer_7ch(...)
-        #   rendered_image = raw[:3] * raw[3:4] + raw[4:7]
-        raise NotImplementedError("Deferred 7-channel kernel not yet implemented.")
-
-    else:
-        # ── Direct: final = basecolor * shadow + other_effects → 3-ch rasterizer ──
-        if override_color is not None:
-            colors_precomp, shs = override_color, None
-        elif mbrdf is not None:
-            c = mbrdf["basecolor"] * mbrdf["shadow"]       # [N,3]
-            if mbrdf["other_effects"] is not None:
-                c = c + mbrdf["other_effects"]
-            colors_precomp, shs = torch.clamp_min(c, 0.0), None
-        else:
-            colors_precomp, shs = None, pc.get_features
-
-        rendered_image, radii, allmap = _splat(colors_precomp, shs=shs)
-
-    return _build_output_dict(means2D, radii, rendered_image, allmap,
-                              viewpoint_camera, pc, pipe, shadow_pkg)
+    return _build_output_dict(
+        means2D, radii, rendered_image, allmap, viewpoint_camera, pc, pipe, shadow_pkg
+    )

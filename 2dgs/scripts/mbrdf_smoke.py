@@ -42,9 +42,9 @@ def main():
     cam = scene.getTrainCameras()[randint(0, len(scene.getTrainCameras()) - 1)]
     out = render(cam, gaussians, pipe, bg)
     img = out["render"]
-    shadow = out["shadow"]
+    pre_shadow = out["pre_shadow"]
     print("render", tuple(img.shape), float(img.mean()), bool(torch.isfinite(img).all()), flush=True)
-    print("shadow", None if shadow is None else tuple(shadow.shape), None if shadow is None else float(shadow.mean()), flush=True)
+    print("pre_shadow", None if pre_shadow is None else tuple(pre_shadow.shape), None if pre_shadow is None else float(pre_shadow.mean()), flush=True)
     gt = cam.original_image.cuda()
     loss = (1.0 - opt.lambda_dssim) * l1_loss(img, gt) + opt.lambda_dssim * (1.0 - ssim(img, gt))
     loss.backward()

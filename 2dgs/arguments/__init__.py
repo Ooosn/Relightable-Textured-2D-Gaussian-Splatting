@@ -83,6 +83,10 @@ class PipelineParams(ParamGroup):
         self.depth_ratio = 0.0
         self.debug = False
         self.shadow_pass = False
+        # diff-surfel-rasterization-texture: toggle texture sampling in CUDA
+        # True  -> 2DGS + texture sampling
+        # False -> 2DGS behavior (no texture sampling), still using texture rasterizer module
+        self.enable_texture = True
         self.shadow_offset = 0.15
         self.shadow_light_scale = 10.0
         self.shadow_resolution_scale = 1.0

@@ -71,8 +71,12 @@ RasterizeGaussiansCUDA(
   const int W = image_width;
 
   CHECK_INPUT(background);
+  if (background.numel() != NUM_CHANNELS)
+	AT_ERROR("background must have NUM_CHANNELS elements (7: RGB + decay_bg + other_bg)");
   CHECK_INPUT(means3D);
   CHECK_INPUT(colors);
+  if (colors.numel() > 0 && colors.size(1) != NUM_CHANNELS)
+	AT_ERROR("colors must be (N, NUM_CHANNELS) for deferred 7-channel mode");
   CHECK_INPUT(opacity);
   CHECK_INPUT(scales);
   CHECK_INPUT(rotations);

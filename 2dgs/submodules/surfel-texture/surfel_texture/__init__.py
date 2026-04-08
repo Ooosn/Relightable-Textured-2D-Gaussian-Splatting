@@ -30,6 +30,7 @@ def rasterize_gaussians(
     texture_color,
     texture_alpha,
     texture_sigma_factor,
+    enable_texture,
     raster_settings,
 ):
     return _RasterizeGaussians.apply(
@@ -44,6 +45,7 @@ def rasterize_gaussians(
         texture_color,
         texture_alpha,
         texture_sigma_factor,
+        enable_texture,
         raster_settings,
     )
 
@@ -62,6 +64,7 @@ class _RasterizeGaussians(torch.autograd.Function):
         texture_color,
         texture_alpha,
         texture_sigma_factor,
+        enable_texture,
         raster_settings,
     ):
 
@@ -87,6 +90,7 @@ class _RasterizeGaussians(torch.autograd.Function):
             texture_color,
             texture_alpha,
             texture_sigma_factor,
+            enable_texture,
             raster_settings.prefiltered,
             raster_settings.debug
         )
@@ -107,6 +111,7 @@ class _RasterizeGaussians(torch.autograd.Function):
         ctx.raster_settings = raster_settings
         ctx.num_rendered = num_rendered
         ctx.texture_sigma_factor = texture_sigma_factor
+        ctx.enable_texture = bool(enable_texture)
         ctx.save_for_backward(
             colors_precomp,
             means3D,
@@ -130,6 +135,7 @@ class _RasterizeGaussians(torch.autograd.Function):
         num_rendered = ctx.num_rendered
         raster_settings = ctx.raster_settings
         texture_sigma_factor = ctx.texture_sigma_factor
+        enable_texture = ctx.enable_texture
         (
             colors_precomp,
             means3D,
@@ -166,6 +172,7 @@ class _RasterizeGaussians(torch.autograd.Function):
                 texture_color,
                 texture_alpha,
                 texture_sigma_factor,
+                enable_texture,
                 geomBuffer,
                 num_rendered,
                 binningBuffer,
@@ -244,6 +251,7 @@ class GaussianRasterizer(nn.Module):
         texture_color=None,
         texture_alpha=None,
         texture_sigma_factor=3.0,
+        enable_texture=True,
     ):
         
         raster_settings = self.raster_settings
@@ -284,6 +292,7 @@ class GaussianRasterizer(nn.Module):
             texture_color,
             texture_alpha,
             texture_sigma_factor,
+            enable_texture,
             raster_settings, 
         )
 

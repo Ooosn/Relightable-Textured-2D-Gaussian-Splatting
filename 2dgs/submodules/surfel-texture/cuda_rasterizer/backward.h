@@ -35,6 +35,7 @@ namespace BACKWARD
 		const float* depths,
 		const float* final_Ts,
 		const uint32_t* n_contrib,
+		bool enable_texture,
 		const float* texture_color,
 		const float* texture_alpha,
 		int texture_resolution,

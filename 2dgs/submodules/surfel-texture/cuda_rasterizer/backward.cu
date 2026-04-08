@@ -156,6 +156,7 @@ renderCUDA(
 	const float* __restrict__ depths,
 	const float* __restrict__ final_Ts,
 	const uint32_t* __restrict__ n_contrib,
+	const bool enable_texture,
 	const float* __restrict__ texture_color,
 	const float* __restrict__ texture_alpha,
 	int texture_resolution,
@@ -322,21 +323,24 @@ renderCUDA(
 			float du_dsx = 0.0f;
 			float dv_dsy = 0.0f;
 
-			compute_texture_uv(s, texture_sigma_factor, u, v, du_dsx, dv_dsy);
-			sample_texture_bilinear(
-				texture_color,
-				texture_alpha,
-				collected_id[j],
-				texture_resolution,
-				u,
-				v,
-				tex_rgb,
-				tex_a,
-				tex_rgb_du,
-				tex_rgb_dv,
-				tex_a_du,
-				tex_a_dv
-			);
+			if (enable_texture && texture_color != nullptr && texture_resolution > 0)
+			{
+				compute_texture_uv(s, texture_sigma_factor, u, v, du_dsx, dv_dsy);
+				sample_texture_bilinear(
+					texture_color,
+					texture_alpha,
+					collected_id[j],
+					texture_resolution,
+					u,
+					v,
+					tex_rgb,
+					tex_a,
+					tex_rgb_du,
+					tex_rgb_dv,
+					tex_a_du,
+					tex_a_dv
+				);
+			}
 
 			// accumulations
 
@@ -478,16 +482,19 @@ renderCUDA(
 
 			// Update gradients w.r.t. opacity of the Gaussian
 			atomicAdd(&(dL_dopacity[global_id]), tex_a * G * dL_dalpha);
-			accumulate_texture_bilinear_vjp(
-				global_id,
-				texture_resolution,
-				u,
-				v,
-				dL_dtex_rgb,
-				dL_dsample_alpha,
-				dL_dtex_color,
-				dL_dtex_alpha
-			);
+			if (enable_texture && texture_color != nullptr && texture_resolution > 0)
+			{
+				accumulate_texture_bilinear_vjp(
+					global_id,
+					texture_resolution,
+					u,
+					v,
+					dL_dtex_rgb,
+					dL_dsample_alpha,
+					dL_dtex_color,
+					dL_dtex_alpha
+				);
+			}
 		}
 	}
 }
@@ -749,6 +756,7 @@ void BACKWARD::render(
 	const float* depths,
 	const float* final_Ts,
 	const uint32_t* n_contrib,
+	bool enable_texture,
 	const float* texture_color,
 	const float* texture_alpha,
 	int texture_resolution,
@@ -776,6 +784,7 @@ void BACKWARD::render(
 		depths,
 		final_Ts,
 		n_contrib,
+		enable_texture,
 		texture_color,
 		texture_alpha,
 		texture_resolution,

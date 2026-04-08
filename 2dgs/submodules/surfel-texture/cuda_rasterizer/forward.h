@@ -62,6 +62,7 @@ namespace FORWARD
 		const float* transMats,
 		const float* depths,
 		const float4* normal_opacity,
+		bool enable_texture,
 		const float* texture_color,
 		const float* texture_alpha,
 		int texture_resolution,
