@@ -5,10 +5,43 @@ import torch.nn as nn
 
 from . import _C
 
+_RASTERIZE_GAUSSIANS_HAS_TEXTURE_DIMS = None
+
 
 def cpu_deep_copy_tuple(input_tuple):
     copied_tensors = [item.cpu().clone() if isinstance(item, torch.Tensor) else item for item in input_tuple]
     return tuple(copied_tensors)
+
+
+def _call_rasterize_gaussians(args_with_dims, args_without_dims, has_dynamic_texture):
+    global _RASTERIZE_GAUSSIANS_HAS_TEXTURE_DIMS
+
+    if _RASTERIZE_GAUSSIANS_HAS_TEXTURE_DIMS is True:
+        return _C.rasterize_gaussians(*args_with_dims)
+
+    if _RASTERIZE_GAUSSIANS_HAS_TEXTURE_DIMS is False:
+        if has_dynamic_texture:
+            raise RuntimeError(
+                "The loaded diff_surfel_rasterization_shadow extension does not support "
+                "dynamic texture dimensions. Rebuild this submodule before enabling "
+                "texture_dynamic_resolution."
+            )
+        return _C.rasterize_gaussians(*args_without_dims)
+
+    try:
+        result = _C.rasterize_gaussians(*args_with_dims)
+    except TypeError as ex:
+        if has_dynamic_texture:
+            raise RuntimeError(
+                "The loaded diff_surfel_rasterization_shadow extension does not support "
+                "dynamic texture dimensions. Rebuild this submodule before enabling "
+                "texture_dynamic_resolution."
+            ) from ex
+        result = _C.rasterize_gaussians(*args_without_dims)
+        _RASTERIZE_GAUSSIANS_HAS_TEXTURE_DIMS = False
+    else:
+        _RASTERIZE_GAUSSIANS_HAS_TEXTURE_DIMS = True
+    return result
 
 
 class GaussianRasterizationSettings(NamedTuple):
@@ -47,6 +80,7 @@ def rasterize_gaussians(
     is_train,
     raster_settings,
 ):
+    has_dynamic_texture = texture_dims is not None and texture_dims.numel() > 0
     args = (
         raster_settings.bg,
         means3D,
@@ -75,17 +109,44 @@ def rasterize_gaussians(
         thres,
         is_train,
     )
+    legacy_args = (
+        raster_settings.bg,
+        means3D,
+        colors_precomp,
+        opacities,
+        scales,
+        rotations,
+        raster_settings.scale_modifier,
+        cov3Ds_precomp,
+        raster_settings.viewmatrix,
+        raster_settings.projmatrix,
+        raster_settings.tanfovx,
+        raster_settings.tanfovy,
+        raster_settings.image_height,
+        raster_settings.image_width,
+        shs,
+        raster_settings.sh_degree,
+        raster_settings.campos,
+        texture_alpha,
+        texture_sigma_factor,
+        raster_settings.prefiltered,
+        raster_settings.debug,
+        non_trans,
+        offset,
+        thres,
+        is_train,
+    )
 
     if raster_settings.debug:
         cpu_args = cpu_deep_copy_tuple(args)
         try:
-            num_rendered, color, out_weight, radii, out_trans, geomBuffer, binningBuffer, imgBuffer = _C.rasterize_gaussians(*args)
+            num_rendered, color, out_weight, radii, out_trans, geomBuffer, binningBuffer, imgBuffer = _call_rasterize_gaussians(args, legacy_args, has_dynamic_texture)
         except Exception as ex:
             torch.save(cpu_args, "snapshot_fw_shadow.dump")
             print("\nAn error occured in forward. Please forward snapshot_fw_shadow.dump for debugging.")
             raise ex
     else:
-        num_rendered, color, out_weight, radii, out_trans, geomBuffer, binningBuffer, imgBuffer = _C.rasterize_gaussians(*args)
+        num_rendered, color, out_weight, radii, out_trans, geomBuffer, binningBuffer, imgBuffer = _call_rasterize_gaussians(args, legacy_args, has_dynamic_texture)
 
     _ = (num_rendered, geomBuffer, binningBuffer, imgBuffer)
     invdepths = None
@@ -93,7 +154,6 @@ def rasterize_gaussians(
     P = means3D.shape[0]
     # Reshape UV-indexed shadow buffers to [P, res, res] when texture was provided.
     tex_res = 0
-    has_dynamic_texture = texture_dims is not None and texture_dims.numel() > 0
     if texture_alpha is not None and texture_alpha.numel() > 0 and not has_dynamic_texture:
         tex_res = int(texture_alpha.shape[2])
     if tex_res > 0:

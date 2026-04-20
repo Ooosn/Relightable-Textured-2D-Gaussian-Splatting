@@ -58,7 +58,7 @@ Examples below assume:
 
 ```powershell
 conda run -n mygs python D:\RTS\gs2dgs\train.py `
-  -s D:\RTS\data\Pixiu `
+  -s E:\gsrelight-data\NRHints\Pixiu `
   -m D:\RTS\output\gs2dgs_run `
   --eval `
   --iterations 30000 `
@@ -75,7 +75,7 @@ conda run -n mygs python D:\RTS\gs2dgs\train.py `
 
 ```powershell
 conda run -n mygs python D:\RTS\gs2dgs\train.py `
-  -s D:\RTS\data\Pixiu `
+  -s E:\gsrelight-data\NRHints\Pixiu `
   -m D:\RTS\output\gs2dgs_tex_run `
   --eval `
   --iterations 30000 `
@@ -90,6 +90,83 @@ conda run -n mygs python D:\RTS\gs2dgs\train.py `
   --view_num 2000 `
   --resolution 1
 ```
+
+### Texture pixel densification / RTG short test
+
+This is the active experiment for **2DGS texture-level pixel densification**.
+The goal is to keep each Gaussian as one surfel, but dynamically refine its
+local texture chart when relighting-related texture gradients are high.
+
+This is different from normal Gaussian densification:
+
+- normal densification adds / splits Gaussians,
+- RTG pixel densification keeps the Gaussian and grows its texture chart,
+- dynamic texture charts are stored in a flat atlas with per-Gaussian
+  `[height, width, offset]` metadata.
+
+Required switches:
+
+- `--use_textures`
+- `--texture_dynamic_resolution`
+- `--texture_rtg_enabled`
+- `--texture_effect_mode per_uv`
+
+For a quick PC sanity test, force RTG refinement to happen early and keep the
+view count small. A full-view RTG short run can approach the 32 GB VRAM limit
+once charts grow.
+
+```powershell
+conda run -n mygs python D:\RTS\gs2dgs\train.py `
+  -s E:\gsrelight-data\NRHints\Pixiu `
+  -m D:\RTS\output\gs2dgs_rtg_short `
+  --eval `
+  --iterations 700 `
+  --rasterizer 2dgs `
+  --use_nerual_phasefunc `
+  --use_textures `
+  --texture_dynamic_resolution `
+  --texture_min_resolution 4 `
+  --texture_max_resolution 16 `
+  --texture_effect_mode per_uv `
+  --texture_rtg_enabled `
+  --texture_rtg_refine_from_iter 100 `
+  --texture_rtg_refine_until_iter 500 `
+  --texture_rtg_refine_interval 100 `
+  --texture_rtg_refine_fraction 0.02 `
+  --texture_rtg_alpha_weight 1.0 `
+  --cam_opt `
+  --pl_opt `
+  --sh_degree 0 `
+  --view_num 4 `
+  --load_num 4 `
+  --resolution 1
+```
+
+Expected RTG log lines look like:
+
+```text
+[ITER 100] RTG refined 2000 texture charts | texels 1600000->1696000 (+96000), avg 17.0/G, score mean/max 3.635e-09/2.046e-08, res {4x4:98000, 8x8:2000}
+```
+
+What to check:
+
+- At refine iterations, the log should print `RTG refined ...`.
+- `texels old->new` should increase.
+- `res {...}` should gradually move some charts from `4x4` to `8x8`,
+  then later to `16x16`, up to `--texture_max_resolution`.
+- Loss should not jump to NaN after the first refinement.
+- If no RTG log appears, check that both `--texture_dynamic_resolution`
+  and `--texture_rtg_enabled` are present, and that the run reaches
+  `--texture_rtg_refine_from_iter`.
+
+The default RTG schedule starts later:
+
+- `--texture_rtg_refine_from_iter 15000`
+- `--texture_rtg_refine_until_iter 100000`
+- `--texture_rtg_refine_interval 1000`
+- `--texture_rtg_refine_fraction 0.02`
+
+So short tests should override these values as shown above.
 
 ### Important defaults
 

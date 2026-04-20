@@ -15,6 +15,64 @@ import torch.nn as nn
 import torch
 from . import _C
 
+_RASTERIZE_GAUSSIANS_HAS_TEXTURE_DIMS = None
+_RASTERIZE_GAUSSIANS_BACKWARD_HAS_TEXTURE_DIMS = None
+
+
+def _dynamic_texture_dims_error():
+    return RuntimeError(
+        "The loaded surfel_texture_deferred extension does not support dynamic "
+        "texture dimensions. Rebuild this submodule before enabling "
+        "texture_dynamic_resolution."
+    )
+
+
+def _call_rasterize_gaussians(args_with_dims, args_without_dims, has_dynamic_texture):
+    global _RASTERIZE_GAUSSIANS_HAS_TEXTURE_DIMS
+
+    if _RASTERIZE_GAUSSIANS_HAS_TEXTURE_DIMS is True:
+        return _C.rasterize_gaussians(*args_with_dims)
+
+    if _RASTERIZE_GAUSSIANS_HAS_TEXTURE_DIMS is False:
+        if has_dynamic_texture:
+            raise _dynamic_texture_dims_error()
+        return _C.rasterize_gaussians(*args_without_dims)
+
+    try:
+        result = _C.rasterize_gaussians(*args_with_dims)
+    except TypeError as ex:
+        if has_dynamic_texture:
+            raise _dynamic_texture_dims_error() from ex
+        result = _C.rasterize_gaussians(*args_without_dims)
+        _RASTERIZE_GAUSSIANS_HAS_TEXTURE_DIMS = False
+    else:
+        _RASTERIZE_GAUSSIANS_HAS_TEXTURE_DIMS = True
+    return result
+
+
+def _call_rasterize_gaussians_backward(args_with_dims, args_without_dims, has_dynamic_texture):
+    global _RASTERIZE_GAUSSIANS_BACKWARD_HAS_TEXTURE_DIMS
+
+    if _RASTERIZE_GAUSSIANS_BACKWARD_HAS_TEXTURE_DIMS is True:
+        return _C.rasterize_gaussians_backward(*args_with_dims)
+
+    if _RASTERIZE_GAUSSIANS_BACKWARD_HAS_TEXTURE_DIMS is False:
+        if has_dynamic_texture:
+            raise _dynamic_texture_dims_error()
+        return _C.rasterize_gaussians_backward(*args_without_dims)
+
+    try:
+        result = _C.rasterize_gaussians_backward(*args_with_dims)
+    except TypeError as ex:
+        if has_dynamic_texture:
+            raise _dynamic_texture_dims_error() from ex
+        result = _C.rasterize_gaussians_backward(*args_without_dims)
+        _RASTERIZE_GAUSSIANS_BACKWARD_HAS_TEXTURE_DIMS = False
+    else:
+        _RASTERIZE_GAUSSIANS_BACKWARD_HAS_TEXTURE_DIMS = True
+    return result
+
+
 def cpu_deep_copy_tuple(input_tuple):
     copied_tensors = [item.cpu().clone() if isinstance(item, torch.Tensor) else item for item in input_tuple]
     return tuple(copied_tensors)
@@ -76,6 +134,7 @@ class _RasterizeGaussians(torch.autograd.Function):
     ):
 
         # Restructure arguments the way that the C++ lib expects them
+        has_dynamic_texture = texture_dims is not None and texture_dims.numel() > 0
         args = (
             raster_settings.bg, 
             means3D,
@@ -102,18 +161,43 @@ class _RasterizeGaussians(torch.autograd.Function):
             raster_settings.prefiltered,
             raster_settings.debug
         )
+        legacy_args = (
+            raster_settings.bg,
+            means3D,
+            colors_precomp,
+            opacities,
+            scales,
+            rotations,
+            raster_settings.scale_modifier,
+            cov3Ds_precomp,
+            raster_settings.viewmatrix,
+            raster_settings.projmatrix,
+            raster_settings.tanfovx,
+            raster_settings.tanfovy,
+            raster_settings.image_height,
+            raster_settings.image_width,
+            sh,
+            raster_settings.sh_degree,
+            raster_settings.campos,
+            texture_color,
+            texture_alpha,
+            texture_sigma_factor,
+            use_textures,
+            raster_settings.prefiltered,
+            raster_settings.debug
+        )
 
         # Invoke C++/CUDA rasterizer
         if raster_settings.debug:
             cpu_args = cpu_deep_copy_tuple(args) # Copy them before they can be corrupted
             try:
-                num_rendered, color, depth, radii, geomBuffer, binningBuffer, imgBuffer = _C.rasterize_gaussians(*args)
+                num_rendered, color, depth, radii, geomBuffer, binningBuffer, imgBuffer = _call_rasterize_gaussians(args, legacy_args, has_dynamic_texture)
             except Exception as ex:
                 torch.save(cpu_args, "snapshot_fw.dump")
                 print("\nAn error occured in forward. Please forward snapshot_fw.dump for debugging.")
                 raise ex
         else:
-            num_rendered, color, depth, radii, geomBuffer, binningBuffer, imgBuffer = _C.rasterize_gaussians(*args)
+            num_rendered, color, depth, radii, geomBuffer, binningBuffer, imgBuffer = _call_rasterize_gaussians(args, legacy_args, has_dynamic_texture)
 
         # Keep relevant tensors for backward
         ctx.raster_settings = raster_settings
@@ -163,6 +247,7 @@ class _RasterizeGaussians(torch.autograd.Function):
         ) = ctx.saved_tensors
 
         # Restructure args as C++ method expects them
+        has_dynamic_texture = texture_dims is not None and texture_dims.numel() > 0
         args = (raster_settings.bg,
                 means3D, 
                 radii, 
@@ -190,18 +275,44 @@ class _RasterizeGaussians(torch.autograd.Function):
                 binningBuffer,
                 imgBuffer,
                 raster_settings.debug)
+        legacy_args = (raster_settings.bg,
+                means3D,
+                radii,
+                colors_precomp,
+                scales,
+                rotations,
+                raster_settings.scale_modifier,
+                cov3Ds_precomp,
+                raster_settings.viewmatrix,
+                raster_settings.projmatrix,
+                raster_settings.tanfovx,
+                raster_settings.tanfovy,
+                grad_out_color,
+                grad_depth,
+                sh,
+                raster_settings.sh_degree,
+                raster_settings.campos,
+                texture_color,
+                texture_alpha,
+                texture_sigma_factor,
+                use_textures,
+                geomBuffer,
+                num_rendered,
+                binningBuffer,
+                imgBuffer,
+                raster_settings.debug)
 
         # Compute gradients for relevant tensors by invoking backward method
         if raster_settings.debug:
             cpu_args = cpu_deep_copy_tuple(args) # Copy them before they can be corrupted
             try:
-                grad_means2D, grad_colors_precomp, grad_opacities, grad_means3D, grad_cov3Ds_precomp, grad_sh, grad_scales, grad_rotations, grad_texture_color, grad_texture_alpha = _C.rasterize_gaussians_backward(*args)
+                grad_means2D, grad_colors_precomp, grad_opacities, grad_means3D, grad_cov3Ds_precomp, grad_sh, grad_scales, grad_rotations, grad_texture_color, grad_texture_alpha = _call_rasterize_gaussians_backward(args, legacy_args, has_dynamic_texture)
             except Exception as ex:
                 torch.save(cpu_args, "snapshot_bw.dump")
                 print("\nAn error occured in backward. Writing snapshot_bw.dump for debugging.\n")
                 raise ex
         else:
-             grad_means2D, grad_colors_precomp, grad_opacities, grad_means3D, grad_cov3Ds_precomp, grad_sh, grad_scales, grad_rotations, grad_texture_color, grad_texture_alpha = _C.rasterize_gaussians_backward(*args)
+             grad_means2D, grad_colors_precomp, grad_opacities, grad_means3D, grad_cov3Ds_precomp, grad_sh, grad_scales, grad_rotations, grad_texture_color, grad_texture_alpha = _call_rasterize_gaussians_backward(args, legacy_args, has_dynamic_texture)
 
         if os.getenv("SURFEL_DEFERRED_DEBUG_SHAPES", "0") == "1":
             print(
