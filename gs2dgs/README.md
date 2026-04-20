@@ -170,14 +170,16 @@ What to check:
 
 The default RTG schedule starts later:
 
-- `--texture_rtg_refine_from_iter 20000`
+- `--texture_rtg_refine_from_iter 30000`
 - `--texture_rtg_refine_until_iter 100000`
 - `--texture_rtg_refine_interval 1000`
 - `--texture_rtg_refine_fraction 0.02`
 - `--texture_rtg_min_score 1e-5`
 - `--texture_rtg_resolution_gamma 1.0`
 
-So short tests should override these values as shown above.
+So short tests should override these values as shown above. The production
+default starts after specular rendering is enabled and after the ASG
+anisotropic parameters have had several thousand iterations to settle.
 
 The production RTG gate is resolution-aware:
 

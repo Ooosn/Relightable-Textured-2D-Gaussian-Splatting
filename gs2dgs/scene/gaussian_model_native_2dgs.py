@@ -105,7 +105,7 @@ class GaussianModel:
         self.percent_dense = 0
         self.spatial_lr_scale = 0
         self.texture_rtg_enabled = False
-        self.texture_rtg_refine_from_iter = 20_000
+        self.texture_rtg_refine_from_iter = 30_000
         self.texture_rtg_refine_until_iter = 100_000
         self.texture_rtg_refine_interval = 1_000
         self.texture_rtg_refine_fraction = 0.02
@@ -577,7 +577,7 @@ class GaussianModel:
     def training_setup(self, training_args):
         self.percent_dense = training_args.percent_dense
         self.texture_rtg_enabled = bool(getattr(training_args, "texture_rtg_enabled", False))
-        self.texture_rtg_refine_from_iter = int(getattr(training_args, "texture_rtg_refine_from_iter", 20_000))
+        self.texture_rtg_refine_from_iter = int(getattr(training_args, "texture_rtg_refine_from_iter", 30_000))
         self.texture_rtg_refine_until_iter = int(getattr(training_args, "texture_rtg_refine_until_iter", 100_000))
         self.texture_rtg_refine_interval = int(getattr(training_args, "texture_rtg_refine_interval", 1_000))
         self.texture_rtg_refine_fraction = float(getattr(training_args, "texture_rtg_refine_fraction", 0.02))

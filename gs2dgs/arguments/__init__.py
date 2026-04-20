@@ -158,7 +158,7 @@ class OptimizationParams(ParamGroup):
         self.feature_lr = 0.0025
         self.texture_lr = 0.0025
         self.texture_rtg_enabled = False
-        self.texture_rtg_refine_from_iter = 20_000
+        self.texture_rtg_refine_from_iter = 30_000
         self.texture_rtg_refine_until_iter = 100_000
         self.texture_rtg_refine_interval = 1_000
         self.texture_rtg_refine_fraction = 0.02
