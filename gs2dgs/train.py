@@ -242,10 +242,10 @@ def _restore_viewpoint_stack(scene, loop_state):
         return None
     camera_names = loop_state.get("viewpoint_stack", [])
     cameras = []
-    cameras.extend(scene.getTrainCameras())
-    cameras.extend(scene.getTestCameras())
-    if hasattr(scene, "getValidCameras"):
-        cameras.extend(scene.getValidCameras())
+    train_camera_group = getattr(scene, "train_cameras", None)
+    if isinstance(train_camera_group, dict):
+        for camera_list in train_camera_group.values():
+            cameras.extend(camera_list)
     by_name = {_camera_key(cam): cam for cam in cameras}
     restored = []
     missing = []
@@ -513,6 +513,16 @@ def training(modelset, opt, pipe, testing_iterations, saving_iterations, checkpo
 
     # 初始化高斯实例
     gaussians = GaussianModel(modelset, opt)
+    print(
+        "RTG config: "
+        f"enabled={bool(getattr(opt, 'texture_rtg_enabled', False))}, "
+        f"from={int(getattr(opt, 'texture_rtg_refine_from_iter', -1))}, "
+        f"until={int(getattr(opt, 'texture_rtg_refine_until_iter', -1))}, "
+        f"interval={int(getattr(opt, 'texture_rtg_refine_interval', -1))}, "
+        f"min_score={float(getattr(opt, 'texture_rtg_min_score', 0.0)):.3e}, "
+        f"dynamic={bool(getattr(modelset, 'texture_dynamic_resolution', False))}",
+        flush=True,
+    )
 
     # 根据 训练args，优化args 以及 初始高斯 建立场景实例，最终的高斯实例
     """
@@ -1049,36 +1059,62 @@ def training(modelset, opt, pipe, testing_iterations, saving_iterations, checkpo
                 # Optimizer step
                 if iteration < opt.iterations:  # 判断是否处于优化阶段
                     gaussians.optimizer.step()
-                    is_rtg_start_checkpoint = (
-                        iteration in checkpoint_iterations
-                        and bool(getattr(opt, "texture_rtg_enabled", False))
-                        and bool(getattr(opt, "texture_dynamic_resolution", False))
-                        and iteration == int(getattr(opt, "texture_rtg_refine_from_iter", -1))
-                    )
-                    if hasattr(gaussians, "refine_textures_by_rtg"):
-                        should_refine_rtg = True
-                    else:
-                        should_refine_rtg = False
                     # opt the camera pose
                     if scene.optimizing:    # 判断是否开启相机优化
                         scene.optimizer.step()
                         scene.optimizer.zero_grad(set_to_none = True)
                     gaussians.optimizer.zero_grad(set_to_none = True)   # 梯度清零
-                    if is_rtg_start_checkpoint:
-                        save_training_checkpoint(
-                            scene,
-                            gaussians,
-                            iteration,
-                            label="Pre-RTG Checkpoint",
-                            loop_state=_capture_loop_state(viewpoint_stack, opt_test, opt_test_ready, ema_loss_for_log),
-                        )
-                        checkpoint_saved_this_iter = True
-                    if should_refine_rtg:
-                        num_rtg_refined = gaussians.refine_textures_by_rtg(iteration)
-                        if num_rtg_refined > 0:
-                            rtg_log = gaussians.texture_rtg_log_string() if hasattr(gaussians, "texture_rtg_log_string") else ""
-                            suffix = f" | {rtg_log}" if rtg_log else ""
-                            print(f"\n[ITER {iteration}] RTG refined {num_rtg_refined} texture charts{suffix}")
+
+            if iteration < opt.iterations:
+                is_rtg_start_checkpoint = (
+                    iteration in checkpoint_iterations
+                    and bool(getattr(opt, "texture_rtg_enabled", False))
+                    and bool(getattr(gaussians, "texture_dynamic_resolution", False))
+                    and iteration == int(getattr(opt, "texture_rtg_refine_from_iter", -1))
+                )
+                rtg_method = getattr(gaussians, "refine_textures_by_rtg", None)
+                rtg_interval = max(1, int(getattr(opt, "texture_rtg_refine_interval", 1)))
+                rtg_due = (
+                    bool(getattr(opt, "texture_rtg_enabled", False))
+                    and iteration >= int(getattr(opt, "texture_rtg_refine_from_iter", 0))
+                    and iteration <= int(getattr(opt, "texture_rtg_refine_until_iter", opt.iterations))
+                    and iteration % rtg_interval == 0
+                )
+                if is_rtg_start_checkpoint:
+                    save_training_checkpoint(
+                        scene,
+                        gaussians,
+                        iteration,
+                        label="Pre-RTG Checkpoint",
+                        loop_state=_capture_loop_state(viewpoint_stack, opt_test, opt_test_ready, ema_loss_for_log),
+                    )
+                    checkpoint_saved_this_iter = True
+                if rtg_due:
+                    score = getattr(gaussians, "_rtg_score", None)
+                    if torch.is_tensor(score) and score.numel() > 0:
+                        score_mean = float(score.detach().float().mean().item())
+                        score_max = float(score.detach().float().max().item())
+                    else:
+                        score_mean = 0.0
+                        score_max = 0.0
+                    print(
+                        f"\n[ITER {iteration}] RTG due | "
+                        f"method={callable(rtg_method)}, "
+                        f"score mean/max {score_mean:.3e}/{score_max:.3e}",
+                        flush=True,
+                    )
+                    if not callable(rtg_method):
+                        print(f"\n[ITER {iteration}] RTG skipped | no_refine_method", flush=True)
+                        num_rtg_refined = 0
+                        rtg_log = ""
+                    else:
+                        num_rtg_refined = rtg_method(iteration)
+                        rtg_log = gaussians.texture_rtg_log_string() if hasattr(gaussians, "texture_rtg_log_string") else ""
+                    if num_rtg_refined > 0:
+                        suffix = f" | {rtg_log}" if rtg_log else ""
+                        print(f"\n[ITER {iteration}] RTG refined {num_rtg_refined} texture charts{suffix}", flush=True)
+                    elif rtg_log:
+                        print(f"\n[ITER {iteration}] RTG skipped | {rtg_log}", flush=True)
 
             """
             1. 默认冻结 高斯点相位函数，初期训练高斯点场景空间为主，并只简单优化漫反射 kd (阴影和次要效果为 0)

@@ -164,7 +164,7 @@ class OptimizationParams(ParamGroup):
         self.texture_rtg_refine_fraction = 0.02
         self.texture_rtg_ema = 0.9
         self.texture_rtg_alpha_weight = 1.0
-        self.texture_rtg_min_score = 1e-5
+        self.texture_rtg_min_score = 1e-10
         self.texture_rtg_resolution_gamma = 1.0
         self.texture_rtg_chunk_texels = 262_144
         

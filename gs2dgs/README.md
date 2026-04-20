@@ -174,7 +174,7 @@ The default RTG schedule starts later:
 - `--texture_rtg_refine_until_iter 100000`
 - `--texture_rtg_refine_interval 1000`
 - `--texture_rtg_refine_fraction 0.02`
-- `--texture_rtg_min_score 1e-5`
+- `--texture_rtg_min_score 1e-10`
 - `--texture_rtg_resolution_gamma 1.0`
 
 So short tests should override these values as shown above. The production

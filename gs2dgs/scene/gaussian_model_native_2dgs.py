@@ -111,7 +111,7 @@ class GaussianModel:
         self.texture_rtg_refine_fraction = 0.02
         self.texture_rtg_ema = 0.9
         self.texture_rtg_alpha_weight = 1.0
-        self.texture_rtg_min_score = 1e-5
+        self.texture_rtg_min_score = 1e-10
         self.texture_rtg_resolution_gamma = 1.0
         self.texture_rtg_chunk_texels = 262_144
         self._last_rtg_refine_log = {}
@@ -161,6 +161,10 @@ class GaussianModel:
         )
 
     def restore(self, model_args, training_args):
+        requested_dynamic_textures = bool(self.texture_dynamic_resolution)
+        requested_texture_min_resolution = int(self.texture_min_resolution)
+        requested_texture_max_resolution = int(self.texture_max_resolution)
+        converted_static_textures = False
         if len(model_args) == 12:
             (
                 self.active_sh_degree,
@@ -233,9 +237,14 @@ class GaussianModel:
                 asg_state,
                 phase_state,
             ) = model_args[:32]
-            self.texture_dynamic_resolution = bool(extra_state.get("texture_dynamic_resolution", self.texture_dynamic_resolution))
-            self.texture_min_resolution = int(extra_state.get("texture_min_resolution", self.texture_min_resolution))
-            self.texture_max_resolution = int(extra_state.get("texture_max_resolution", self.texture_max_resolution))
+            checkpoint_dynamic_textures = bool(extra_state.get("texture_dynamic_resolution", self.texture_dynamic_resolution))
+            self.texture_dynamic_resolution = bool(checkpoint_dynamic_textures or requested_dynamic_textures)
+            if requested_dynamic_textures:
+                self.texture_min_resolution = requested_texture_min_resolution
+                self.texture_max_resolution = requested_texture_max_resolution
+            else:
+                self.texture_min_resolution = int(extra_state.get("texture_min_resolution", self.texture_min_resolution))
+                self.texture_max_resolution = int(extra_state.get("texture_max_resolution", self.texture_max_resolution))
             texture_dims = extra_state.get("texture_dims", torch.empty(0))
             self._texture_dims = texture_dims.to(device="cuda", dtype=torch.int32) if isinstance(texture_dims, torch.Tensor) else torch.empty(0, device="cuda", dtype=torch.int32)
             rtg_score = extra_state.get("rtg_score", torch.empty(0))
@@ -246,6 +255,20 @@ class GaussianModel:
                     self.asg_func.load_state_dict(asg_state)
                 if phase_state is not None:
                     self.neural_phasefunc.load_state_dict(phase_state)
+
+        if requested_dynamic_textures:
+            self.texture_dynamic_resolution = True
+            self.texture_min_resolution = requested_texture_min_resolution
+            self.texture_max_resolution = requested_texture_max_resolution
+        if self.use_textures and self.texture_dynamic_resolution and not self.has_dynamic_textures:
+            converted_static_textures = self._convert_static_textures_to_dynamic()
+            if converted_static_textures:
+                stats = self._dynamic_texture_stats()
+                hist = ", ".join(f"{res}x{res}:{count}" for res, count in stats["hist"])
+                print(
+                    f"Converted static textures to dynamic atlas | "
+                    f"texels {stats['total_texels']}, avg {stats['avg_texels']:.1f}/G, res {{{hist}}}"
+                )
 
         self.training_setup(training_args)
         if self.use_textures and self._tex_color.numel() == 0:
@@ -258,6 +281,8 @@ class GaussianModel:
         self.denom = denom
         try:
             self.optimizer.load_state_dict(opt_dict)
+            if converted_static_textures:
+                self._reshape_static_texture_optimizer_state_for_dynamic()
         except ValueError:
             pass
 
@@ -371,6 +396,13 @@ class GaussianModel:
         log = getattr(self, "_last_rtg_refine_log", None)
         if not log:
             return ""
+        if log.get("skipped", False):
+            return (
+                f"skipped {log.get('reason', 'unknown')}, "
+                f"score mean/max {log.get('score_mean', 0.0):.3e}/{log.get('score_max', 0.0):.3e}, "
+                f"gate mean/max {log.get('gate_mean', 0.0):.3e}/{log.get('gate_max', 0.0):.3e}, "
+                f"candidates {log.get('candidate_count', 0)}/{log.get('eligible_count', 0)}"
+            )
         hist = ", ".join(f"{res}x{res}:{count}" for res, count in log.get("hist", []))
         return (
             f"texels {log['before_texels']}->{log['after_texels']} "
@@ -422,6 +454,53 @@ class GaussianModel:
             self._tex_alpha = optimizable["tex_alpha"]
         self._texture_dims = texture_dims.to(device=self.get_xyz.device, dtype=torch.int32)
         self._ensure_rtg_buffers()
+
+    def _pack_static_texture_tensor_for_dynamic(self, tensor):
+        if not isinstance(tensor, torch.Tensor) or tensor.ndim != 4:
+            return tensor
+        return tensor.permute(0, 2, 3, 1).reshape(-1, tensor.shape[1]).contiguous()
+
+    def _convert_static_textures_to_dynamic(self):
+        if not self.use_textures or self.has_dynamic_textures or self._tex_color.numel() == 0:
+            return False
+        if self._tex_color.ndim != 4 or self._tex_alpha.ndim != 4:
+            return False
+        if self._tex_color.shape[0] != self.get_xyz.shape[0] or self._tex_alpha.shape[0] != self.get_xyz.shape[0]:
+            return False
+        if self._tex_color.shape[2:] != self._tex_alpha.shape[2:]:
+            return False
+        tex_h, tex_w = int(self._tex_color.shape[2]), int(self._tex_color.shape[3])
+        if tex_h != tex_w:
+            raise ValueError("Cannot convert non-square static textures to dynamic charts.")
+        device = self.get_xyz.device
+        resolutions = torch.full((self.get_xyz.shape[0],), tex_h, dtype=torch.int32, device=device)
+        texture_dims = self._build_texture_dims_from_resolutions(resolutions)
+        tex_color = self._pack_static_texture_tensor_for_dynamic(self._tex_color.detach()).to(device=device)
+        tex_alpha = self._pack_static_texture_tensor_for_dynamic(self._tex_alpha.detach()).to(device=device)
+        self._tex_color = nn.Parameter(tex_color.requires_grad_(True))
+        self._tex_alpha = nn.Parameter(tex_alpha.requires_grad_(True))
+        self._texture_dims = texture_dims
+        self._ensure_rtg_buffers()
+        return True
+
+    def _reshape_static_texture_optimizer_state_for_dynamic(self):
+        if self.optimizer is None:
+            return
+        for group in self.optimizer.param_groups:
+            if group.get("name") not in {"tex_color", "tex_alpha"} or len(group.get("params", [])) != 1:
+                continue
+            param = group["params"][0]
+            state = self.optimizer.state.get(param, None)
+            if not isinstance(state, dict):
+                continue
+            for key in ("exp_avg", "exp_avg_sq"):
+                value = state.get(key, None)
+                if not isinstance(value, torch.Tensor):
+                    continue
+                packed = self._pack_static_texture_tensor_for_dynamic(value)
+                if not isinstance(packed, torch.Tensor) or packed.shape != param.shape:
+                    packed = torch.zeros_like(param)
+                state[key] = packed.to(device=param.device, dtype=param.dtype)
 
     def _init_dynamic_textures_from_base_color(self, base_color):
         num_points = base_color.shape[0]
@@ -969,18 +1048,34 @@ class GaussianModel:
 
     def refine_textures_by_rtg(self, iteration):
         self._last_rtg_refine_log = {}
-        if not (self.use_textures and self.texture_dynamic_resolution and self.texture_rtg_enabled and self.has_dynamic_textures):
-            return 0
         if iteration < self.texture_rtg_refine_from_iter or iteration > self.texture_rtg_refine_until_iter:
             return 0
         interval = max(1, int(self.texture_rtg_refine_interval))
         if iteration % interval != 0:
+            return 0
+        flags = {
+            "use_textures": bool(self.use_textures),
+            "dynamic": bool(self.texture_dynamic_resolution),
+            "rtg_enabled": bool(self.texture_rtg_enabled),
+            "has_dynamic": bool(self.has_dynamic_textures),
+        }
+        if not all(flags.values()):
+            self._last_rtg_refine_log = {
+                "skipped": True,
+                "reason": "disabled_flags:" + ",".join(k for k, v in flags.items() if not v),
+            }
             return 0
         self._ensure_rtg_buffers()
         old_resolutions = self._texture_dims[:, 0].to(torch.long)
         eligible = old_resolutions < int(self.texture_max_resolution)
         num_eligible = int(eligible.sum().item())
         if num_eligible == 0:
+            self._last_rtg_refine_log = {
+                "skipped": True,
+                "reason": "no_eligible",
+                "candidate_count": 0,
+                "eligible_count": 0,
+            }
             return 0
         min_res = max(1.0, float(getattr(self, "texture_min_resolution", 1)))
         gamma = max(0.0, float(getattr(self, "texture_rtg_resolution_gamma", 1.0)))
@@ -992,15 +1087,45 @@ class GaussianModel:
             valid = torch.logical_and(valid, self._rtg_score >= score_gate)
         candidate_count = int(valid.sum().item())
         if candidate_count == 0:
+            eligible_scores = self._rtg_score[eligible].detach()
+            eligible_gates = score_gate[eligible].detach()
+            self._last_rtg_refine_log = {
+                "skipped": True,
+                "reason": "no_candidates",
+                "score_mean": float(eligible_scores.mean().item()) if eligible_scores.numel() > 0 else 0.0,
+                "score_max": float(eligible_scores.max().item()) if eligible_scores.numel() > 0 else 0.0,
+                "gate_mean": float(eligible_gates.mean().item()) if eligible_gates.numel() > 0 else 0.0,
+                "gate_max": float(eligible_gates.max().item()) if eligible_gates.numel() > 0 else 0.0,
+                "candidate_count": int(candidate_count),
+                "eligible_count": int(num_eligible),
+            }
             return 0
         fraction = max(0.0, float(self.texture_rtg_refine_fraction))
         if fraction <= 0.0:
+            self._last_rtg_refine_log = {
+                "skipped": True,
+                "reason": "zero_fraction",
+                "candidate_count": int(candidate_count),
+                "eligible_count": int(num_eligible),
+            }
             return 0
         k = max(1, int(np.ceil(candidate_count * fraction)))
         valid_idx = torch.nonzero(valid, as_tuple=False).flatten()
         priority = self._rtg_score / resolution_scale
         top_priority, top_order = torch.topk(priority[valid_idx], k=min(k, valid_idx.numel()), largest=True)
         if top_priority.numel() == 0 or float(top_priority.max().item()) <= 0.0:
+            selected_scores = self._rtg_score[valid].detach()
+            selected_gates = score_gate[valid].detach()
+            self._last_rtg_refine_log = {
+                "skipped": True,
+                "reason": "non_positive_priority",
+                "score_mean": float(selected_scores.mean().item()) if selected_scores.numel() > 0 else 0.0,
+                "score_max": float(selected_scores.max().item()) if selected_scores.numel() > 0 else 0.0,
+                "gate_mean": float(selected_gates.mean().item()) if selected_gates.numel() > 0 else 0.0,
+                "gate_max": float(selected_gates.max().item()) if selected_gates.numel() > 0 else 0.0,
+                "candidate_count": int(candidate_count),
+                "eligible_count": int(num_eligible),
+            }
             return 0
         selected = torch.zeros_like(valid)
         selected[valid_idx[top_order]] = True
@@ -1008,6 +1133,12 @@ class GaussianModel:
         new_resolutions[selected] = torch.clamp(new_resolutions[selected] * 2, max=int(self.texture_max_resolution))
         selected = torch.logical_and(selected, new_resolutions > old_resolutions)
         if selected.sum() == 0:
+            self._last_rtg_refine_log = {
+                "skipped": True,
+                "reason": "empty_selection_after_resize",
+                "candidate_count": int(candidate_count),
+                "eligible_count": int(num_eligible),
+            }
             return 0
         before_stats = self._dynamic_texture_stats()
         selected_scores = self._rtg_score[selected].detach()
