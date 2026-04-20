@@ -442,18 +442,121 @@ class GaussianModel:
         if self._rtg_score.numel() != n_points:
             self._rtg_score = torch.zeros((n_points,), dtype=torch.float32, device=self.get_xyz.device)
 
-    def _replace_dynamic_texture_tensors(self, tex_color, tex_alpha, texture_dims):
+    def _replace_dynamic_texture_tensors(self, tex_color, tex_alpha, texture_dims, tex_color_state=None, tex_alpha_state=None):
         self._validate_dynamic_texture_layout(tex_color, tex_alpha, texture_dims)
         if self.optimizer is None:
             self._tex_color = nn.Parameter(tex_color.requires_grad_(True))
             self._tex_alpha = nn.Parameter(tex_alpha.requires_grad_(True))
         else:
-            optimizable = self.replace_tensor_to_optimizer(tex_color, "tex_color")
+            optimizable = self.replace_tensor_to_optimizer(tex_color, "tex_color", state_tensors=tex_color_state)
             self._tex_color = optimizable["tex_color"]
-            optimizable = self.replace_tensor_to_optimizer(tex_alpha, "tex_alpha")
+            optimizable = self.replace_tensor_to_optimizer(tex_alpha, "tex_alpha", state_tensors=tex_alpha_state)
             self._tex_alpha = optimizable["tex_alpha"]
         self._texture_dims = texture_dims.to(device=self.get_xyz.device, dtype=torch.int32)
         self._ensure_rtg_buffers()
+
+    def _optimizer_state_for_name(self, name):
+        if self.optimizer is None:
+            return None
+        for group in self.optimizer.param_groups:
+            if group.get("name") == name and len(group.get("params", [])) == 1:
+                return self.optimizer.state.get(group["params"][0], None)
+        return None
+
+    def _gather_dynamic_tensor_by_mask(self, tensor, point_mask):
+        if not isinstance(tensor, torch.Tensor) or not self.has_dynamic_textures:
+            return None
+        if tensor.shape[0] != self._tex_color.shape[0]:
+            return None
+        selected_idx = torch.nonzero(point_mask, as_tuple=False).flatten()
+        if selected_idx.numel() == 0:
+            return tensor[:0]
+
+        dims = self._texture_dims
+        counts = self._texture_counts(dims)
+        offsets = dims[:, 2].to(torch.long)
+        selected_counts = counts[selected_idx]
+        selected_offsets = torch.zeros_like(selected_counts)
+        if selected_counts.numel() > 1:
+            selected_offsets[1:] = torch.cumsum(selected_counts[:-1], dim=0)
+        total_texels = int(selected_counts.sum().item())
+        gathered = torch.empty((total_texels, tensor.shape[1]), dtype=tensor.dtype, device=tensor.device)
+
+        max_texels = max(1, int(getattr(self, "texture_rtg_chunk_texels", 262_144)))
+        for count_value in torch.unique(selected_counts).tolist():
+            local_idx = torch.nonzero(selected_counts == count_value, as_tuple=False).flatten()
+            if local_idx.numel() == 0:
+                continue
+            charts_per_chunk = max(1, max_texels // max(1, int(count_value)))
+            local = torch.arange(count_value, device=dims.device, dtype=torch.long)
+            for chunk_start in range(0, int(local_idx.numel()), charts_per_chunk):
+                chunk_local_idx = local_idx[chunk_start:chunk_start + charts_per_chunk]
+                src_points = selected_idx[chunk_local_idx]
+                src = offsets[src_points, None] + local[None, :]
+                dst = selected_offsets[chunk_local_idx, None] + local[None, :]
+                gathered[dst.reshape(-1)] = tensor[src.reshape(-1)]
+        return gathered
+
+    def _gather_dynamic_optimizer_state_by_mask(self, name, point_mask):
+        state = self._optimizer_state_for_name(name)
+        if not isinstance(state, dict):
+            return None
+        gathered_state = {}
+        for key in ("exp_avg", "exp_avg_sq"):
+            gathered = self._gather_dynamic_tensor_by_mask(state.get(key), point_mask)
+            if gathered is not None:
+                gathered_state[key] = gathered
+        return gathered_state or None
+
+    def _append_dynamic_optimizer_state(self, name, appended_texels):
+        state = self._optimizer_state_for_name(name)
+        if not isinstance(state, dict):
+            return None
+        appended_texels = int(appended_texels)
+        appended_state = {}
+        for key in ("exp_avg", "exp_avg_sq"):
+            value = state.get(key)
+            if not isinstance(value, torch.Tensor) or value.shape[0] != self._tex_color.shape[0]:
+                continue
+            zeros = torch.zeros((appended_texels, value.shape[1]), dtype=value.dtype, device=value.device)
+            appended_state[key] = torch.cat([value, zeros], dim=0)
+        return appended_state or None
+
+    def _resize_dynamic_optimizer_state(self, name, old_dims, new_resolutions):
+        state = self._optimizer_state_for_name(name)
+        if not isinstance(state, dict):
+            return None
+        old_resolutions = old_dims[:, 0].to(torch.long)
+        old_offsets = old_dims[:, 2].to(torch.long)
+        new_resolutions = new_resolutions.to(device=old_dims.device, dtype=torch.long)
+        new_counts = new_resolutions * new_resolutions
+        new_offsets = torch.zeros_like(new_resolutions)
+        if new_resolutions.numel() > 1:
+            new_offsets[1:] = torch.cumsum(new_counts[:-1], dim=0)
+        total_texels = int(new_counts.sum().item())
+        unchanged = old_resolutions == new_resolutions
+        max_texels = max(1, int(getattr(self, "texture_rtg_chunk_texels", 262_144)))
+
+        resized_state = {}
+        for key in ("exp_avg", "exp_avg_sq"):
+            value = state.get(key)
+            if not isinstance(value, torch.Tensor) or value.shape[0] != self._tex_color.shape[0]:
+                continue
+            new_value = torch.zeros((total_texels, value.shape[1]), dtype=value.dtype, device=value.device)
+            for res_value in torch.unique(old_resolutions[unchanged]).tolist():
+                idx = torch.nonzero(torch.logical_and(unchanged, old_resolutions == res_value), as_tuple=False).flatten()
+                if idx.numel() == 0:
+                    continue
+                texels_per_chart = int(res_value * res_value)
+                charts_per_chunk = max(1, max_texels // max(1, texels_per_chart))
+                local = torch.arange(texels_per_chart, device=old_dims.device, dtype=torch.long)
+                for chunk_start in range(0, int(idx.numel()), charts_per_chunk):
+                    chunk_idx = idx[chunk_start:chunk_start + charts_per_chunk]
+                    src = old_offsets[chunk_idx, None] + local[None, :]
+                    dst = new_offsets[chunk_idx, None] + local[None, :]
+                    new_value[dst.reshape(-1)] = value[src.reshape(-1)]
+            resized_state[key] = new_value
+        return resized_state or None
 
     def _pack_static_texture_tensor_for_dynamic(self, tensor):
         if not isinstance(tensor, torch.Tensor) or tensor.ndim != 4:
@@ -921,12 +1024,14 @@ class GaussianModel:
     def _prune_dynamic_textures(self, valid_points_mask):
         if not self.has_dynamic_textures:
             return
+        tex_color_state = self._gather_dynamic_optimizer_state_by_mask("tex_color", valid_points_mask)
+        tex_alpha_state = self._gather_dynamic_optimizer_state_by_mask("tex_alpha", valid_points_mask)
         tex_color, tex_alpha = self._gather_dynamic_texels_by_mask(valid_points_mask)
         resolutions = self._texture_dims[valid_points_mask, 0]
         texture_dims = self._build_texture_dims_from_resolutions(resolutions)
         kept = int(valid_points_mask.sum().item())
         self._rtg_score = self._rtg_score[valid_points_mask] if self._rtg_score.numel() == valid_points_mask.shape[0] else torch.zeros((kept,), device=self.get_xyz.device)
-        self._replace_dynamic_texture_tensors(tex_color, tex_alpha, texture_dims)
+        self._replace_dynamic_texture_tensors(tex_color, tex_alpha, texture_dims, tex_color_state, tex_alpha_state)
 
     def _append_dynamic_textures_from_mask(self, selected_pts_mask, repeat_count=1):
         if not self.has_dynamic_textures or selected_pts_mask.sum() == 0:
@@ -941,12 +1046,14 @@ class GaussianModel:
         texture_dims = self._build_texture_dims_from_resolutions(torch.cat([old_resolutions, new_resolutions], dim=0))
         tex_color = torch.cat([self._tex_color.detach(), selected_color], dim=0)
         tex_alpha = torch.cat([self._tex_alpha.detach(), selected_alpha], dim=0)
+        tex_color_state = self._append_dynamic_optimizer_state("tex_color", selected_color.shape[0])
+        tex_alpha_state = self._append_dynamic_optimizer_state("tex_alpha", selected_alpha.shape[0])
         if self._rtg_score.numel() == old_resolutions.shape[0]:
             self._rtg_score = torch.cat(
                 [self._rtg_score, torch.zeros((new_resolutions.shape[0],), dtype=torch.float32, device=self._rtg_score.device)],
                 dim=0,
             )
-        self._replace_dynamic_texture_tensors(tex_color, tex_alpha, texture_dims)
+        self._replace_dynamic_texture_tensors(tex_color, tex_alpha, texture_dims, tex_color_state, tex_alpha_state)
 
     def _resize_dynamic_textures(self, selected_pts_mask, new_resolutions):
         if not self.has_dynamic_textures or selected_pts_mask.sum() == 0:
@@ -1014,7 +1121,9 @@ class GaussianModel:
             dim=1,
         )
         refined = int(selected_pts_mask.sum().item())
-        self._replace_dynamic_texture_tensors(new_color, new_alpha, texture_dims)
+        tex_color_state = self._resize_dynamic_optimizer_state("tex_color", old_dims, new_resolutions)
+        tex_alpha_state = self._resize_dynamic_optimizer_state("tex_alpha", old_dims, new_resolutions)
+        self._replace_dynamic_texture_tensors(new_color, new_alpha, texture_dims, tex_color_state, tex_alpha_state)
         if self._rtg_score.numel() == selected_pts_mask.shape[0]:
             self._rtg_score[selected_pts_mask] = 0.0
         return refined
@@ -1163,14 +1272,19 @@ class GaussianModel:
             }
         return refined
 
-    def replace_tensor_to_optimizer(self, tensor, name):
+    def replace_tensor_to_optimizer(self, tensor, name, state_tensors=None):
         optimizable_tensors = {}
         for group in self.optimizer.param_groups:
             if group["name"] == name:
                 stored_state = self.optimizer.state.get(group["params"][0], None)
                 if stored_state is not None:
-                    stored_state["exp_avg"] = torch.zeros_like(tensor)
-                    stored_state["exp_avg_sq"] = torch.zeros_like(tensor)
+                    state_tensors = state_tensors or {}
+                    for key in ("exp_avg", "exp_avg_sq"):
+                        value = state_tensors.get(key)
+                        if isinstance(value, torch.Tensor) and value.shape == tensor.shape:
+                            stored_state[key] = value.to(device=tensor.device, dtype=tensor.dtype)
+                        else:
+                            stored_state[key] = torch.zeros_like(tensor)
                     del self.optimizer.state[group["params"][0]]
                 group["params"][0] = nn.Parameter(tensor.requires_grad_(True))
                 if stored_state is not None:
