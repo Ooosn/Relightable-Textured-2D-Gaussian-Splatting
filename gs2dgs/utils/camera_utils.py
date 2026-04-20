@@ -129,14 +129,18 @@ def camera_to_JSON(id, camera : Camera):
     pos = W2C[:3, 3]
     rot = W2C[:3, :3]
     serializable_array_2d = [x.tolist() for x in rot]
+    width = camera.image_width if hasattr(camera, "image_width") else camera.width
+    height = camera.image_height if hasattr(camera, "image_height") else camera.height
+    fov_x = camera.FoVx if hasattr(camera, "FoVx") else camera.FovX
+    fov_y = camera.FoVy if hasattr(camera, "FoVy") else camera.FovY
     camera_entry = {
         'id' : id,
         'img_name' : camera.image_name,
-        'width' : camera.image_width,
-        'height' : camera.image_height,
+        'width' : width,
+        'height' : height,
         'position': pos.tolist(),
         'rotation': serializable_array_2d,
-        'fy' : fov2focal(camera.FoVy, camera.image_height),
-        'fx' : fov2focal(camera.FoVx, camera.image_width)
+        'fy' : fov2focal(fov_y, height),
+        'fx' : fov2focal(fov_x, width)
     }
     return camera_entry

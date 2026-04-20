@@ -90,6 +90,7 @@ def rasterize_with_texture_module(viewpoint_camera, pc, pipe, bg_color, scaling_
 
     use_tex = bool(getattr(pc, "use_textures", False)) and bool(getattr(pipe, "enable_texture", True))
     texture_alpha = pc.get_texture_alpha if use_tex else None
+    texture_dims = pc.get_texture_dims if use_tex and bool(getattr(pc, "has_dynamic_textures", False)) else None
     tex_res = int(getattr(pc, "texture_resolution", 1))
 
     if not deferred:
@@ -98,7 +99,7 @@ def rasterize_with_texture_module(viewpoint_camera, pc, pipe, bg_color, scaling_
             if shadow is not None and shadow.ndim == 3:
                 shadow = shadow.unsqueeze(1)
             other_effects = mbrdf["other_effects"]
-            if other_effects is not None and other_effects.ndim == 2 and use_tex:
+            if other_effects is not None and other_effects.ndim == 2 and use_tex and texture_dims is None:
                 other_effects = other_effects[:, :, None, None].expand(-1, -1, tex_res, tex_res)
             mbrdf_colors = mbrdf["basecolor"] * shadow + other_effects
         else:
@@ -121,6 +122,7 @@ def rasterize_with_texture_module(viewpoint_camera, pc, pipe, bg_color, scaling_
             cov3D_precomp=cov3D_precomp,
             texture_color=texture_color,
             texture_alpha=texture_alpha,
+            texture_dims=texture_dims,
             use_textures=use_tex,
             transmat_grad_holder=transmat_grad_holder,
         )
@@ -131,7 +133,7 @@ def rasterize_with_texture_module(viewpoint_camera, pc, pipe, bg_color, scaling_
         if shadow is not None and shadow.ndim == 3:
             shadow = shadow.unsqueeze(1)
         other_effects = mbrdf["other_effects"]
-        if other_effects is not None and other_effects.ndim == 2 and use_tex:
+        if other_effects is not None and other_effects.ndim == 2 and use_tex and texture_dims is None:
             other_effects = other_effects[:, :, None, None].expand(-1, -1, tex_res, tex_res)
         if other_effects is not None and use_tex and other_effects.ndim == 4:
             pass
@@ -156,6 +158,7 @@ def rasterize_with_texture_module(viewpoint_camera, pc, pipe, bg_color, scaling_
         cov3D_precomp=cov3D_precomp,
         texture_color=texture_color,
         texture_alpha=texture_alpha,
+        texture_dims=texture_dims,
         use_textures=use_tex,
         transmat_grad_holder=transmat_grad_holder,
     )

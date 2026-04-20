@@ -139,6 +139,7 @@ def _compute_shadow_pass_2dgs_native(viewpoint_camera, gau, pipe, bg_color, scal
     lt = _build_light_transform_2dgs(viewpoint_camera, means3d, pipe)
     use_textures = bool(getattr(gau, "use_textures", False)) and bool(getattr(pipe, "enable_texture", True))
     texture_alpha = gau.get_texture_alpha if use_textures else torch.empty(0, device="cuda")
+    texture_dims = gau.get_texture_dims if use_textures and bool(getattr(gau, "has_dynamic_textures", False)) else torch.empty(0, device="cuda", dtype=torch.int32)
 
     shadow_settings = ShadowRasterSettings(
         image_height=lt["h_light"],
@@ -170,6 +171,7 @@ def _compute_shadow_pass_2dgs_native(viewpoint_camera, gau, pipe, bg_color, scal
         rotations=gau.get_rotation,
         cov3Ds_precomp=None,
         texture_alpha=texture_alpha,
+        texture_dims=texture_dims,
         texture_sigma_factor=float(getattr(gau, "texture_sigma_factor", 3.0)),
         non_trans=None,
         offset=getattr(pipe, "shadow_offset", 0.015),
@@ -178,9 +180,17 @@ def _compute_shadow_pass_2dgs_native(viewpoint_camera, gau, pipe, bg_color, scal
     )
     non_trans_safe = torch.clamp_min(non_trans, 1e-6)
     if use_textures:
-        tex_res = int(getattr(gau, "texture_resolution", 1))
-        per_uv_shadow = (out_trans / non_trans_safe).view(means3d.shape[0], tex_res, tex_res)
-        per_point_shadow = per_uv_shadow.mean(dim=(-2, -1), keepdim=False).unsqueeze(-1)
+        if texture_dims.numel() > 0:
+            per_uv_shadow = (out_trans / non_trans_safe).reshape(-1)
+            counts = (texture_dims[:, 0].to(torch.long) * texture_dims[:, 1].to(torch.long)).clamp_min(1)
+            owner_ids = torch.repeat_interleave(torch.arange(means3d.shape[0], device=means3d.device), counts)
+            per_point_shadow = torch.zeros((means3d.shape[0],), dtype=per_uv_shadow.dtype, device=means3d.device)
+            per_point_shadow.scatter_add_(0, owner_ids, per_uv_shadow)
+            per_point_shadow = (per_point_shadow / counts.to(per_uv_shadow.dtype)).unsqueeze(-1)
+        else:
+            tex_res = int(getattr(gau, "texture_resolution", 1))
+            per_uv_shadow = (out_trans / non_trans_safe).view(means3d.shape[0], tex_res, tex_res)
+            per_point_shadow = per_uv_shadow.mean(dim=(-2, -1), keepdim=False).unsqueeze(-1)
     else:
         per_uv_shadow = None
         per_point_shadow = (out_trans / non_trans_safe).unsqueeze(-1)
@@ -231,6 +241,62 @@ def _compute_mbrdf_colors_2dgs(viewpoint_camera, gau, shadow_pkg, fix_labert=Fal
     asg_1 = gau.asg_func(wi_local, wo_local, gau.get_alpha_asg, asg_scales, asg_axises)
 
     per_uv_shadow = None if shadow_pkg is None else shadow_pkg.get("per_uv_shadow")
+    if bool(getattr(gau, "use_textures", False)) and per_uv_shadow is not None and bool(getattr(gau, "has_dynamic_textures", False)):
+        texture_effect_mode = str(getattr(gau, "texture_effect_mode", "per_uv"))
+        if texture_effect_mode != "per_uv":
+            raise ValueError("Dynamic texture resolution currently requires texture_effect_mode='per_uv'.")
+
+        texture_dims = gau.get_texture_dims
+        counts = (texture_dims[:, 0].to(torch.long) * texture_dims[:, 1].to(torch.long)).clamp_min(1)
+        offsets = texture_dims[:, 2].to(torch.long)
+        total_texels = int(counts.sum().item())
+        chunk_points = max(1, int(getattr(gau, "texture_phase_chunk_points", 4096)))
+        per_uv_shadow = per_uv_shadow.reshape(total_texels, 1)
+
+        basecolor = torch.empty((total_texels, 3), dtype=torch.float32, device=dev)
+        shadow = torch.empty((total_texels, 1), dtype=torch.float32, device=dev)
+        other_effects = torch.empty((total_texels, 3), dtype=torch.float32, device=dev)
+        texture_color = gau.get_texture_color
+
+        for start in range(0, num_points, chunk_points):
+            end = min(start + chunk_points, num_points)
+            point_ids = torch.arange(start, end, dtype=torch.long, device=dev)
+            texel_ids = torch.repeat_interleave(point_ids, counts[start:end])
+            flat_start = int(offsets[start].item())
+            flat_end = int((offsets[end - 1] + counts[end - 1]).item())
+            num_texels = flat_end - flat_start
+
+            def _expand_chunk(tensor):
+                return tensor[texel_ids]
+
+            decay_flat, other_effects_flat, asg_3_flat, _ = gau.neural_phasefunc(
+                _expand_chunk(wi),
+                _expand_chunk(wo),
+                _expand_chunk(gau.get_xyz),
+                _expand_chunk(gau.get_neural_material),
+                hint=per_uv_shadow[flat_start:flat_end],
+                asg_1=_expand_chunk(asg_1),
+                asg_mlp=gau.asg_mlp,
+            )
+            if decay_flat is None:
+                decay_flat = torch.ones((num_texels, 1), dtype=torch.float32, device=dev)
+            if asg_3_flat is None:
+                asg_3_flat = _expand_chunk(asg_1)
+            if other_effects_flat is None:
+                other_effects[flat_start:flat_end] = 0.0
+            else:
+                other_effects[flat_start:flat_end] = other_effects_flat * (1.0 / _expand_chunk(wi_dist2))
+
+            shadow[flat_start:flat_end] = decay_flat
+            specular_flat = _expand_chunk(gau.get_ks) * asg_3_flat
+            basecolor[flat_start:flat_end] = (
+                (texture_color[flat_start:flat_end] + specular_flat)
+                * _expand_chunk(cos_theta)
+                * _expand_chunk(dist_2_inv)
+            )
+
+        return {"basecolor": basecolor, "shadow": shadow, "other_effects": other_effects}
+
     if bool(getattr(gau, "use_textures", False)) and per_uv_shadow is not None:
         tex_res = per_uv_shadow.shape[-1]
         texture_effect_mode = str(getattr(gau, "texture_effect_mode", "per_uv"))

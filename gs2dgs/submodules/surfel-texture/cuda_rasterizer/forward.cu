@@ -272,10 +272,11 @@ renderCUDA(
 	const float* __restrict__ transMats,
 	const float* __restrict__ depths,
 	const float4* __restrict__ normal_opacity,
-	const bool use_textures,
-	const float* __restrict__ texture_color,
-	const float* __restrict__ texture_alpha,
-	int texture_resolution,
+		const bool use_textures,
+		const float* __restrict__ texture_color,
+		const float* __restrict__ texture_alpha,
+		const int* __restrict__ texture_dims,
+		int texture_resolution,
 	float texture_sigma_factor,
 	float* __restrict__ final_T,
 	uint32_t* __restrict__ n_contrib,
@@ -397,15 +398,16 @@ renderCUDA(
 			float du_dsx = 0.0f;
 			float dv_dsy = 0.0f;
 
-			if (use_textures && texture_color != nullptr && texture_resolution > 0)
-			{
-				compute_texture_uv(s, texture_sigma_factor, u, v, du_dsx, dv_dsy);
-				sample_texture_bilinear(
-					texture_color,
-					texture_alpha,
-					collected_id[j],
-					texture_resolution,
-					u,
+				if (use_textures && texture_color != nullptr && (texture_resolution > 0 || texture_dims != nullptr))
+				{
+					compute_texture_uv(s, texture_sigma_factor, u, v, du_dsx, dv_dsy);
+					sample_texture_bilinear(
+						texture_color,
+						texture_alpha,
+						collected_id[j],
+						texture_resolution,
+						texture_dims,
+						u,
 					v,
 					tex_rgb,
 					tex_a,
@@ -502,6 +504,7 @@ void FORWARD::render(
 	bool use_textures,
 	const float* texture_color,
 	const float* texture_alpha,
+	const int* texture_dims,
 	int texture_resolution,
 	float texture_sigma_factor,
 	float* final_T,
@@ -520,10 +523,11 @@ void FORWARD::render(
 		transMats,
 		depths,
 		normal_opacity,
-		use_textures,
-		texture_color,
-		texture_alpha,
-		texture_resolution,
+			use_textures,
+			texture_color,
+			texture_alpha,
+			texture_dims,
+			texture_resolution,
 		texture_sigma_factor,
 		final_T,
 		n_contrib,

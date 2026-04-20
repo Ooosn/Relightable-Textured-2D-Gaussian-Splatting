@@ -79,6 +79,9 @@ class ModelParams(ParamGroup):
         self.use_nerual_phasefunc = True
         self.use_textures = False
         self.texture_resolution = 4
+        self.texture_dynamic_resolution = False
+        self.texture_min_resolution = 4
+        self.texture_max_resolution = 64
         self.texture_effect_mode = "per_uv"
         self.texture_phase_chunk_points = 4096
         # 输入图片数量最大值，默认 2000
@@ -153,6 +156,14 @@ class OptimizationParams(ParamGroup):
         self.position_lr_max_steps = 30_000
         self.feature_lr = 0.0025
         self.texture_lr = 0.0025
+        self.texture_rtg_enabled = False
+        self.texture_rtg_refine_from_iter = 15_000
+        self.texture_rtg_refine_until_iter = 100_000
+        self.texture_rtg_refine_interval = 1_000
+        self.texture_rtg_refine_fraction = 0.02
+        self.texture_rtg_ema = 0.9
+        self.texture_rtg_alpha_weight = 1.0
+        self.texture_rtg_min_score = 0.0
         
         self.kd_lr = 0.01
         self.ks_lr = 0.01

@@ -131,9 +131,10 @@ RasterizeGaussiansCUDA(
 	const int image_width,
 	const torch::Tensor& sh,
 	const int degree,
-	const torch::Tensor& campos,
-	const torch::Tensor& texture_alpha,
-	const float texture_sigma_factor,
+		const torch::Tensor& campos,
+		const torch::Tensor& texture_alpha,
+		const torch::Tensor& texture_dims,
+		const float texture_sigma_factor,
 	const bool prefiltered,
 	const bool debug,
 	const torch::Tensor& non_trans,
@@ -161,8 +162,15 @@ RasterizeGaussiansCUDA(
   CHECK_INPUT(projmatrix);
   CHECK_INPUT(sh);
   CHECK_INPUT(campos);
-  if (texture_alpha.numel() != 0) CHECK_INPUT(texture_alpha);
-  if (non_trans.numel() != 0) CHECK_INPUT(non_trans);
+		  if (texture_alpha.numel() != 0) CHECK_INPUT(texture_alpha);
+		  if (texture_dims.numel() != 0) {
+		    CHECK_INPUT(texture_dims);
+		    TORCH_CHECK(texture_dims.scalar_type() == torch::kInt32, "texture_dims must be int32");
+		    TORCH_CHECK(texture_dims.dim() == 2 && texture_dims.size(1) == 3, "texture_dims must have shape [P, 3]");
+		    TORCH_CHECK(texture_dims.size(0) == means3D.size(0), "texture_dims first dimension must match point count");
+		    TORCH_CHECK(texture_alpha.dim() == 2 && texture_alpha.size(1) == 1, "dynamic texture_alpha must have shape [total_texels, 1]");
+		  }
+		  if (non_trans.numel() != 0) CHECK_INPUT(non_trans);
 
   auto int_opts = means3D.options().dtype(torch::kInt32);
   auto float_opts = means3D.options().dtype(torch::kFloat32);
@@ -172,11 +180,11 @@ RasterizeGaussiansCUDA(
   // When a texture_alpha with a valid resolution is provided, accumulate shadow
   // per UV texel (layout matches texture_alpha_index: [P * res * res] flat).
   // Otherwise fall back to the original per-Gaussian scalar layout [P].
-  const int tex_res_shadow = static_cast<int>(
-      texture_alpha.numel() == 0 ? 0 : texture_alpha.size(2));
-  const long shadow_buf_size = (tex_res_shadow > 0)
-      ? static_cast<long>(P) * tex_res_shadow * tex_res_shadow
-      : static_cast<long>(P);
+	  const int tex_res_shadow = static_cast<int>(
+	      (texture_alpha.numel() == 0 || texture_dims.numel() != 0) ? 0 : texture_alpha.size(2));
+	  const long shadow_buf_size = (texture_dims.numel() != 0)
+	      ? static_cast<long>(texture_alpha.numel())
+	      : ((tex_res_shadow > 0) ? static_cast<long>(P) * tex_res_shadow * tex_res_shadow : static_cast<long>(P));
   torch::Tensor out_trans = torch::zeros({shadow_buf_size}, float_opts);
   torch::Tensor radii = torch::full({P}, 0, means3D.options().dtype(torch::kInt32));
   
@@ -216,9 +224,10 @@ RasterizeGaussiansCUDA(
 		viewmatrix.contiguous().data<float>(), 
 		projmatrix.contiguous().data<float>(),
 		campos.contiguous().data<float>(),
-		texture_alpha.numel() == 0 ? nullptr : texture_alpha.contiguous().data_ptr<float>(),
-		static_cast<int>(texture_alpha.numel() == 0 ? 0 : texture_alpha.size(2)),
-		texture_sigma_factor,
+			texture_alpha.numel() == 0 ? nullptr : texture_alpha.contiguous().data_ptr<float>(),
+			texture_dims.numel() == 0 ? nullptr : texture_dims.contiguous().data_ptr<int>(),
+			static_cast<int>((texture_alpha.numel() == 0 || texture_dims.numel() != 0) ? 0 : texture_alpha.size(2)),
+			texture_sigma_factor,
 		tan_fovx,
 		tan_fovy,
 		prefiltered,

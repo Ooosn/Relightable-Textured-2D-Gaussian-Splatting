@@ -30,6 +30,7 @@ def rasterize_gaussians(
     cov3Ds_precomp,
     texture_color,
     texture_alpha,
+    texture_dims,
     texture_sigma_factor,
     use_textures,
     transmat_grad_holder,
@@ -46,6 +47,7 @@ def rasterize_gaussians(
         cov3Ds_precomp,
         texture_color,
         texture_alpha,
+        texture_dims,
         texture_sigma_factor,
         use_textures,
         transmat_grad_holder,
@@ -66,6 +68,7 @@ class _RasterizeGaussians(torch.autograd.Function):
         cov3Ds_precomp,
         texture_color,
         texture_alpha,
+        texture_dims,
         texture_sigma_factor,
         use_textures,
         transmat_grad_holder,
@@ -93,6 +96,7 @@ class _RasterizeGaussians(torch.autograd.Function):
             raster_settings.campos,
             texture_color,
             texture_alpha,
+            texture_dims,
             texture_sigma_factor,
             use_textures,
             raster_settings.prefiltered,
@@ -127,6 +131,7 @@ class _RasterizeGaussians(torch.autograd.Function):
             sh,
             texture_color,
             texture_alpha,
+            texture_dims,
             geomBuffer,
             binningBuffer,
             imgBuffer,
@@ -151,6 +156,7 @@ class _RasterizeGaussians(torch.autograd.Function):
             sh,
             texture_color,
             texture_alpha,
+            texture_dims,
             geomBuffer,
             binningBuffer,
             imgBuffer,
@@ -176,6 +182,7 @@ class _RasterizeGaussians(torch.autograd.Function):
                 raster_settings.campos,
                 texture_color,
                 texture_alpha,
+                texture_dims,
                 texture_sigma_factor,
                 use_textures,
                 geomBuffer,
@@ -227,6 +234,7 @@ class _RasterizeGaussians(torch.autograd.Function):
             grad_texture_alpha,
             None,
             None,
+            None,
             grad_cov3Ds_precomp if ctx.has_transmat_grad_holder else None,
             None,
         )
@@ -275,6 +283,7 @@ class GaussianRasterizer(nn.Module):
         cov3D_precomp=None,
         texture_color=None,
         texture_alpha=None,
+        texture_dims=None,
         texture_sigma_factor=3.0,
         use_textures=True,
         transmat_grad_holder=None,
@@ -303,6 +312,8 @@ class GaussianRasterizer(nn.Module):
             texture_color = torch.Tensor([]).cuda()
         if texture_alpha is None:
             texture_alpha = torch.Tensor([]).cuda()
+        if texture_dims is None:
+            texture_dims = torch.empty(0, device=means3D.device, dtype=torch.int32)
         if transmat_grad_holder is None:
             transmat_grad_holder = torch.Tensor([]).cuda()
         
@@ -319,9 +330,9 @@ class GaussianRasterizer(nn.Module):
             cov3D_precomp,
             texture_color,
             texture_alpha,
+            texture_dims,
             texture_sigma_factor,
             use_textures,
             transmat_grad_holder,
             raster_settings, 
         )
-
