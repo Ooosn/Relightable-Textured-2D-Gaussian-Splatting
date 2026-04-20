@@ -516,7 +516,7 @@ def training(modelset, opt, pipe, testing_iterations, saving_iterations, checkpo
             }
 
 
-    loss_fn_alex.to(gaussians.get_features.device)
+    get_lpips_model().to(gaussians.get_features.device)
 
     if first_iter < unfreeze_iterations:
         gaussians.neural_phasefunc.freeze()

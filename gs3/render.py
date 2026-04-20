@@ -38,7 +38,8 @@ from rich.panel import Panel
 import time
 import matplotlib.pyplot as plt
 from write_vedio import images_to_video
-import nerfbaselines
+from concurrent.futures import ThreadPoolExecutor
+executor = ThreadPoolExecutor(max_workers=8)
 
 def render_set(modelset, name, iteration, views, gaussians, pipeline, background, gamma, hdr, write_images=False, calculate_fps=False, force_save=False, 
                synthesize_video = False, shadowmap_render = False):
@@ -159,10 +160,10 @@ def render_set(modelset, name, iteration, views, gaussians, pipeline, background
                     try:
                         os.makedirs(key, exist_ok=True)
                         if force_save:
-                            torchvision.utils.save_image(value, os.path.join(key, '{0:05d}'.format(idx) + ".png"))
+                            executor.submit(torchvision.utils.save_image, value, os.path.join(key, '{0:05d}'.format(idx) + ".png"))
                         else:
                             if not os.path.exists(os.path.join(key, '{0:05d}'.format(idx) + ".png")):
-                                torchvision.utils.save_image(value, os.path.join(key, '{0:05d}'.format(idx) + ".png"))
+                                executor.submit(torchvision.utils.save_image, value, os.path.join(key, '{0:05d}'.format(idx) + ".png"))
                     except:
                         print("problem found in", key)
             

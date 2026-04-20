@@ -101,10 +101,25 @@ class Scene:
         self.train_cameras = {}
         self.test_cameras = {}
         self.valid_cameras = {}
+
+        camera_source_path = self.source_path
+        if self.loaded_iter:
+            load_model_path = self.resume_model_path or self.model_path
+            saved_camera_path = os.path.join(
+                load_model_path,
+                "point_cloud",
+                "iteration_" + str(self.loaded_iter),
+            )
+            if any(
+                os.path.exists(os.path.join(saved_camera_path, name))
+                for name in ("transforms_train.json", "transforms_test.json", "transforms_valid.json")
+            ):
+                camera_source_path = saved_camera_path
+                print(f"Using saved camera/light transforms from: {camera_source_path}")
         
         # 无论是否加载已训练的模型，都需要加载场景数据集
         # 仅判断是否存在transforms_train.json文件，如果存在则认为是Blender数据集，随后在sceneLoadTypeCallbacks中调用Blender函数加载训练和测试集的相机信息
-        if os.path.exists(os.path.join(self.source_path, "transforms_train.json")):
+        if os.path.exists(os.path.join(camera_source_path, "transforms_train.json")):
             print("Found transforms_train.json file, assuming Blender data set!")
         
             # scene_info 获得的是一个 SceneInfo 对象，包含了场景的所有信息，比如训练集和测试集的相机信息、点云信息、图片信息等
@@ -114,7 +129,7 @@ class Scene:
                            nerf_normalization=nerf_normalization,
                            ply_path=ply_path)   # 点云信息地址，不存在则随机初始化
             """
-            scene_info = sceneLoadTypeCallbacks["Blender"](self.source_path, args.white_background, args.eval, args.view_num, args.load_num, \
+            scene_info = sceneLoadTypeCallbacks["Blender"](camera_source_path, args.white_background, args.eval, args.view_num, args.load_num, \
                                                        valid=valid, skip_train=skip_train, skip_test=skip_test,
                                                        extension=".exr" if args.hdr else ".png")
         else:
