@@ -48,6 +48,7 @@ class GaussianModel2DGSAdapter(_BaseGaussianModel2DGS):
         self.texture_sigma_factor = float(getattr(modelset, "texture_sigma_factor", 3.0))
         self.texture_effect_mode = str(getattr(modelset, "texture_effect_mode", "per_uv"))
         self.texture_phase_chunk_points = int(getattr(modelset, "texture_phase_chunk_points", 4096))
+        self.texture_phase_chunk_texels = int(getattr(modelset, "texture_phase_chunk_texels", 262_144))
 
     def update_learning_rate(self, iteration, asg_freeze_step=0, local_q_freeze_step=0, freeze_phasefunc_steps=0):
         for param_group in self.optimizer.param_groups:

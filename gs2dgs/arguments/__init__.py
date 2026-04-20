@@ -84,6 +84,7 @@ class ModelParams(ParamGroup):
         self.texture_max_resolution = 64
         self.texture_effect_mode = "per_uv"
         self.texture_phase_chunk_points = 4096
+        self.texture_phase_chunk_texels = 262_144
         # 输入图片数量最大值，默认 2000
         self.view_num = 2000
         # MLP parameter
@@ -164,6 +165,7 @@ class OptimizationParams(ParamGroup):
         self.texture_rtg_ema = 0.9
         self.texture_rtg_alpha_weight = 1.0
         self.texture_rtg_min_score = 0.0
+        self.texture_rtg_chunk_texels = 262_144
         
         self.kd_lr = 0.01
         self.ks_lr = 0.01

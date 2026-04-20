@@ -112,6 +112,7 @@ class GaussianModel:
         self.texture_rtg_ema = 0.9
         self.texture_rtg_alpha_weight = 1.0
         self.texture_rtg_min_score = 0.0
+        self.texture_rtg_chunk_texels = 262_144
         self._last_rtg_refine_log = {}
         self.setup_functions()
 
@@ -440,10 +441,64 @@ class GaussianModel:
             return torch.empty(0, device=self.get_xyz.device, dtype=torch.long)
         return torch.repeat_interleave(torch.arange(counts.shape[0], device=counts.device), counts)
 
+    def _accumulate_dynamic_texture_grad_score(self, grad, score, weight=1.0):
+        if grad is None or not self.has_dynamic_textures:
+            return
+        texel_score = grad.detach().abs().mean(dim=1)
+        dims = self._texture_dims
+        counts = self._texture_counts(dims)
+        offsets = dims[:, 2].to(torch.long)
+        max_texels = max(1, int(getattr(self, "texture_rtg_chunk_texels", 262_144)))
+        max_points = 4096
+        num_points = int(dims.shape[0])
+        start = 0
+        while start < num_points:
+            point_end = min(start + max_points, num_points)
+            cumulative = torch.cumsum(counts[start:point_end], dim=0)
+            valid = torch.nonzero(cumulative <= max_texels, as_tuple=False).flatten()
+            end = start + 1 if valid.numel() == 0 else start + int(valid[-1].item()) + 1
+            chunk_counts = counts[start:end]
+            for count_value in torch.unique(chunk_counts).tolist():
+                local_idx = torch.nonzero(chunk_counts == count_value, as_tuple=False).flatten()
+                if local_idx.numel() == 0:
+                    continue
+                point_idx = local_idx + start
+                local = torch.arange(count_value, device=dims.device, dtype=torch.long)
+                src = offsets[point_idx, None] + local[None, :]
+                score[point_idx] += float(weight) * texel_score[src.reshape(-1)].view(point_idx.numel(), -1).sum(dim=1)
+            start = end
+
     def _gather_dynamic_texels_by_mask(self, point_mask):
-        owner_ids = self._texel_owner_ids()
-        texel_mask = point_mask[owner_ids]
-        return self._tex_color.detach()[texel_mask], self._tex_alpha.detach()[texel_mask]
+        selected_idx = torch.nonzero(point_mask, as_tuple=False).flatten()
+        if selected_idx.numel() == 0:
+            return self._tex_color.detach()[:0], self._tex_alpha.detach()[:0]
+
+        dims = self._texture_dims
+        counts = self._texture_counts(dims)
+        offsets = dims[:, 2].to(torch.long)
+        selected_counts = counts[selected_idx]
+        selected_offsets = torch.zeros_like(selected_counts)
+        if selected_counts.numel() > 1:
+            selected_offsets[1:] = torch.cumsum(selected_counts[:-1], dim=0)
+        total_texels = int(selected_counts.sum().item())
+        selected_color = torch.empty((total_texels, self._tex_color.shape[1]), dtype=self._tex_color.dtype, device=self._tex_color.device)
+        selected_alpha = torch.empty((total_texels, self._tex_alpha.shape[1]), dtype=self._tex_alpha.dtype, device=self._tex_alpha.device)
+
+        max_texels = max(1, int(getattr(self, "texture_rtg_chunk_texels", 262_144)))
+        for count_value in torch.unique(selected_counts).tolist():
+            local_idx = torch.nonzero(selected_counts == count_value, as_tuple=False).flatten()
+            if local_idx.numel() == 0:
+                continue
+            charts_per_chunk = max(1, max_texels // max(1, int(count_value)))
+            local = torch.arange(count_value, device=dims.device, dtype=torch.long)
+            for chunk_start in range(0, int(local_idx.numel()), charts_per_chunk):
+                chunk_local_idx = local_idx[chunk_start:chunk_start + charts_per_chunk]
+                src_points = selected_idx[chunk_local_idx]
+                src = offsets[src_points, None] + local[None, :]
+                dst = selected_offsets[chunk_local_idx, None] + local[None, :]
+                selected_color[dst.reshape(-1)] = self._tex_color.detach()[src.reshape(-1)]
+                selected_alpha[dst.reshape(-1)] = self._tex_alpha.detach()[src.reshape(-1)]
+        return selected_color, selected_alpha
 
     def _initialize_mbrdf_modules(self):
         self.asg_func = Mixture_of_ASG(self.basis_asg_num, self.asg_channel_num)
@@ -526,6 +581,7 @@ class GaussianModel:
         self.texture_rtg_ema = float(getattr(training_args, "texture_rtg_ema", 0.9))
         self.texture_rtg_alpha_weight = float(getattr(training_args, "texture_rtg_alpha_weight", 1.0))
         self.texture_rtg_min_score = float(getattr(training_args, "texture_rtg_min_score", 0.0))
+        self.texture_rtg_chunk_texels = int(getattr(training_args, "texture_rtg_chunk_texels", 262_144))
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self._ensure_rtg_buffers()
@@ -828,16 +884,21 @@ class GaussianModel:
         new_color = torch.empty((total_texels, color_channels), dtype=self._tex_color.dtype, device=self._tex_color.device)
         new_alpha = torch.empty((total_texels, alpha_channels), dtype=self._tex_alpha.dtype, device=self._tex_alpha.device)
         unchanged = old_resolutions == new_resolutions
+        max_texels = max(1, int(getattr(self, "texture_rtg_chunk_texels", 262_144)))
 
         for res_value in torch.unique(old_resolutions[unchanged]).tolist():
             idx = torch.nonzero(torch.logical_and(unchanged, old_resolutions == res_value), as_tuple=False).flatten()
             if idx.numel() == 0:
                 continue
-            local = torch.arange(res_value * res_value, device=old_dims.device, dtype=torch.long)
-            src = old_offsets[idx, None] + local[None, :]
-            dst = new_offsets[idx, None] + local[None, :]
-            new_color[dst.reshape(-1)] = self._tex_color.detach()[src.reshape(-1)]
-            new_alpha[dst.reshape(-1)] = self._tex_alpha.detach()[src.reshape(-1)]
+            texels_per_chart = int(res_value * res_value)
+            charts_per_chunk = max(1, max_texels // max(1, texels_per_chart))
+            local = torch.arange(texels_per_chart, device=old_dims.device, dtype=torch.long)
+            for chunk_start in range(0, int(idx.numel()), charts_per_chunk):
+                chunk_idx = idx[chunk_start:chunk_start + charts_per_chunk]
+                src = old_offsets[chunk_idx, None] + local[None, :]
+                dst = new_offsets[chunk_idx, None] + local[None, :]
+                new_color[dst.reshape(-1)] = self._tex_color.detach()[src.reshape(-1)]
+                new_alpha[dst.reshape(-1)] = self._tex_alpha.detach()[src.reshape(-1)]
 
         changed = old_resolutions != new_resolutions
         for res_value in torch.unique(old_resolutions[changed]).tolist():
@@ -845,20 +906,25 @@ class GaussianModel:
             if idx.numel() == 0:
                 continue
             target_res = int(new_resolutions[idx[0]].item())
-            local_old = torch.arange(res_value * res_value, device=old_dims.device, dtype=torch.long)
-            src = old_offsets[idx, None] + local_old[None, :]
-            color_values = torch.sigmoid(self._tex_color.detach()[src.reshape(-1)]).view(idx.numel(), res_value, res_value, color_channels)
-            alpha_values = torch.sigmoid(self._tex_alpha.detach()[src.reshape(-1)]).view(idx.numel(), res_value, res_value, alpha_channels)
-            color_values = color_values.permute(0, 3, 1, 2).contiguous()
-            alpha_values = alpha_values.permute(0, 3, 1, 2).contiguous()
-            color_up = F.interpolate(color_values, size=(target_res, target_res), mode="bilinear", align_corners=False)
-            alpha_up = F.interpolate(alpha_values, size=(target_res, target_res), mode="bilinear", align_corners=False)
-            color_up = inverse_sigmoid(color_up.permute(0, 2, 3, 1).reshape(-1, color_channels).clamp(1e-6, 1 - 1e-6))
-            alpha_up = inverse_sigmoid(alpha_up.permute(0, 2, 3, 1).reshape(-1, alpha_channels).clamp(1e-6, 1 - 1e-6))
-            local_new = torch.arange(target_res * target_res, device=old_dims.device, dtype=torch.long)
-            dst = new_offsets[idx, None] + local_new[None, :]
-            new_color[dst.reshape(-1)] = color_up
-            new_alpha[dst.reshape(-1)] = alpha_up
+            old_texels = int(res_value * res_value)
+            new_texels = int(target_res * target_res)
+            charts_per_chunk = max(1, max_texels // max(1, max(old_texels, new_texels)))
+            local_old = torch.arange(old_texels, device=old_dims.device, dtype=torch.long)
+            local_new = torch.arange(new_texels, device=old_dims.device, dtype=torch.long)
+            for chunk_start in range(0, int(idx.numel()), charts_per_chunk):
+                chunk_idx = idx[chunk_start:chunk_start + charts_per_chunk]
+                src = old_offsets[chunk_idx, None] + local_old[None, :]
+                color_values = torch.sigmoid(self._tex_color.detach()[src.reshape(-1)]).view(chunk_idx.numel(), res_value, res_value, color_channels)
+                alpha_values = torch.sigmoid(self._tex_alpha.detach()[src.reshape(-1)]).view(chunk_idx.numel(), res_value, res_value, alpha_channels)
+                color_values = color_values.permute(0, 3, 1, 2).contiguous()
+                alpha_values = alpha_values.permute(0, 3, 1, 2).contiguous()
+                color_up = F.interpolate(color_values, size=(target_res, target_res), mode="bilinear", align_corners=False)
+                alpha_up = F.interpolate(alpha_values, size=(target_res, target_res), mode="bilinear", align_corners=False)
+                color_up = inverse_sigmoid(color_up.permute(0, 2, 3, 1).reshape(-1, color_channels).clamp(1e-6, 1 - 1e-6))
+                alpha_up = inverse_sigmoid(alpha_up.permute(0, 2, 3, 1).reshape(-1, alpha_channels).clamp(1e-6, 1 - 1e-6))
+                dst = new_offsets[chunk_idx, None] + local_new[None, :]
+                new_color[dst.reshape(-1)] = color_up
+                new_alpha[dst.reshape(-1)] = alpha_up
 
         texture_dims = torch.stack(
             [new_resolutions.to(torch.int32), new_resolutions.to(torch.int32), new_offsets.to(torch.int32)],
@@ -881,13 +947,12 @@ class GaussianModel:
             score = torch.zeros((n_points,), dtype=torch.float32, device=self.get_xyz.device)
             if self.has_dynamic_textures:
                 counts = self._texture_counts().to(torch.float32).clamp_min(1.0)
-                owner_ids = self._texel_owner_ids()
-                if self._tex_color.grad is not None:
-                    tex_score = self._tex_color.grad.detach().abs().mean(dim=1)
-                    score.scatter_add_(0, owner_ids, tex_score)
-                if self._tex_alpha.grad is not None:
-                    alpha_score = self._tex_alpha.grad.detach().abs().mean(dim=1)
-                    score.scatter_add_(0, owner_ids, self.texture_rtg_alpha_weight * alpha_score)
+                self._accumulate_dynamic_texture_grad_score(self._tex_color.grad, score)
+                self._accumulate_dynamic_texture_grad_score(
+                    self._tex_alpha.grad,
+                    score,
+                    weight=self.texture_rtg_alpha_weight,
+                )
                 score = score / counts
             else:
                 if self._tex_color.grad is not None:

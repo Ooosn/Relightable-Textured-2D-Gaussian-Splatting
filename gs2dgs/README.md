@@ -126,12 +126,14 @@ conda run -n mygs python D:\RTS\gs2dgs\train.py `
   --texture_min_resolution 4 `
   --texture_max_resolution 64 `
   --texture_effect_mode per_uv `
+  --texture_phase_chunk_texels 262144 `
   --texture_rtg_enabled `
   --texture_rtg_refine_from_iter 500 `
   --texture_rtg_refine_until_iter 2000 `
   --texture_rtg_refine_interval 500 `
   --texture_rtg_refine_fraction 0.02 `
   --texture_rtg_alpha_weight 1.0 `
+  --texture_rtg_chunk_texels 262144 `
   --cam_opt `
   --pl_opt `
   --sh_degree 0 `
@@ -155,6 +157,11 @@ What to check:
 - If no RTG log appears, check that both `--texture_dynamic_resolution`
   and `--texture_rtg_enabled` are present, and that the run reaches
   `--texture_rtg_refine_from_iter`.
+- If VRAM spikes during dynamic texture training, first lower
+  `--texture_phase_chunk_texels` to `131072` or `65536`. This caps the
+  largest temporary texel batch used by the neural phase / texture shading
+  path. `--texture_rtg_chunk_texels` applies the same idea to RTG gradient
+  aggregation.
 
 The default RTG schedule starts later:
 

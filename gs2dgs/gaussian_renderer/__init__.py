@@ -30,6 +30,45 @@ def _safe_normalize(x):
     return F.normalize(x, dim=-1, eps=1e-6)
 
 
+def _iter_texture_point_chunks(counts, max_points, max_texels):
+    num_points = int(counts.shape[0])
+    max_points = max(1, int(max_points))
+    max_texels = max(1, int(max_texels))
+    start = 0
+    while start < num_points:
+        point_end = min(start + max_points, num_points)
+        chunk_counts = counts[start:point_end]
+        cumulative = torch.cumsum(chunk_counts, dim=0)
+        valid = torch.nonzero(cumulative <= max_texels, as_tuple=False).flatten()
+        if valid.numel() == 0:
+            end = start + 1
+        else:
+            end = start + int(valid[-1].item()) + 1
+        yield start, end
+        start = end
+
+
+def _mean_dynamic_texture_values(flat_values, texture_dims, max_points, max_texels):
+    counts = (texture_dims[:, 0].to(torch.long) * texture_dims[:, 1].to(torch.long)).clamp_min(1)
+    offsets = texture_dims[:, 2].to(torch.long)
+    num_points = int(texture_dims.shape[0])
+    values_2d = flat_values.reshape(flat_values.shape[0], -1)
+    out = torch.empty((num_points, values_2d.shape[1]), dtype=flat_values.dtype, device=flat_values.device)
+
+    for start, end in _iter_texture_point_chunks(counts, max_points, max_texels):
+        chunk_counts = counts[start:end]
+        for count_value in torch.unique(chunk_counts).tolist():
+            local_idx = torch.nonzero(chunk_counts == count_value, as_tuple=False).flatten()
+            if local_idx.numel() == 0:
+                continue
+            point_idx = local_idx + start
+            local = torch.arange(count_value, device=flat_values.device, dtype=torch.long)
+            src = offsets[point_idx, None] + local[None, :]
+            out[point_idx] = values_2d[src.reshape(-1)].view(point_idx.numel(), -1, values_2d.shape[1]).mean(dim=1)
+
+    return out.reshape((num_points,) + flat_values.shape[1:])
+
+
 def _NdotWi(nrm, wi, elu, a):
     tmp = a * (1.0 - 1.0 / math.e)
     return (elu((nrm * wi).sum(dim=-1, keepdim=True)) + tmp) / (1.0 + tmp)
@@ -182,11 +221,12 @@ def _compute_shadow_pass_2dgs_native(viewpoint_camera, gau, pipe, bg_color, scal
     if use_textures:
         if texture_dims.numel() > 0:
             per_uv_shadow = (out_trans / non_trans_safe).reshape(-1)
-            counts = (texture_dims[:, 0].to(torch.long) * texture_dims[:, 1].to(torch.long)).clamp_min(1)
-            owner_ids = torch.repeat_interleave(torch.arange(means3d.shape[0], device=means3d.device), counts)
-            per_point_shadow = torch.zeros((means3d.shape[0],), dtype=per_uv_shadow.dtype, device=means3d.device)
-            per_point_shadow.scatter_add_(0, owner_ids, per_uv_shadow)
-            per_point_shadow = (per_point_shadow / counts.to(per_uv_shadow.dtype)).unsqueeze(-1)
+            per_point_shadow = _mean_dynamic_texture_values(
+                per_uv_shadow,
+                texture_dims,
+                max_points=int(getattr(gau, "texture_phase_chunk_points", 4096)),
+                max_texels=int(getattr(gau, "texture_phase_chunk_texels", 262_144)),
+            ).unsqueeze(-1)
         else:
             tex_res = int(getattr(gau, "texture_resolution", 1))
             per_uv_shadow = (out_trans / non_trans_safe).view(means3d.shape[0], tex_res, tex_res)
@@ -251,6 +291,7 @@ def _compute_mbrdf_colors_2dgs(viewpoint_camera, gau, shadow_pkg, fix_labert=Fal
         offsets = texture_dims[:, 2].to(torch.long)
         total_texels = int(counts.sum().item())
         chunk_points = max(1, int(getattr(gau, "texture_phase_chunk_points", 4096)))
+        chunk_texels = max(1, int(getattr(gau, "texture_phase_chunk_texels", 262_144)))
         per_uv_shadow = per_uv_shadow.reshape(total_texels, 1)
 
         basecolor = torch.empty((total_texels, 3), dtype=torch.float32, device=dev)
@@ -258,8 +299,7 @@ def _compute_mbrdf_colors_2dgs(viewpoint_camera, gau, shadow_pkg, fix_labert=Fal
         other_effects = torch.empty((total_texels, 3), dtype=torch.float32, device=dev)
         texture_color = gau.get_texture_color
 
-        for start in range(0, num_points, chunk_points):
-            end = min(start + chunk_points, num_points)
+        for start, end in _iter_texture_point_chunks(counts, chunk_points, chunk_texels):
             point_ids = torch.arange(start, end, dtype=torch.long, device=dev)
             texel_ids = torch.repeat_interleave(point_ids, counts[start:end])
             flat_start = int(offsets[start].item())
