@@ -132,6 +132,8 @@ conda run -n mygs python D:\RTS\gs2dgs\train.py `
   --texture_rtg_refine_until_iter 2000 `
   --texture_rtg_refine_interval 500 `
   --texture_rtg_refine_fraction 0.02 `
+  --texture_rtg_min_score 0.0 `
+  --texture_rtg_resolution_gamma 1.0 `
   --texture_rtg_alpha_weight 1.0 `
   --texture_rtg_chunk_texels 262144 `
   --cam_opt `
@@ -144,7 +146,7 @@ conda run -n mygs python D:\RTS\gs2dgs\train.py `
 Expected RTG log lines look like:
 
 ```text
-[ITER 500] RTG refined 123 texture charts | texels 480000->496384 (+16384), avg 18.2/G, score mean/max 1.23e-04/9.87e-04, res {4x4:12000, 8x8:123}
+[ITER 500] RTG refined 123 texture charts | texels 480000->496384 (+16384), avg 18.2/G, score mean/max 1.23e-04/9.87e-04, gate mean/max 0.00e+00/0.00e+00, candidates 12000/12000, res {4x4:12000, 8x8:123}
 ```
 
 What to check:
@@ -153,6 +155,9 @@ What to check:
 - `texels old->new` should increase.
 - `res {...}` should gradually move some charts from `4x4` to `8x8`,
   then later to `16x16`, up to `--texture_max_resolution`.
+- For this forced short test, `--texture_rtg_min_score 0.0` disables the
+  absolute gate so the path is easy to verify. Real runs should use the
+  default nonzero gate.
 - Loss should not jump to NaN after the first refinement.
 - If no RTG log appears, check that both `--texture_dynamic_resolution`
   and `--texture_rtg_enabled` are present, and that the run reaches
@@ -165,12 +170,24 @@ What to check:
 
 The default RTG schedule starts later:
 
-- `--texture_rtg_refine_from_iter 15000`
+- `--texture_rtg_refine_from_iter 20000`
 - `--texture_rtg_refine_until_iter 100000`
 - `--texture_rtg_refine_interval 1000`
 - `--texture_rtg_refine_fraction 0.02`
+- `--texture_rtg_min_score 1e-5`
+- `--texture_rtg_resolution_gamma 1.0`
 
 So short tests should override these values as shown above.
+
+The production RTG gate is resolution-aware:
+
+```text
+RTG_i >= texture_rtg_min_score * (resolution_i / texture_min_resolution) ^ texture_rtg_resolution_gamma
+```
+
+After this gate, `texture_rtg_refine_fraction` is only used as a budget cap.
+The ranking score is also divided by the same resolution scale, so larger
+charts need stronger relighting-aware texture gradients to keep growing.
 
 ### Important defaults
 

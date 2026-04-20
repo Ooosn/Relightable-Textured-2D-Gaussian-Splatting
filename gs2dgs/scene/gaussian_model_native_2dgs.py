@@ -105,13 +105,14 @@ class GaussianModel:
         self.percent_dense = 0
         self.spatial_lr_scale = 0
         self.texture_rtg_enabled = False
-        self.texture_rtg_refine_from_iter = 15_000
+        self.texture_rtg_refine_from_iter = 20_000
         self.texture_rtg_refine_until_iter = 100_000
         self.texture_rtg_refine_interval = 1_000
         self.texture_rtg_refine_fraction = 0.02
         self.texture_rtg_ema = 0.9
         self.texture_rtg_alpha_weight = 1.0
-        self.texture_rtg_min_score = 0.0
+        self.texture_rtg_min_score = 1e-5
+        self.texture_rtg_resolution_gamma = 1.0
         self.texture_rtg_chunk_texels = 262_144
         self._last_rtg_refine_log = {}
         self.setup_functions()
@@ -375,6 +376,8 @@ class GaussianModel:
             f"texels {log['before_texels']}->{log['after_texels']} "
             f"(+{log['texel_delta']}), avg {log['avg_texels']:.1f}/G, "
             f"score mean/max {log['score_mean']:.3e}/{log['score_max']:.3e}, "
+            f"gate mean/max {log['gate_mean']:.3e}/{log['gate_max']:.3e}, "
+            f"candidates {log['candidate_count']}/{log['eligible_count']}, "
             f"res {{{hist}}}"
         )
 
@@ -574,13 +577,14 @@ class GaussianModel:
     def training_setup(self, training_args):
         self.percent_dense = training_args.percent_dense
         self.texture_rtg_enabled = bool(getattr(training_args, "texture_rtg_enabled", False))
-        self.texture_rtg_refine_from_iter = int(getattr(training_args, "texture_rtg_refine_from_iter", 15_000))
+        self.texture_rtg_refine_from_iter = int(getattr(training_args, "texture_rtg_refine_from_iter", 20_000))
         self.texture_rtg_refine_until_iter = int(getattr(training_args, "texture_rtg_refine_until_iter", 100_000))
         self.texture_rtg_refine_interval = int(getattr(training_args, "texture_rtg_refine_interval", 1_000))
         self.texture_rtg_refine_fraction = float(getattr(training_args, "texture_rtg_refine_fraction", 0.02))
         self.texture_rtg_ema = float(getattr(training_args, "texture_rtg_ema", 0.9))
         self.texture_rtg_alpha_weight = float(getattr(training_args, "texture_rtg_alpha_weight", 1.0))
-        self.texture_rtg_min_score = float(getattr(training_args, "texture_rtg_min_score", 0.0))
+        self.texture_rtg_min_score = float(getattr(training_args, "texture_rtg_min_score", 1e-5))
+        self.texture_rtg_resolution_gamma = float(getattr(training_args, "texture_rtg_resolution_gamma", 1.0))
         self.texture_rtg_chunk_texels = int(getattr(training_args, "texture_rtg_chunk_texels", 262_144))
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
@@ -974,19 +978,29 @@ class GaussianModel:
             return 0
         self._ensure_rtg_buffers()
         old_resolutions = self._texture_dims[:, 0].to(torch.long)
-        valid = old_resolutions < int(self.texture_max_resolution)
-        if self.texture_rtg_min_score > 0:
-            valid = torch.logical_and(valid, self._rtg_score >= float(self.texture_rtg_min_score))
-        num_valid = int(valid.sum().item())
-        if num_valid == 0:
+        eligible = old_resolutions < int(self.texture_max_resolution)
+        num_eligible = int(eligible.sum().item())
+        if num_eligible == 0:
+            return 0
+        min_res = max(1.0, float(getattr(self, "texture_min_resolution", 1)))
+        gamma = max(0.0, float(getattr(self, "texture_rtg_resolution_gamma", 1.0)))
+        base_gate = max(0.0, float(getattr(self, "texture_rtg_min_score", 1e-5)))
+        resolution_scale = (old_resolutions.to(torch.float32) / min_res).clamp_min(1.0).pow(gamma)
+        score_gate = resolution_scale * base_gate
+        valid = eligible
+        if base_gate > 0:
+            valid = torch.logical_and(valid, self._rtg_score >= score_gate)
+        candidate_count = int(valid.sum().item())
+        if candidate_count == 0:
             return 0
         fraction = max(0.0, float(self.texture_rtg_refine_fraction))
         if fraction <= 0.0:
             return 0
-        k = max(1, int(np.ceil(num_valid * fraction)))
+        k = max(1, int(np.ceil(candidate_count * fraction)))
         valid_idx = torch.nonzero(valid, as_tuple=False).flatten()
-        top_scores, top_order = torch.topk(self._rtg_score[valid_idx], k=min(k, valid_idx.numel()), largest=True)
-        if top_scores.numel() == 0 or float(top_scores.max().item()) <= 0.0:
+        priority = self._rtg_score / resolution_scale
+        top_priority, top_order = torch.topk(priority[valid_idx], k=min(k, valid_idx.numel()), largest=True)
+        if top_priority.numel() == 0 or float(top_priority.max().item()) <= 0.0:
             return 0
         selected = torch.zeros_like(valid)
         selected[valid_idx[top_order]] = True
@@ -997,6 +1011,7 @@ class GaussianModel:
             return 0
         before_stats = self._dynamic_texture_stats()
         selected_scores = self._rtg_score[selected].detach()
+        selected_gates = score_gate[selected].detach()
         refined = self._resize_dynamic_textures(selected, new_resolutions)
         if refined > 0:
             after_stats = self._dynamic_texture_stats()
@@ -1010,6 +1025,10 @@ class GaussianModel:
                 "hist": after_stats["hist"],
                 "score_mean": float(selected_scores.mean().item()) if selected_scores.numel() > 0 else 0.0,
                 "score_max": float(selected_scores.max().item()) if selected_scores.numel() > 0 else 0.0,
+                "gate_mean": float(selected_gates.mean().item()) if selected_gates.numel() > 0 else 0.0,
+                "gate_max": float(selected_gates.max().item()) if selected_gates.numel() > 0 else 0.0,
+                "candidate_count": int(candidate_count),
+                "eligible_count": int(num_eligible),
             }
         return refined
 

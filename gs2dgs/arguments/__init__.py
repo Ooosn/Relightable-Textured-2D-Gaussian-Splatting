@@ -158,13 +158,14 @@ class OptimizationParams(ParamGroup):
         self.feature_lr = 0.0025
         self.texture_lr = 0.0025
         self.texture_rtg_enabled = False
-        self.texture_rtg_refine_from_iter = 15_000
+        self.texture_rtg_refine_from_iter = 20_000
         self.texture_rtg_refine_until_iter = 100_000
         self.texture_rtg_refine_interval = 1_000
         self.texture_rtg_refine_fraction = 0.02
         self.texture_rtg_ema = 0.9
         self.texture_rtg_alpha_weight = 1.0
-        self.texture_rtg_min_score = 0.0
+        self.texture_rtg_min_score = 1e-5
+        self.texture_rtg_resolution_gamma = 1.0
         self.texture_rtg_chunk_texels = 262_144
         
         self.kd_lr = 0.01
