@@ -192,6 +192,11 @@ def _build_splat2world_2dgs(means3D, scaling_2d, rotation, scaling_modifier=1.0)
     return trans
 
 
+def save_gaussian_checkpoint(scene, gaussians, iteration, label="Checkpoint"):
+    print(f"\n[ITER {iteration}] Saving {label}")
+    torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
+
+
 def _masked_vector_stats(values: torch.Tensor, mask: torch.Tensor | None = None):
     if values is None:
         return {"count": 0, "median": None, "p95": None, "max": None}
@@ -789,6 +794,7 @@ def training(modelset, opt, pipe, testing_iterations, saving_iterations, checkpo
 
             # 对于测试集：：：：：  
             # 只用于优化场景光源和相机信息，因为这些信息可能是未知的，需要通过优化来估计    
+            checkpoint_saved_this_iter = False
             if opt_test and scene.optimizing:  
                 """这里是否有一个漏洞，当 scene.optimizing 为 false 时，测试集也会进入后续的 else 分支，但是本文中可能默认 optimizing 为 true ，阴差阳错"""
                 # 不会用于直接优化高斯模型
@@ -948,6 +954,15 @@ def training(modelset, opt, pipe, testing_iterations, saving_iterations, checkpo
                 # Optimizer step
                 if iteration < opt.iterations:  # 判断是否处于优化阶段
                     gaussians.optimizer.step()
+                    is_rtg_start_checkpoint = (
+                        iteration in checkpoint_iterations
+                        and bool(getattr(opt, "texture_rtg_enabled", False))
+                        and bool(getattr(opt, "texture_dynamic_resolution", False))
+                        and iteration == int(getattr(opt, "texture_rtg_refine_from_iter", -1))
+                    )
+                    if is_rtg_start_checkpoint:
+                        save_gaussian_checkpoint(scene, gaussians, iteration, label="Pre-RTG Checkpoint")
+                        checkpoint_saved_this_iter = True
                     if hasattr(gaussians, "refine_textures_by_rtg"):
                         num_rtg_refined = gaussians.refine_textures_by_rtg(iteration)
                         if num_rtg_refined > 0:
@@ -1004,14 +1019,11 @@ def training(modelset, opt, pipe, testing_iterations, saving_iterations, checkpo
                     gaussians.local_q.requires_grad_(True)
                     if iteration % 5000 == 0:
                         gaussians.reset_local_q(temp)
-            
-
 
             # 判断是否保存模型
-            if (iteration in checkpoint_iterations):
-                print("\n[ITER {}] Saving Checkpoint".format(iteration))
-                torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
-            
+            if (iteration in checkpoint_iterations and not checkpoint_saved_this_iter):
+                save_gaussian_checkpoint(scene, gaussians, iteration)
+
             if modelset.asg_mlp and iteration == opt.asg_mlp_freeze: # 40000
                 asg_mlp = True
             
@@ -1226,6 +1238,10 @@ if __name__ == "__main__":
         args.test_iterations.append(args.iterations)
     if args.iterations not in args.checkpoint_iterations:
         args.checkpoint_iterations.append(args.iterations)
+    if bool(getattr(args, "texture_rtg_enabled", False)) and bool(getattr(args, "texture_dynamic_resolution", False)):
+        rtg_start_iter = int(getattr(args, "texture_rtg_refine_from_iter", 0))
+        if 0 < rtg_start_iter <= args.iterations and rtg_start_iter not in args.checkpoint_iterations:
+            args.checkpoint_iterations.append(rtg_start_iter)
     
     # Prepare training
     print("Optimizing " + args.model_path)

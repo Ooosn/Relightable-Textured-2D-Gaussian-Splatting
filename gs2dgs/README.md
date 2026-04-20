@@ -205,6 +205,12 @@ That means a normal run will automatically:
 - run final evaluation,
 - save the final full checkpoint.
 
+When RTG dynamic texture refinement is enabled, `train.py` also appends
+`--texture_rtg_refine_from_iter` to `checkpoint_iterations`. With the
+production default this writes `chkpnt30000.pth` immediately before the first
+RTG texture-chart refinement, so it can be used as a clean full-state warmup
+checkpoint for resumed RTG experiments.
+
 ## Rendering
 
 Use `gs2dgs/render.py`.
