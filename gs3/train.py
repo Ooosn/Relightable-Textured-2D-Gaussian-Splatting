@@ -21,7 +21,10 @@ from utils.loss_utils import l1_loss, ssim
 from gaussian_renderer import render, get_shadow_backward_stage
 import sys
 from scene import Scene, GaussianModel
-from utils.general_utils import safe_state
+from scene.gaussian_model_2dgs_adapter import GaussianModel2DGSAdapter
+from utils.general_utils import safe_state, build_scaling_rotation
+from utils.graphics_utils import getWorld2View2_cu
+from utils.lie_groups import exp_map_SO3xR3
 import uuid
 from tqdm import tqdm
 from utils.image_utils import psnr
@@ -84,6 +87,90 @@ def _grad_health(parameter):
         "finite": _tensor_finite(grad) if grad is not None else True,
         "absmax": _tensor_absmax(grad),
     }
+
+
+def _camera_projection_bridge_2dgs(viewpoint_cam, means3D, viewspace_point_tensor, transmat_grad_holder=None, splat2world=None):
+    if viewspace_point_tensor is None or viewspace_point_tensor.grad is None:
+        return False
+    if not getattr(viewpoint_cam.cam_pose_adj, "requires_grad", False):
+        return False
+
+    dL_dmean2D = viewspace_point_tensor.grad.detach()
+    if dL_dmean2D.ndim == 3:
+        dL_dmean2D = dL_dmean2D.squeeze(0)
+    if dL_dmean2D.shape[-1] < 2:
+        return False
+    dL_dmean2D = dL_dmean2D[:, :2]
+    if not torch.isfinite(dL_dmean2D).all():
+        return False
+    if float(dL_dmean2D.abs().max().item()) < 1e-12:
+        return False
+
+    adj = exp_map_SO3xR3(viewpoint_cam.cam_pose_adj)
+    dR = adj[0, :3, :3]
+    dt = adj[0, :3, 3]
+    R = viewpoint_cam.R_cu.matmul(dR.T)
+    T = dt + dR.matmul(viewpoint_cam.T_cu)
+    world_view_transform = getWorld2View2_cu(
+        R, T, viewpoint_cam.trans_cu, viewpoint_cam.scale_cu
+    ).transpose(0, 1)
+    full_proj_transform = (
+        world_view_transform.unsqueeze(0).bmm(viewpoint_cam.projection_matrix.unsqueeze(0))
+    ).squeeze(0)
+
+    means_h = torch.cat([means3D.detach(), torch.ones_like(means3D[:, :1])], dim=-1)
+    clip = means_h @ full_proj_transform
+    w = clip[:, 3:4].clamp_min(1e-7)
+    ndc_xy = clip[:, :2] / w
+
+    pixel_xy = torch.empty_like(ndc_xy)
+    pixel_xy[:, 0] = ((ndc_xy[:, 0] + 1.0) * viewpoint_cam.image_width - 1.0) * 0.5
+    pixel_xy[:, 1] = ((ndc_xy[:, 1] + 1.0) * viewpoint_cam.image_height - 1.0) * 0.5
+
+    proxy = (pixel_xy * dL_dmean2D).sum()
+
+    if transmat_grad_holder is not None and transmat_grad_holder.grad is not None and splat2world is not None:
+        dL_dtransMat = transmat_grad_holder.grad.detach()
+        if dL_dtransMat.ndim == 3:
+            dL_dtransMat = dL_dtransMat.reshape(dL_dtransMat.shape[0], -1)
+        if (
+            dL_dtransMat.shape[-1] == 9
+            and torch.isfinite(dL_dtransMat).all()
+            and float(dL_dtransMat.abs().max().item()) >= 1e-12
+        ):
+            W, H = viewpoint_cam.image_width, viewpoint_cam.image_height
+            near, far = viewpoint_cam.znear, viewpoint_cam.zfar
+            ndc2pix = torch.tensor(
+                [
+                    [W / 2, 0, 0, (W - 1) / 2],
+                    [0, H / 2, 0, (H - 1) / 2],
+                    [0, 0, far - near, near],
+                    [0, 0, 0, 1],
+                ],
+                dtype=full_proj_transform.dtype,
+                device=full_proj_transform.device,
+            ).T
+            trans_proxy = (
+                splat2world[:, [0, 1, 3]] @ (full_proj_transform @ ndc2pix)[:, [0, 1, 3]]
+            ).permute(0, 2, 1).reshape(-1, 9)
+            proxy = proxy + (trans_proxy * dL_dtransMat).sum()
+
+    if not torch.isfinite(proxy):
+        return False
+    proxy.backward()
+    return True
+
+
+def _build_splat2world_2dgs(means3D, scaling_2d, rotation, scaling_modifier=1.0):
+    rs = build_scaling_rotation(
+        torch.cat([scaling_2d * scaling_modifier, torch.ones_like(scaling_2d)], dim=-1),
+        rotation,
+    ).permute(0, 2, 1)
+    trans = torch.zeros((means3D.shape[0], 4, 4), dtype=means3D.dtype, device=means3D.device)
+    trans[:, :3, :3] = rs
+    trans[:, 3, :3] = means3D
+    trans[:, 3, 3] = 1
+    return trans
 
 
 def _masked_vector_stats(values: torch.Tensor, mask: torch.Tensor | None = None):
@@ -319,7 +406,10 @@ def training(modelset, opt, pipe, testing_iterations, saving_iterations, checkpo
     tb_writer = prepare_output_and_logger(modelset)
 
     # 初始化高斯实例
-    gaussians = GaussianModel(modelset, opt)
+    if str(getattr(modelset, "rasterizer", "")).startswith("2dgs"):
+        gaussians = GaussianModel2DGSAdapter(modelset, opt)
+    else:
+        gaussians = GaussianModel(modelset, opt)
 
     # 根据 训练args，优化args 以及 初始高斯 建立场景实例，最终的高斯实例
     """
@@ -518,6 +608,7 @@ def training(modelset, opt, pipe, testing_iterations, saving_iterations, checkpo
         viewspace_point_tensor, visibility_filter, radii = render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
 
         image, shadow, other_effects, backward_info, expected_depth = render_pkg["render"], render_pkg["shadow"], render_pkg["other_effects"], render_pkg["backward_info"], render_pkg["expected_depth"]
+        transmat_grad_holder = render_pkg.get("transmat_grad_holder")
 
 
         # 如果迭代次数小于 unfreeze_iterations，则不考虑阴影和次要效果，此时 shadow 和 other_effects 都是 0
@@ -584,6 +675,24 @@ def training(modelset, opt, pipe, testing_iterations, saving_iterations, checkpo
         # 反向传播，计算各个参数的梯度
         # 尚未更新参数，等待后续挑选更新
         loss.backward()
+        if (
+            scene.optimizing
+            and str(getattr(gaussians, "rasterizer", ""))[:5] == "2dgs"
+            and os.getenv("GS3_DISABLE_2DGS_CAM_BRIDGE", "0") != "1"
+        ):
+            splat2world_2dgs = _build_splat2world_2dgs(
+                gaussians.get_xyz.detach(),
+                gaussians.get_scaling[:, :2].detach(),
+                gaussians.get_rotation.detach(),
+                scaling_modifier=1.0,
+            )
+            _camera_projection_bridge_2dgs(
+                viewpoint_cam,
+                gaussians.get_xyz,
+                viewspace_point_tensor,
+                transmat_grad_holder=transmat_grad_holder,
+                splat2world=splat2world_2dgs,
+            )
         iter_end.record() # 记录迭代结束的时间
 
 

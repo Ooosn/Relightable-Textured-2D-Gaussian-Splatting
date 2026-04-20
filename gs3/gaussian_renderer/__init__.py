@@ -25,6 +25,9 @@ _SUBMODULE_PATHS = [
     os.path.join(_REPO_ROOT, "submodules", "diff-gaussian-rasterization_hgs"),
     os.path.join(_REPO_ROOT, "submodules", "v_3dgs"),
     os.path.join(_REPO_ROOT, "submodules", "v_3dgs_ortho"),
+    os.path.join(_REPO_ROOT, "..", "2dgs", "submodules", "surfel-texture"),
+    os.path.join(_REPO_ROOT, "..", "2dgs", "submodules", "surfel-texture-deferred"),
+    os.path.join(_REPO_ROOT, "..", "2dgs", "submodules", "diff-surfel-rasterization-shadow"),
 ]
 for _path in reversed(_SUBMODULE_PATHS):
     if os.path.isdir(_path) and _path not in sys.path:
@@ -34,14 +37,22 @@ from gsplat import rasterization
 from utils.graphics_utils import fov2focal
 from diff_gaussian_rasterization import  GaussianRasterizationSettings as basic_settings
 from diff_gaussian_rasterization import  GaussianRasterizer as basic_rasterizer
+from diff_gaussian_rasterization import CamGradBridge as basic_cam_grad_bridge
 from diff_gaussian_rasterization_light import GaussianRasterizationSettings as light_settings
 from diff_gaussian_rasterization_light import  GaussianRasterizer as light_rasterizer
 from v_3dgs import GaussianRasterizationSettings as v_3dgs_settings
 from v_3dgs import GaussianRasterizer as persp_rasterizer
 from v_3dgs_ortho import GaussianRasterizer as ortho_rasterizer
+from surfel_texture import GaussianRasterizationSettings as surfel_settings
+from surfel_texture import GaussianRasterizer as surfel_rasterizer
+from surfel_texture_deferred import GaussianRasterizer as surfel_rasterizer_deferred
+from diff_surfel_rasterization_shadow import GaussianRasterizationSettings as surfel_shadow_settings
+from diff_surfel_rasterization_shadow import GaussianRasterizer as surfel_shadow_rasterizer
 
 from scene.gaussian_model import GaussianModel
 from utils.sh_utils import eval_sh
+from utils.graphics_utils import getProjectionMatrix
+from utils.general_utils import build_scaling_rotation, strip_symmetric
 from utils.graphics_utils import getProjectionMatrixWithPrincipalPoint, look_at,getProjectionMatrix, \
                                  getOrthographicMatrixFromBounds, computeCov2D_ortho_python, euler_to_matrix, \
                                  look_at_cu
@@ -62,6 +73,436 @@ def _env_enabled(name, default="0"):
 def _maybe_cuda_sync():
     if _env_enabled("SSGS_RENDER_SYNC"):
         torch.cuda.synchronize()
+
+
+def _build_2dgs_raster_settings(viewpoint_camera, pipe, bg_color, scaling_modifier, sh_degree):
+    tanfovx = math.tan(viewpoint_camera.FoVx * 0.5)
+    tanfovy = math.tan(viewpoint_camera.FoVy * 0.5)
+    return surfel_settings(
+        image_height=int(viewpoint_camera.image_height),
+        image_width=int(viewpoint_camera.image_width),
+        tanfovx=tanfovx,
+        tanfovy=tanfovy,
+        bg=bg_color,
+        scale_modifier=scaling_modifier,
+        viewmatrix=viewpoint_camera.world_view_transform,
+        projmatrix=viewpoint_camera.full_proj_transform,
+        sh_degree=sh_degree,
+        campos=viewpoint_camera.camera_center,
+        prefiltered=False,
+        debug=getattr(pipe, "debug", False),
+    )
+
+
+def _look_at_2dgs(camera_position, target_position, up_dir):
+    camera_direction = camera_position - target_position
+    camera_direction = camera_direction / np.linalg.norm(camera_direction)
+    if abs(np.dot(up_dir, camera_direction)) > 0.9:
+        up_dir = np.array([0.0, 1.0, 0.0], dtype=np.float32)
+    camera_right = np.cross(up_dir, camera_direction)
+    camera_right = camera_right / np.linalg.norm(camera_right)
+    camera_up = np.cross(camera_direction, camera_right)
+    camera_up = camera_up / np.linalg.norm(camera_up)
+
+    rotation_transform = np.zeros((4, 4), dtype=np.float32)
+    rotation_transform[0, :3] = camera_right
+    rotation_transform[1, :3] = camera_up
+    rotation_transform[2, :3] = camera_direction
+    rotation_transform[3, 3] = 1.0
+
+    translation_transform = np.eye(4, dtype=np.float32)
+    translation_transform[:3, -1] = -np.asarray(camera_position, dtype=np.float32)
+
+    look_at_transform = rotation_transform @ translation_transform
+    look_at_transform[1:3, :] *= -1
+    return look_at_transform.T
+
+
+def _build_light_transform_2dgs(viewpoint_camera, means3d, pipe):
+    tanfovx = math.tan(viewpoint_camera.FoVx * 0.5)
+    tanfovy = math.tan(viewpoint_camera.FoVy * 0.5)
+    fx_origin = viewpoint_camera.image_width / (2.0 * tanfovx)
+    fy_origin = viewpoint_camera.image_height / (2.0 * tanfovy)
+
+    object_center = means3d.mean(dim=0).detach().cpu().numpy()
+    light_position = viewpoint_camera.pl_pos.detach().cpu().numpy().reshape(-1)
+    world_view_transform_light = _look_at_2dgs(
+        light_position,
+        object_center,
+        up_dir=np.array([0.0, 0.0, 1.0], dtype=np.float32),
+    )
+    world_view_transform_light = torch.tensor(
+        world_view_transform_light,
+        device=viewpoint_camera.world_view_transform.device,
+        dtype=viewpoint_camera.world_view_transform.dtype,
+    )
+
+    camera_position = viewpoint_camera.camera_center.detach().cpu().numpy() * getattr(pipe, "shadow_light_scale", 1.0)
+    light_norm = max(float(np.sum(light_position * light_position)), 1e-8)
+    camera_norm = max(float(np.sum(camera_position * camera_position)), 1e-8)
+    f_scale_ratio = math.sqrt(light_norm / camera_norm)
+    fx_far = fx_origin * f_scale_ratio
+    fy_far = fy_origin * f_scale_ratio
+
+    tanfovx_far = 0.5 * viewpoint_camera.image_width / fx_far
+    tanfovy_far = 0.5 * viewpoint_camera.image_height / fy_far
+    resolution_scale = max(float(getattr(pipe, "shadow_resolution_scale", 1.0)), 0.25)
+    h_light = min(max(32, int(resolution_scale * viewpoint_camera.image_height)), 2048)
+    w_light = min(max(32, int(resolution_scale * viewpoint_camera.image_width)), 2048)
+
+    light_persp_proj_matrix = getProjectionMatrix(
+        znear=viewpoint_camera.znear,
+        zfar=viewpoint_camera.zfar,
+        fovX=2.0 * math.atan(tanfovx_far),
+        fovY=2.0 * math.atan(tanfovy_far),
+    ).transpose(0, 1).cuda()
+    light_projmatrix = (
+        world_view_transform_light.unsqueeze(0).bmm(light_persp_proj_matrix.unsqueeze(0))
+    ).squeeze(0)
+
+    return dict(
+        world_view_transform_light=world_view_transform_light,
+        light_projmatrix=light_projmatrix,
+        tanfovx_far=tanfovx_far,
+        tanfovy_far=tanfovy_far,
+        h_light=h_light,
+        w_light=w_light,
+        light_position=light_position,
+    )
+
+
+def _compute_shadow_pass_2dgs_native(viewpoint_camera, gau, pipe, bg_color, scaling_modifier=1.0):
+    if viewpoint_camera.pl_pos is None or gau.get_xyz.numel() == 0:
+        return None
+
+    means3d = gau.get_xyz
+    opacity = gau.get_opacity
+    scales = gau.get_scaling
+    rotations = gau.get_rotation
+    lt = _build_light_transform_2dgs(viewpoint_camera, means3d, pipe)
+
+    shadow_settings = surfel_shadow_settings(
+        image_height=lt["h_light"],
+        image_width=lt["w_light"],
+        tanfovx=lt["tanfovx_far"],
+        tanfovy=lt["tanfovy_far"],
+        bg=bg_color[:3],
+        scale_modifier=scaling_modifier,
+        viewmatrix=lt["world_view_transform_light"],
+        projmatrix=lt["light_projmatrix"],
+        sh_degree=gau.active_sh_degree,
+        campos=torch.tensor(lt["light_position"], dtype=torch.float32, device="cuda"),
+        prefiltered=False,
+        debug=getattr(pipe, "debug", False),
+        low_pass_filter_radius=0.3,
+        ortho=False,
+        use_textures=False,
+    )
+    shadow_rasterizer = surfel_shadow_rasterizer(raster_settings=shadow_settings)
+    light_colors = torch.ones((means3d.shape[0], 3), dtype=torch.float32, device="cuda")
+
+    _, _, _, out_trans, non_trans, _ = shadow_rasterizer(
+        means3D=means3d,
+        means2D=torch.zeros_like(means3d, requires_grad=True),
+        shs=None,
+        colors_precomp=light_colors,
+        opacities=opacity,
+        scales=scales,
+        rotations=rotations,
+        cov3Ds_precomp=None,
+        texture_alpha=torch.empty(0, device="cuda"),
+        texture_sigma_factor=3.0,
+        non_trans=None,
+        offset=getattr(pipe, "shadow_offset", 0.015),
+        thres=-1.0,
+        is_train=False,
+    )
+    per_point_shadow = (out_trans / torch.clamp_min(non_trans, 1e-6)).unsqueeze(-1)
+    return {
+        "per_point_shadow": per_point_shadow,
+        "light_viewmatrix": lt["world_view_transform_light"],
+        "light_projmatrix": lt["light_projmatrix"],
+    }
+
+
+def _compute_shadow_pass_2dgs_lifted(viewpoint_camera, gau, pipe, bg_color, modelset, scaling_modifier=1.0):
+    if viewpoint_camera.pl_pos is None or gau.get_xyz.numel() == 0:
+        return None
+
+    means3d = gau.get_xyz
+    opacity = gau.get_opacity
+    scales3 = torch.cat([gau.get_scaling, torch.ones_like(gau.get_scaling[:, :1])], dim=-1)
+    rotations = gau.get_rotation
+    lt = _build_light_transform_2dgs(viewpoint_camera, means3d, pipe)
+
+    L = build_scaling_rotation(scaling_modifier * scales3, rotations)
+    cov3d = strip_symmetric(L @ L.transpose(1, 2))
+
+    raster_settings_light = light_settings(
+        image_height=lt["h_light"],
+        image_width=lt["w_light"],
+        tanfovx=lt["tanfovx_far"],
+        tanfovy=lt["tanfovy_far"],
+        bg=bg_color[:3],
+        scale_modifier=scaling_modifier,
+        viewmatrix=lt["world_view_transform_light"],
+        projmatrix=lt["light_projmatrix"],
+        sh_degree=gau.active_sh_degree,
+        campos=viewpoint_camera.pl_pos[0],
+        prefiltered=False,
+        debug=getattr(pipe, "debug", False),
+        low_pass_filter_radius=0.3,
+        ortho=False,
+    )
+    rasterizer_light = light_rasterizer(raster_settings=raster_settings_light)
+    light_inputs = {
+        "means3D": means3d,
+        "means2D": torch.zeros_like(means3d, dtype=means3d.dtype, requires_grad=True, device=means3d.device),
+        "shs": None,
+        "colors_precomp": torch.ones((means3d.shape[0], 3), dtype=torch.float32, device="cuda"),
+        "opacities": opacity,
+        "scales": None,
+        "rotations": None,
+        "cov3Ds_precomp": cov3d,
+        "projmatrix": lt["light_projmatrix"],
+        "viewmatrix": lt["world_view_transform_light"],
+        "non_trans": torch.zeros((means3d.shape[0], 1), dtype=torch.float32, device="cuda"),
+        "offset": getattr(modelset, "offset", 0.015),
+        "thres": 4,
+        "is_train": False,
+        "hgs": False,
+        "hgs_normals": None,
+        "hgs_opacities": None,
+        "hgs_opacities_shadow": None,
+        "hgs_opacities_light": None,
+        "streams": None,
+    }
+    _, _, _, shadow, non_trans, _ = rasterizer_light(**light_inputs)
+    per_point_shadow = shadow / torch.clamp_min(non_trans, 1e-6)
+    return {
+        "per_point_shadow": per_point_shadow,
+        "light_viewmatrix": lt["world_view_transform_light"],
+        "light_projmatrix": lt["light_projmatrix"],
+    }
+
+
+def _render_2dgs_native_3ch(viewpoint_camera, gau, pipe, bg_color, modelset, scaling_modifier=1.0, fix_labert=False, shadow_map=False, iteration=0):
+    means3D = gau.get_xyz
+    means2D = torch.zeros_like(means3D, dtype=torch.float32, requires_grad=True, device=means3D.device)
+    opacity = gau.get_opacity
+    scales = gau.get_scaling
+    rotations = gau.get_rotation
+    transmat_grad_holder = None
+    if getattr(viewpoint_camera, "cam_pose_adj", None) is not None and viewpoint_camera.cam_pose_adj.requires_grad:
+        transmat_grad_holder = torch.zeros(
+            (means3D.shape[0], 9),
+            dtype=torch.float32,
+            device=means3D.device,
+            requires_grad=True,
+        )
+
+    if gau.use_MBRDF:
+        if os.getenv("GS3_2DGS_USE_LIFTED_SHADOW", "0") == "1":
+            shadow_pkg = _compute_shadow_pass_2dgs_lifted(viewpoint_camera, gau, pipe, bg_color, modelset, scaling_modifier)
+        else:
+            shadow_pkg = _compute_shadow_pass_2dgs_native(viewpoint_camera, gau, pipe, bg_color, scaling_modifier)
+    else:
+        shadow_pkg = None
+
+    colors_precomp = None
+    shs = None
+    shadow_img = None
+    other_img = None
+    if gau.use_MBRDF:
+        pl_pos_expand = viewpoint_camera.pl_pos.expand(gau.get_xyz.shape[0], -1)
+        wi_ray = pl_pos_expand - gau.get_xyz
+        wi_dist2 = torch.sum(wi_ray**2, dim=-1, keepdim=True).clamp_min(1e-12)
+        dist_2_inv = 1.0 / wi_dist2
+        wi = wi_ray * torch.sqrt(dist_2_inv)
+        camera_center_for_brdf = viewpoint_camera.camera_center
+        if os.getenv("GS3_2DGS_DETACH_VIEWDIR", "0") == "1":
+            camera_center_for_brdf = camera_center_for_brdf.detach()
+        wo = _safe_normalize(camera_center_for_brdf - gau.get_xyz)
+
+        local_axises = gau.get_local_axis
+        local_z = local_axises[:, :, 2]
+        wi_local = torch.einsum('Ki,Kij->Kj', wi, local_axises)
+        wo_local = torch.einsum('Ki,Kij->Kj', wo, local_axises)
+        cosTheta = _NdotWi(local_z, wi, torch.nn.ELU(alpha=0.01), 0.01)
+        diffuse = gau.get_kd / math.pi
+        asg_scales = gau.asg_func.get_asg_lam_miu
+        asg_axises = gau.asg_func.get_asg_axis
+        asg_1 = gau.asg_func(wi_local, wo_local, gau.get_alpha_asg, asg_scales, asg_axises)
+        shadow_hint = None if shadow_pkg is None else shadow_pkg["per_point_shadow"]
+        decay, other_effects, asg_3, _ = gau.neural_phasefunc(
+            wi, wo, gau.get_xyz, gau.get_neural_material,
+            hint=shadow_hint, asg_1=asg_1, asg_mlp=gau.asg_mlp,
+        )
+        if decay is None:
+            decay = torch.ones((means3D.shape[0], 1), dtype=torch.float32, device=means3D.device)
+        if fix_labert:
+            basecolor = diffuse * cosTheta * dist_2_inv
+        else:
+            specular = gau.get_ks * asg_3
+            basecolor = (diffuse + specular) * cosTheta * dist_2_inv
+        if other_effects is not None:
+            other_effects = other_effects * dist_2_inv
+        else:
+            other_effects = torch.zeros_like(basecolor)
+        colors_precomp = basecolor * decay + other_effects
+    else:
+        shs = gau.get_features
+
+    raster_settings_2dgs = _build_2dgs_raster_settings(
+        viewpoint_camera, pipe, bg_color[:3], scaling_modifier, gau.active_sh_degree
+    )
+    rasterizer_2dgs = surfel_rasterizer(raster_settings=raster_settings_2dgs)
+    rendered_rgb, radii, allmap = rasterizer_2dgs(
+        means3D=means3D,
+        means2D=means2D,
+        opacities=opacity,
+        shs=shs if colors_precomp is None else None,
+        colors_precomp=colors_precomp,
+        scales=scales,
+        rotations=rotations,
+        cov3D_precomp=None,
+        texture_color=None,
+        texture_alpha=None,
+        use_textures=False,
+        transmat_grad_holder=transmat_grad_holder,
+    )
+    try:
+        means2D.retain_grad()
+    except:
+        pass
+
+    render_alpha = allmap[1:2].clamp_min(1e-8)
+    expected_depth = torch.nan_to_num(allmap[0:1] / render_alpha, 0, 0)
+    shadow_img = torch.ones((1, rendered_rgb.shape[1], rendered_rgb.shape[2]), dtype=rendered_rgb.dtype, device=rendered_rgb.device)
+    other_img = torch.zeros((3, rendered_rgb.shape[1], rendered_rgb.shape[2]), dtype=rendered_rgb.dtype, device=rendered_rgb.device)
+    return {
+        "render": rendered_rgb,
+        "shadow": shadow_img,
+        "other_effects": other_img,
+        "viewspace_points": means2D,
+        "visibility_filter": radii > 0,
+        "radii": radii,
+        "out_weight": torch.zeros((means3D.shape[0], 1), dtype=torch.float32, device="cuda"),
+        "backward_info": {},
+        "shadow_stage": get_shadow_backward_stage(modelset, iteration),
+        "transmat_grad_holder": transmat_grad_holder,
+        "expected_depth": expected_depth,
+    }
+
+
+def _render_2dgs_native_deferred(viewpoint_camera, gau, pipe, bg_color, modelset, scaling_modifier=1.0, fix_labert=False, shadow_map=False, iteration=0):
+    means3D = gau.get_xyz
+    means2D = torch.zeros_like(means3D, dtype=torch.float32, requires_grad=True, device=means3D.device)
+    opacity = gau.get_opacity
+    scales = gau.get_scaling
+    rotations = gau.get_rotation
+    transmat_grad_holder = None
+    if getattr(viewpoint_camera, "cam_pose_adj", None) is not None and viewpoint_camera.cam_pose_adj.requires_grad:
+        transmat_grad_holder = torch.zeros(
+            (means3D.shape[0], 9),
+            dtype=torch.float32,
+            device=means3D.device,
+            requires_grad=True,
+        )
+
+    if gau.use_MBRDF:
+        if os.getenv("GS3_2DGS_USE_LIFTED_SHADOW", "0") == "1":
+            shadow_pkg = _compute_shadow_pass_2dgs_lifted(viewpoint_camera, gau, pipe, bg_color, modelset, scaling_modifier)
+        else:
+            shadow_pkg = _compute_shadow_pass_2dgs_native(viewpoint_camera, gau, pipe, bg_color, scaling_modifier)
+    else:
+        shadow_pkg = None
+
+    colors_precomp = None
+    if gau.use_MBRDF:
+        pl_pos_expand = viewpoint_camera.pl_pos.expand(gau.get_xyz.shape[0], -1)
+        wi_ray = pl_pos_expand - gau.get_xyz
+        wi_dist2 = torch.sum(wi_ray**2, dim=-1, keepdim=True).clamp_min(1e-12)
+        dist_2_inv = 1.0 / wi_dist2
+        wi = wi_ray * torch.sqrt(dist_2_inv)
+        camera_center_for_brdf = viewpoint_camera.camera_center
+        if os.getenv("GS3_2DGS_DETACH_VIEWDIR", "0") == "1":
+            camera_center_for_brdf = camera_center_for_brdf.detach()
+        wo = _safe_normalize(camera_center_for_brdf - gau.get_xyz)
+
+        local_axises = gau.get_local_axis
+        local_z = local_axises[:, :, 2]
+        wi_local = torch.einsum('Ki,Kij->Kj', wi, local_axises)
+        wo_local = torch.einsum('Ki,Kij->Kj', wo, local_axises)
+        cosTheta = _NdotWi(local_z, wi, torch.nn.ELU(alpha=0.01), 0.01)
+        diffuse = gau.get_kd / math.pi
+        asg_scales = gau.asg_func.get_asg_lam_miu
+        asg_axises = gau.asg_func.get_asg_axis
+        asg_1 = gau.asg_func(wi_local, wo_local, gau.get_alpha_asg, asg_scales, asg_axises)
+        shadow_hint = None if shadow_pkg is None else shadow_pkg["per_point_shadow"]
+        decay, other_effects, asg_3, _ = gau.neural_phasefunc(
+            wi, wo, gau.get_xyz, gau.get_neural_material,
+            hint=shadow_hint, asg_1=asg_1, asg_mlp=gau.asg_mlp,
+        )
+        if decay is None:
+            decay = torch.ones((means3D.shape[0], 1), dtype=torch.float32, device=means3D.device)
+        if fix_labert:
+            basecolor = diffuse * cosTheta * dist_2_inv
+        else:
+            specular = gau.get_ks * asg_3
+            basecolor = (diffuse + specular) * cosTheta * dist_2_inv
+        if other_effects is None:
+            other_effects = torch.zeros_like(basecolor)
+        else:
+            other_effects = other_effects * dist_2_inv
+        colors_precomp = torch.cat([basecolor, decay, other_effects], dim=1)
+    else:
+        colors_precomp = None
+
+    surfel_bg = bg_color
+    if surfel_bg.shape[0] == 3:
+        surfel_bg = torch.cat(
+            [surfel_bg, torch.zeros(4, dtype=surfel_bg.dtype, device=surfel_bg.device)],
+            dim=0,
+        )
+    raster_settings_2dgs = _build_2dgs_raster_settings(
+        viewpoint_camera, pipe, surfel_bg, scaling_modifier, gau.active_sh_degree
+    )
+    rasterizer_2dgs = surfel_rasterizer_deferred(raster_settings=raster_settings_2dgs)
+    rendered_7ch, radii, allmap = rasterizer_2dgs(
+        means3D=means3D,
+        means2D=means2D,
+        opacities=opacity,
+        shs=None,
+        colors_precomp=colors_precomp,
+        scales=scales,
+        rotations=rotations,
+        cov3D_precomp=None,
+        texture_color=None,
+        texture_alpha=None,
+        use_textures=False,
+        transmat_grad_holder=transmat_grad_holder,
+    )
+    try:
+        means2D.retain_grad()
+    except:
+        pass
+
+    render_alpha = allmap[1:2].clamp_min(1e-8)
+    expected_depth = torch.nan_to_num(allmap[0:1] / render_alpha, 0, 0)
+    return {
+        "render": rendered_7ch[0:3],
+        "shadow": rendered_7ch[3:4],
+        "other_effects": rendered_7ch[4:7],
+        "viewspace_points": means2D,
+        "visibility_filter": radii > 0,
+        "radii": radii,
+        "out_weight": torch.zeros((means3D.shape[0], 1), dtype=torch.float32, device="cuda"),
+        "backward_info": {},
+        "shadow_stage": get_shadow_backward_stage(modelset, iteration),
+        "transmat_grad_holder": transmat_grad_holder,
+        "expected_depth": expected_depth,
+    }
 
 
 def get_shadow_backward_stage(modelset, iteration: int):
@@ -110,6 +551,38 @@ def render(viewpoint_camera,
            is_train = False,    # 根据 prune_visibility
            asg_mlp = False,
            iteration = 0): 
+    if (
+        str(getattr(gau, "rasterizer", "")) == "2dgs_3ch"
+        and hasattr(gau, "get_scaling")
+        and gau.get_scaling.shape[-1] == 2
+    ):
+        return _render_2dgs_native_3ch(
+            viewpoint_camera,
+            gau,
+            pipe,
+            bg_color,
+            modelset,
+            scaling_modifier=scaling_modifier,
+            fix_labert=fix_labert,
+            shadow_map=shadowmap_render,
+            iteration=iteration,
+        )
+    if (
+        str(getattr(gau, "rasterizer", "")) == "2dgs"
+        and hasattr(gau, "get_scaling")
+        and gau.get_scaling.shape[-1] == 2
+    ):
+        return _render_2dgs_native_deferred(
+            viewpoint_camera,
+            gau,
+            pipe,
+            bg_color,
+            modelset,
+            scaling_modifier=scaling_modifier,
+            fix_labert=fix_labert,
+            shadow_map=shadowmap_render,
+            iteration=iteration,
+        )
     
     """
     Render the scene. 
@@ -375,7 +848,13 @@ def render(viewpoint_camera,
             dist_2_inv = 1.0 / wi_dist2
             wi = wi_ray * torch.sqrt(dist_2_inv) # (N, 3)
             # 归一化视角方向
-            wo = _safe_normalize(viewpoint_camera.camera_center - gau.get_xyz) # (N, 3) 
+            camera_center_for_brdf = viewpoint_camera.camera_center
+            if (
+                str(getattr(gau, "rasterizer", "")).startswith("2dgs")
+                and os.getenv("GS3_2DGS_DETACH_VIEWDIR", "0") == "1"
+            ):
+                camera_center_for_brdf = camera_center_for_brdf.detach()
+            wo = _safe_normalize(camera_center_for_brdf - gau.get_xyz) # (N, 3) 
 
             encoding_pos = None
 
@@ -678,6 +1157,8 @@ def render(viewpoint_camera,
 
     # 3dgs 原代码
 
+    transmat_grad_holder = None
+
     # if gau.rasterizer == "3dgs":
     #     #print("\ndebug: current rasterizer: 3dgs")
 
@@ -731,6 +1212,97 @@ def render(viewpoint_camera,
     #     rendered_image, radii, rendered_depth, rendered_alpha = rasterizer(**rasterizer_inputs)
 
     
+    if gau.rasterizer in ("2dgs", "2dgs_3ch"):
+        means2D = screenspace_points
+        scales_2dgs = scales[..., :2] if scales is not None and scales.numel() > 0 else scales
+        transmat_grad_holder = None
+        if getattr(viewpoint_camera, "cam_pose_adj", None) is not None and viewpoint_camera.cam_pose_adj.requires_grad:
+            transmat_grad_holder = torch.zeros(
+                (means3D.shape[0], 9),
+                dtype=torch.float32,
+                device=means3D.device,
+                requires_grad=True,
+            )
+
+        if gau.rasterizer == "2dgs" and colors_precomp is not None and colors_precomp.shape[-1] >= 7:
+            surfel_bg = bg_color
+            if surfel_bg.shape[0] == 3:
+                surfel_bg = torch.cat(
+                    [surfel_bg, torch.zeros(4, dtype=surfel_bg.dtype, device=surfel_bg.device)],
+                    dim=0,
+                )
+            raster_settings_2dgs = _build_2dgs_raster_settings(
+                viewpoint_camera, pipe, surfel_bg, scaling_modifier, gau.active_sh_degree
+            )
+            rasterizer_2dgs = surfel_rasterizer_deferred(raster_settings=raster_settings_2dgs)
+            rendered_2dgs, radii, allmap = rasterizer_2dgs(
+                means3D=means3D,
+                means2D=means2D,
+                opacities=opacity,
+                shs=None,
+                colors_precomp=colors_precomp,
+                scales=scales_2dgs,
+                rotations=rotations,
+                cov3D_precomp=cov3Ds_precomp,
+                texture_color=None,
+                texture_alpha=None,
+                use_textures=False,
+                transmat_grad_holder=transmat_grad_holder,
+            )
+            rendered_image = rendered_2dgs
+            if shadow_map:
+                render_alpha = allmap[1:2].clamp_min(1e-8)
+                depth_image = torch.nan_to_num(allmap[0:1] / render_alpha, 0, 0)
+                rendered_image = torch.cat([rendered_2dgs, depth_image], dim=0)
+        else:
+            if colors_precomp is not None and colors_precomp.shape[-1] >= 7:
+                colors_precomp_3ch = colors_precomp[:, 0:3] * colors_precomp[:, 3:4] + colors_precomp[:, 4:7]
+            else:
+                colors_precomp_3ch = colors_precomp
+            raster_settings_2dgs = _build_2dgs_raster_settings(
+                viewpoint_camera, pipe, bg_color, scaling_modifier, gau.active_sh_degree
+            )
+            rasterizer_2dgs = surfel_rasterizer(raster_settings=raster_settings_2dgs)
+            rendered_rgb, radii, allmap = rasterizer_2dgs(
+                means3D=means3D,
+                means2D=means2D,
+                opacities=opacity,
+                shs=shs if colors_precomp_3ch is None else None,
+                colors_precomp=colors_precomp_3ch,
+                scales=scales_2dgs,
+                rotations=rotations,
+                cov3D_precomp=cov3Ds_precomp,
+                texture_color=None,
+                texture_alpha=None,
+                use_textures=False,
+                transmat_grad_holder=transmat_grad_holder,
+            )
+            rendered_image = torch.cat(
+                [
+                    rendered_rgb,
+                    torch.ones(
+                        (1, rendered_rgb.shape[1], rendered_rgb.shape[2]),
+                        dtype=rendered_rgb.dtype,
+                        device=rendered_rgb.device,
+                    ),
+                    torch.zeros(
+                        (3, rendered_rgb.shape[1], rendered_rgb.shape[2]),
+                        dtype=rendered_rgb.dtype,
+                        device=rendered_rgb.device,
+                    ),
+                ],
+                dim=0,
+            )
+            if shadow_map:
+                render_alpha = allmap[1:2].clamp_min(1e-8)
+                depth_image = torch.nan_to_num(allmap[0:1] / render_alpha, 0, 0)
+                rendered_image = torch.cat([rendered_image, depth_image], dim=0)
+
+        try:
+            means2D.retain_grad()
+        except:
+            pass
+
     if gau.rasterizer == "gsplat":
         
         focalx = fov2focal(viewpoint_camera.FoVx, viewpoint_camera.image_width)
@@ -884,6 +1456,7 @@ def render(viewpoint_camera,
             "out_weight": out_weight if not shadow_map else torch.zeros([means3D.shape[0], 1], dtype=torch.float32, device='cuda'),
             "backward_info": backward_info,       # [N, 1]
             "shadow_stage": shadow_stage,
+            "transmat_grad_holder": transmat_grad_holder,
             #"asg3": asg_3                 # [N, asg_channel_num]
             "expected_depth": rendered_image[7:8, :, :] if shadow_map else None,
             "depth_image": depth_image if shadow_map else None

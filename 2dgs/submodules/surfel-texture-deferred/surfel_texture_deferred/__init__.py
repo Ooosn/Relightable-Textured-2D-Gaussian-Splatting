@@ -9,6 +9,7 @@
 # For inquiries contact  george.drettakis@inria.fr
 #
 
+import os
 from typing import NamedTuple
 import torch.nn as nn
 import torch
@@ -30,6 +31,8 @@ def rasterize_gaussians(
     texture_color,
     texture_alpha,
     texture_sigma_factor,
+    use_textures,
+    transmat_grad_holder,
     raster_settings,
 ):
     return _RasterizeGaussians.apply(
@@ -44,6 +47,8 @@ def rasterize_gaussians(
         texture_color,
         texture_alpha,
         texture_sigma_factor,
+        use_textures,
+        transmat_grad_holder,
         raster_settings,
     )
 
@@ -62,6 +67,8 @@ class _RasterizeGaussians(torch.autograd.Function):
         texture_color,
         texture_alpha,
         texture_sigma_factor,
+        use_textures,
+        transmat_grad_holder,
         raster_settings,
     ):
 
@@ -87,6 +94,7 @@ class _RasterizeGaussians(torch.autograd.Function):
             texture_color,
             texture_alpha,
             texture_sigma_factor,
+            use_textures,
             raster_settings.prefiltered,
             raster_settings.debug
         )
@@ -107,6 +115,8 @@ class _RasterizeGaussians(torch.autograd.Function):
         ctx.raster_settings = raster_settings
         ctx.num_rendered = num_rendered
         ctx.texture_sigma_factor = texture_sigma_factor
+        ctx.use_textures = bool(use_textures)
+        ctx.has_transmat_grad_holder = transmat_grad_holder is not None and transmat_grad_holder.numel() > 0
         ctx.save_for_backward(
             colors_precomp,
             means3D,
@@ -130,6 +140,7 @@ class _RasterizeGaussians(torch.autograd.Function):
         num_rendered = ctx.num_rendered
         raster_settings = ctx.raster_settings
         texture_sigma_factor = ctx.texture_sigma_factor
+        use_textures = ctx.use_textures
         (
             colors_precomp,
             means3D,
@@ -166,6 +177,7 @@ class _RasterizeGaussians(torch.autograd.Function):
                 texture_color,
                 texture_alpha,
                 texture_sigma_factor,
+                use_textures,
                 geomBuffer,
                 num_rendered,
                 binningBuffer,
@@ -184,6 +196,24 @@ class _RasterizeGaussians(torch.autograd.Function):
         else:
              grad_means2D, grad_colors_precomp, grad_opacities, grad_means3D, grad_cov3Ds_precomp, grad_sh, grad_scales, grad_rotations, grad_texture_color, grad_texture_alpha = _C.rasterize_gaussians_backward(*args)
 
+        if os.getenv("SURFEL_DEFERRED_DEBUG_SHAPES", "0") == "1":
+            print(
+                "surfel_texture_deferred.backward shapes:",
+                tuple(grad_means2D.shape),
+                tuple(grad_colors_precomp.shape),
+                tuple(grad_opacities.shape),
+                tuple(grad_means3D.shape),
+                tuple(grad_cov3Ds_precomp.shape),
+                tuple(grad_sh.shape),
+                tuple(grad_scales.shape),
+                tuple(grad_rotations.shape),
+            )
+
+        if colors_precomp.numel() == 0:
+            grad_colors_precomp = None
+        if sh.numel() == 0:
+            grad_sh = None
+
         grads = (
             grad_means3D,
             grad_means2D,
@@ -196,6 +226,8 @@ class _RasterizeGaussians(torch.autograd.Function):
             grad_texture_color,
             grad_texture_alpha,
             None,
+            None,
+            grad_cov3Ds_precomp if ctx.has_transmat_grad_holder else None,
             None,
         )
 
@@ -244,11 +276,13 @@ class GaussianRasterizer(nn.Module):
         texture_color=None,
         texture_alpha=None,
         texture_sigma_factor=3.0,
+        use_textures=True,
+        transmat_grad_holder=None,
     ):
         
         raster_settings = self.raster_settings
 
-        if (shs is None and colors_precomp is None) or (shs is not None and colors_precomp is not None):
+        if not use_textures and ((shs is None and colors_precomp is None) or (shs is not None and colors_precomp is not None)):
             raise Exception('Please provide excatly one of either SHs or precomputed colors!')
         
         if ((scales is None or rotations is None) and cov3D_precomp is None) or ((scales is not None or rotations is not None) and cov3D_precomp is not None):
@@ -269,6 +303,8 @@ class GaussianRasterizer(nn.Module):
             texture_color = torch.Tensor([]).cuda()
         if texture_alpha is None:
             texture_alpha = torch.Tensor([]).cuda()
+        if transmat_grad_holder is None:
+            transmat_grad_holder = torch.Tensor([]).cuda()
         
 
         # Invoke C++/CUDA rasterization routine
@@ -284,6 +320,8 @@ class GaussianRasterizer(nn.Module):
             texture_color,
             texture_alpha,
             texture_sigma_factor,
+            use_textures,
+            transmat_grad_holder,
             raster_settings, 
         )
 

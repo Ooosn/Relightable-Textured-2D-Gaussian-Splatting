@@ -33,6 +33,7 @@ from diff_surfel_rasterization_shadow import (  # noqa: E402
     GaussianRasterizationSettings as ShadowRasterSettings,
     GaussianRasterizer as ShadowRasterizer,
 )
+from utils.graphics_utils import getProjectionMatrix
 
 
 def _get_orthographic_matrix_from_bounds(xmin, xmax, ymin, ymax, zmin, zmax):
@@ -73,14 +74,21 @@ def _look_at(camera_position, target_position, up_dir):
 
 
 def _build_light_transform(viewpoint_camera, means3d, pipe):
-    """Build world-to-light orthographic projection, returning matrices and tanfov values."""
+    """Build the light-camera transform used by the shadow pass.
+
+    Default behavior mirrors the working gs3 path:
+    - perspective light camera
+    - focal length scaled from the view/light distance ratio
+
+    An orthographic branch is still supported for explicit experiments only.
+    """
     tanfovx = math.tan(viewpoint_camera.FoVx * 0.5)
     tanfovy = math.tan(viewpoint_camera.FoVy * 0.5)
     fx_origin = viewpoint_camera.image_width / (2.0 * tanfovx)
     fy_origin = viewpoint_camera.image_height / (2.0 * tanfovy)
 
     object_center = means3d.mean(dim=0).detach().cpu().numpy()
-    light_position = viewpoint_camera.pl_pos.detach().cpu().numpy()
+    light_position = viewpoint_camera.pl_pos.detach().cpu().numpy().reshape(-1)
     world_view_transform_light = _look_at(
         light_position,
         object_center,
@@ -95,21 +103,9 @@ def _build_light_transform(viewpoint_camera, means3d, pipe):
     camera_position = viewpoint_camera.camera_center.detach().cpu().numpy() * getattr(pipe, "shadow_light_scale", 1.0)
     light_norm = max(float(np.sum(light_position * light_position)), 1e-8)
     camera_norm = max(float(np.sum(camera_position * camera_position)), 1e-8)
-    f_scale_ratio = math.sqrt(light_norm / camera_norm) * 0.2
+    f_scale_ratio = math.sqrt(light_norm / camera_norm)
     fx_far = fx_origin * f_scale_ratio
     fy_far = fy_origin * f_scale_ratio
-
-    xyz_h = torch.cat([means3d, torch.ones_like(means3d[:, :1])], dim=1)
-    xyz_ortho = xyz_h @ world_view_transform_light
-    x_min, y_min, z_min = xyz_ortho[:, 0].min(), xyz_ortho[:, 1].min(), xyz_ortho[:, 2].min()
-    x_max, y_max, z_max = xyz_ortho[:, 0].max(), xyz_ortho[:, 1].max(), xyz_ortho[:, 2].max()
-
-    light_ortho_proj_matrix = _get_orthographic_matrix_from_bounds(
-        xmin=x_min, xmax=x_max, ymin=y_min, ymax=y_max, zmin=z_min, zmax=z_max,
-    ).transpose(0, 1).cuda()
-    full_ortho_proj_transform_light = (
-        world_view_transform_light.unsqueeze(0).bmm(light_ortho_proj_matrix.unsqueeze(0))
-    ).squeeze(0)
 
     tanfovx_far = 0.5 * viewpoint_camera.image_width / fx_far
     tanfovy_far = 0.5 * viewpoint_camera.image_height / fy_far
@@ -117,14 +113,39 @@ def _build_light_transform(viewpoint_camera, means3d, pipe):
     h_light = min(max(32, int(resolution_scale * viewpoint_camera.image_height)), 2048)
     w_light = min(max(32, int(resolution_scale * viewpoint_camera.image_width)), 2048)
 
+    ortho = bool(getattr(pipe, "shadow_ortho", False))
+    if ortho:
+        xyz_h = torch.cat([means3d, torch.ones_like(means3d[:, :1])], dim=1)
+        xyz_ortho = xyz_h @ world_view_transform_light
+        x_min, y_min, z_min = xyz_ortho[:, 0].min(), xyz_ortho[:, 1].min(), xyz_ortho[:, 2].min()
+        x_max, y_max, z_max = xyz_ortho[:, 0].max(), xyz_ortho[:, 1].max(), xyz_ortho[:, 2].max()
+
+        light_ortho_proj_matrix = _get_orthographic_matrix_from_bounds(
+            xmin=x_min, xmax=x_max, ymin=y_min, ymax=y_max, zmin=z_min, zmax=z_max,
+        ).transpose(0, 1).cuda()
+        light_projmatrix = (
+            world_view_transform_light.unsqueeze(0).bmm(light_ortho_proj_matrix.unsqueeze(0))
+        ).squeeze(0)
+    else:
+        light_persp_proj_matrix = getProjectionMatrix(
+            znear=viewpoint_camera.znear,
+            zfar=viewpoint_camera.zfar,
+            fovX=2.0 * math.atan(tanfovx_far),
+            fovY=2.0 * math.atan(tanfovy_far),
+        ).transpose(0, 1).cuda()
+        light_projmatrix = (
+            world_view_transform_light.unsqueeze(0).bmm(light_persp_proj_matrix.unsqueeze(0))
+        ).squeeze(0)
+
     return dict(
         world_view_transform_light=world_view_transform_light,
-        full_ortho_proj_transform_light=full_ortho_proj_transform_light,
+        light_projmatrix=light_projmatrix,
         tanfovx_far=tanfovx_far,
         tanfovy_far=tanfovy_far,
         h_light=h_light,
         w_light=w_light,
         light_position=light_position,
+        ortho=ortho,
     )
 
 
@@ -169,13 +190,13 @@ def _compute_shadow_pass(viewpoint_camera, pc: GaussianModel, pipe, bg_color: to
         bg=bg_color[:3],
         scale_modifier=scaling_modifier,
         viewmatrix=lt["world_view_transform_light"],
-        projmatrix=lt["full_ortho_proj_transform_light"],
+        projmatrix=lt["light_projmatrix"],
         sh_degree=pc.active_sh_degree,
         campos=torch.tensor(lt["light_position"], dtype=torch.float32, device="cuda"),
         prefiltered=False,
         debug=getattr(pipe, "debug", False),
         low_pass_filter_radius=0.3,
-        ortho=False,
+        ortho=lt["ortho"],
         use_textures=use_textures,
     )
     shadow_rasterizer = ShadowRasterizer(raster_settings=shadow_settings)
@@ -203,20 +224,18 @@ def _compute_shadow_pass(viewpoint_camera, pc: GaussianModel, pipe, bg_color: to
     if use_textures:
         # out_trans / non_trans: [N*R*R] flat → reshape to [N, R, R]
         R = int(round((out_trans.numel() / max(N, 1)) ** 0.5))
-        per_uv_shadow = torch.clamp(
-            out_trans.view(N, R, R) / non_trans_safe.view(N, R, R), 0.0, 1.0
-        )  # [N, R, R]
+        per_uv_shadow = out_trans.view(N, R, R) / non_trans_safe.view(N, R, R)  # [N, R, R]
         per_point_shadow = per_uv_shadow.mean(dim=(-2, -1), keepdim=False).unsqueeze(-1)  # [N, 1]
     else:
         # out_trans / non_trans: [N] flat → per-Gaussian shadow
         per_uv_shadow = None
-        per_point_shadow = torch.clamp(out_trans / non_trans_safe, 0.0, 1.0).unsqueeze(-1)  # [N, 1]
+        per_point_shadow = (out_trans / non_trans_safe).unsqueeze(-1)  # [N, 1]
 
     return {
-        "per_point_shadow": per_point_shadow.detach(),
-        "per_uv_shadow": per_uv_shadow.detach() if per_uv_shadow is not None else None,
+        "per_point_shadow": per_point_shadow,
+        "per_uv_shadow": per_uv_shadow,
         "light_viewmatrix": lt["world_view_transform_light"],
-        "light_projmatrix": lt["full_ortho_proj_transform_light"],
+        "light_projmatrix": lt["light_projmatrix"],
     }
 
 
@@ -225,7 +244,10 @@ def _safe_normalize(vec):
 
 
 def _ndotwi(normals, wi):
-    return F.elu(torch.sum(normals * wi, dim=-1, keepdim=True), alpha=0.01) + 0.01
+    import math
+    a = 0.01
+    tmp = a * (1.0 - 1.0 / math.e)
+    return (F.elu(torch.sum(normals * wi, dim=-1, keepdim=True), alpha=a) + tmp) / (1.0 + tmp)
 
 
 def _compute_mbrdf_colors(viewpoint_camera, pc: GaussianModel, shadow_pkg, fix_lambert: bool = False):
@@ -265,6 +287,8 @@ def _compute_mbrdf_colors(viewpoint_camera, pc: GaussianModel, shadow_pkg, fix_l
     wi_ray = pl_pos3 - pc.get_xyz                         # [N, 3]
     wi_dist2 = wi_ray.pow(2).sum(-1, keepdim=True).clamp_min(1e-12)  # [N, 1]
     wi = wi_ray * wi_dist2.rsqrt()                        # [N, 3]
+    if getattr(viewpoint_camera, "cam_pose_adj", None) is not None and viewpoint_camera.cam_pose_adj.requires_grad:
+        cam_center = cam_center.detach()
     wo = _safe_normalize(cam_center - pc.get_xyz)         # [N, 3]
 
     local_axises = pc.get_local_axis                      # [N, 3, 3]
@@ -337,7 +361,7 @@ def _compute_mbrdf_colors(viewpoint_camera, pc: GaussianModel, shadow_pkg, fix_l
     return {"basecolor": basecolor, "shadow": decay, "other_effects": other_effects}
 
 
-def _build_output_dict(means2D, radii, rendered_image, allmap, viewpoint_camera, pc, pipe, shadow_pkg):
+def _build_output_dict(means2D, radii, rendered_image, allmap, viewpoint_camera, pc, pipe, shadow_pkg, transmat_grad_holder, rendered_split=None):
     """Pack rasterizer outputs into the standard return dict."""
     render_alpha = allmap[1:2]
     render_normal = (
@@ -347,7 +371,7 @@ def _build_output_dict(means2D, radii, rendered_image, allmap, viewpoint_camera,
     render_depth_expected = torch.nan_to_num(allmap[0:1] / render_alpha, 0, 0)
     surf_depth  = render_depth_expected * (1 - pipe.depth_ratio) + pipe.depth_ratio * render_depth_median
     surf_normal = depth_to_normal(viewpoint_camera, surf_depth).permute(2, 0, 1) * render_alpha.detach()
-    return {
+    out = {
         "render":            rendered_image,
         "viewspace_points":  means2D,
         "visibility_filter": radii > 0,
@@ -358,12 +382,18 @@ def _build_output_dict(means2D, radii, rendered_image, allmap, viewpoint_camera,
         "surf_depth":        surf_depth,
         "surf_normal":       surf_normal,
         "pre_shadow":        shadow_pkg["per_point_shadow"] if shadow_pkg else None,
+        "transmat_grad_holder": transmat_grad_holder,
     }
+    if rendered_split is not None:
+        out["render_base"] = rendered_split[0:3]
+        out["render_shadow"] = rendered_split[3:4]
+        out["render_other_effects"] = rendered_split[4:7]
+    return out
 
 
 def render(viewpoint_camera, pc: GaussianModel, pipe, bg_color: torch.Tensor,
            scaling_modifier=1.0, override_color=None, fix_lambert=False,
-           apply_shadow=True, deferred=False):
+           apply_shadow=True, deferred=False, return_deferred_split=False):
     """Render the scene.
 
     Two rendering modes (controlled by ``deferred``):
@@ -398,6 +428,20 @@ def render(viewpoint_camera, pc: GaussianModel, pipe, bg_color: torch.Tensor,
         if not apply_shadow:
             # Phase 0: no phasefunc, no shadow. Keep mBRDF representation explicit.
             N = pc.get_xyz.shape[0]
+            pl_pos = viewpoint_camera.pl_pos
+            if not isinstance(pl_pos, torch.Tensor):
+                pl_pos = torch.tensor(pl_pos, dtype=torch.float32)
+            pl_pos = pl_pos.to(pc.get_xyz.device)
+            if pl_pos.ndim == 1:
+                pl_pos = pl_pos.unsqueeze(0)
+
+            pl_pos3 = pl_pos[0].unsqueeze(0).expand(N, -1)
+            wi_ray = pl_pos3 - pc.get_xyz
+            wi_dist2 = wi_ray.pow(2).sum(-1, keepdim=True).clamp_min(1e-12)
+            wi = wi_ray * wi_dist2.rsqrt()
+            local_z = pc.get_local_axis[:, :, 2]
+            ndotwi = _ndotwi(local_z, wi)
+            inv_d2 = 1.0 / wi_dist2
             if getattr(pc, "use_textures", False):
                 # basecolor comes from texture in render_textured; only provide scalar decay + zero other.
                 mbrdf = {
@@ -407,7 +451,9 @@ def render(viewpoint_camera, pc: GaussianModel, pipe, bg_color: torch.Tensor,
                 }
             else:
                 mbrdf = {
-                    "basecolor": (pc.get_kd / math.pi).expand(-1, 3).contiguous(),  # [N,3]
+                    # Match gs3 Phase 0: even before shadow/phase learning starts,
+                    # the diffuse warmup still uses the point-light geometry term.
+                    "basecolor": (pc.get_kd / math.pi) * ndotwi * inv_d2,  # [N,3]
                     "shadow": torch.ones((N, 1), dtype=torch.float32, device=pc.get_xyz.device),
                     "other_effects": torch.zeros((N, 3), dtype=torch.float32, device=pc.get_xyz.device),
                 }
@@ -416,7 +462,7 @@ def render(viewpoint_camera, pc: GaussianModel, pipe, bg_color: torch.Tensor,
 
     # ══ Step 3: Rasterization ═══════════════════════════════════════════════
     colors_precomp = None
-    rendered_image, radii, allmap, means2D = rasterize_with_texture_module(
+    rendered_image, radii, allmap, means2D, transmat_grad_holder, rendered_split = rasterize_with_texture_module(
         viewpoint_camera=viewpoint_camera,
         pc=pc,
         pipe=pipe,
@@ -426,8 +472,9 @@ def render(viewpoint_camera, pc: GaussianModel, pipe, bg_color: torch.Tensor,
             deferred=deferred,
             mbrdf = mbrdf,
             colors_precomp=colors_precomp,
+            return_split=return_deferred_split,
         ),
     )
     return _build_output_dict(
-        means2D, radii, rendered_image, allmap, viewpoint_camera, pc, pipe, shadow_pkg
+        means2D, radii, rendered_image, allmap, viewpoint_camera, pc, pipe, shadow_pkg, transmat_grad_holder, rendered_split
     )

@@ -410,16 +410,16 @@ class GaussianModel:
             max_steps=training_args.neural_phasefunc_lr_max_steps,
         )
 
-    def update_learning_rate(self, iteration):
+    def update_learning_rate(self, iteration, asg_freeze_step=0, local_q_freeze_step=0, freeze_phasefunc_steps=0):
         for param_group in self.optimizer.param_groups:
             if param_group["name"] == "xyz":
                 param_group["lr"] = self.xyz_scheduler_args(iteration)
             elif param_group["name"] in {"alpha_asg", "asg_sigma", "asg_rotation", "asg_scales"}:
-                param_group["lr"] = self.asg_scheduler_args(iteration)
+                param_group["lr"] = self.asg_scheduler_args(max(0, iteration - asg_freeze_step))
             elif param_group["name"] == "local_q":
-                param_group["lr"] = self.local_q_scheduler_args(iteration)
+                param_group["lr"] = self.local_q_scheduler_args(max(0, iteration - local_q_freeze_step))
             elif param_group["name"] in {"neural_phasefunc", "neural_material"}:
-                param_group["lr"] = self.neural_phasefunc_scheduler_args(iteration)
+                param_group["lr"] = self.neural_phasefunc_scheduler_args(max(0, iteration - freeze_phasefunc_steps))
 
     def construct_list_of_attributes(self):
         names = ["x", "y", "z", "nx", "ny", "nz"]

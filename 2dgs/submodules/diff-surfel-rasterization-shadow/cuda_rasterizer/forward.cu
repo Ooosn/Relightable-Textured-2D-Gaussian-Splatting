@@ -298,7 +298,6 @@ renderCUDA(
 	__shared__ float3 collected_Tu[BLOCK_SIZE];
 	__shared__ float3 collected_Tv[BLOCK_SIZE];
 	__shared__ float3 collected_Tw[BLOCK_SIZE];
-
 	__shared__ int collected_id_pointT[BLOCK_SIZE];
 	__shared__ float collected_depth_pointT[BLOCK_SIZE];
 	__shared__ float2 collected_xy_pointT[BLOCK_SIZE];
@@ -504,17 +503,18 @@ renderCUDA(
 					if (!done && current_valid)
 					{
 						contributor++;
+						float transition_trans = footprint_j * (T * (1.0f - (depth_diff / offset) + (depth_diff / offset) * temp));
 						if (texture_resolution > 0)
 						{
 							int ui = min(max((int)(u_j * texture_resolution), 0), texture_resolution - 1);
 							int vi = min(max((int)(v_j * texture_resolution), 0), texture_resolution - 1);
 							int sidx = texture_alpha_index(current_id, vi, ui, texture_resolution);
-							atomicAdd(&(out_trans[sidx]), footprint_j * T);
+							atomicAdd(&(out_trans[sidx]), transition_trans);
 							atomicAdd(&(non_trans[sidx]), footprint_j);
 						}
 						else
 						{
-							atomicAdd(&(out_trans[current_id]), footprint_j * T);
+							atomicAdd(&(out_trans[current_id]), transition_trans);
 							atomicAdd(&(non_trans[current_id]), footprint_j);
 						}
 						if (is_train)
@@ -529,17 +529,18 @@ renderCUDA(
 			if (!done && current_valid)
 			{
 				contributor++;
+				float transition_trans = footprint_j * (T * (1.0f - (depth_diff / offset) + (depth_diff / offset) * temp));
 				if (texture_resolution > 0)
 				{
 					int ui = min(max((int)(u_j * texture_resolution), 0), texture_resolution - 1);
 					int vi = min(max((int)(v_j * texture_resolution), 0), texture_resolution - 1);
 					int sidx = texture_alpha_index(current_id, vi, ui, texture_resolution);
-					atomicAdd(&(out_trans[sidx]), footprint_j * T);
+					atomicAdd(&(out_trans[sidx]), transition_trans);
 					atomicAdd(&(non_trans[sidx]), footprint_j);
 				}
 				else
 				{
-					atomicAdd(&(out_trans[current_id]), footprint_j * T);
+					atomicAdd(&(out_trans[current_id]), transition_trans);
 					atomicAdd(&(non_trans[current_id]), footprint_j);
 				}
 				if (is_train)
@@ -569,6 +570,7 @@ renderColorCUDA(
 	const uint32_t* __restrict__ point_list,
 	int W, int H,
 	const float2* __restrict__ points_xy_image,
+	const float* __restrict__ features,
 	const float* __restrict__ transMats,
 	const float4* __restrict__ normal_opacity,
 	const float* __restrict__ texture_color,    // [N, C, R, R] or nullptr
@@ -648,13 +650,21 @@ renderColorCUDA(
 			float rgb_j[CHANNELS] = {};
 			float dummy_du[CHANNELS] = {}, dummy_dv[CHANNELS] = {};
 			float tex_a = 1.0f, tex_a_du = 0.0f, tex_a_dv = 0.0f;
-			sample_texture_bilinear(
-				texture_color, texture_alpha,
-				gid, texture_resolution,
-				u_j, v_j,
-				rgb_j, tex_a,
-				dummy_du, dummy_dv,
-				tex_a_du, tex_a_dv);
+			if (texture_color != nullptr && texture_resolution > 0)
+			{
+				sample_texture_bilinear(
+					texture_color, texture_alpha,
+					gid, texture_resolution,
+					u_j, v_j,
+					rgb_j, tex_a,
+					dummy_du, dummy_dv,
+					tex_a_du, tex_a_dv);
+			}
+			else
+			{
+				for (int ch = 0; ch < CHANNELS; ch++)
+					rgb_j[ch] = features[gid * CHANNELS + ch];
+			}
 
 			float footprint = max(0.0f, tex_a) * exp(power);
 			float alpha = min(0.99f, no_j.w * footprint);
@@ -791,6 +801,7 @@ void FORWARD::renderColor(
 	const uint32_t* point_list,
 	int W, int H,
 	const float2* means2D,
+	const float* features,
 	const float* transMats,
 	const float4* normal_opacity,
 	const float* texture_color,
@@ -806,6 +817,7 @@ void FORWARD::renderColor(
 		point_list,
 		W, H,
 		means2D,
+		features,
 		transMats,
 		normal_opacity,
 		texture_color,

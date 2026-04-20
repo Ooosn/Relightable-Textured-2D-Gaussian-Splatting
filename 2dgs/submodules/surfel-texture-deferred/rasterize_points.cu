@@ -58,6 +58,7 @@ RasterizeGaussiansCUDA(
 	const torch::Tensor& texture_color,
 	const torch::Tensor& texture_alpha,
 	const float texture_sigma_factor,
+	const bool use_textures,
 	const bool prefiltered,
 	const bool debug)
 {
@@ -85,8 +86,11 @@ RasterizeGaussiansCUDA(
   CHECK_INPUT(projmatrix);
   CHECK_INPUT(sh);
   CHECK_INPUT(campos);
-  if (texture_color.numel() != 0) CHECK_INPUT(texture_color);
-  if (texture_alpha.numel() != 0) CHECK_INPUT(texture_alpha);
+  if (use_textures) {
+	if (texture_color.numel() == 0) AT_ERROR("use_textures=True but texture_color is empty");
+	CHECK_INPUT(texture_color);
+	if (texture_alpha.numel() != 0) CHECK_INPUT(texture_alpha);
+  }
 
   auto int_opts = means3D.options().dtype(torch::kInt32);
   auto float_opts = means3D.options().dtype(torch::kFloat32);
@@ -121,8 +125,8 @@ RasterizeGaussiansCUDA(
 		background.contiguous().data<float>(),
 		W, H,
 		means3D.contiguous().data<float>(),
-		sh.contiguous().data_ptr<float>(),
-		colors.contiguous().data<float>(), 
+		sh.numel() == 0 ? nullptr : sh.contiguous().data_ptr<float>(),
+		colors.numel() == 0 ? nullptr : colors.contiguous().data<float>(), 
 		opacity.contiguous().data<float>(), 
 		scales.contiguous().data_ptr<float>(),
 		scale_modifier,
@@ -131,9 +135,10 @@ RasterizeGaussiansCUDA(
 		viewmatrix.contiguous().data<float>(), 
 		projmatrix.contiguous().data<float>(),
 		campos.contiguous().data<float>(),
-		texture_color.contiguous().data_ptr<float>(),
-		texture_alpha.contiguous().data_ptr<float>(),
-		static_cast<int>(texture_color.numel() == 0 ? 0 : texture_color.size(2)),
+		use_textures,
+		use_textures ? texture_color.contiguous().data_ptr<float>() : nullptr,
+		(use_textures && texture_alpha.numel() != 0) ? texture_alpha.contiguous().data_ptr<float>() : nullptr,
+		static_cast<int>(use_textures ? texture_color.size(2) : 0),
 		texture_sigma_factor,
 		tan_fovx,
 		tan_fovy,
@@ -168,6 +173,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
 	const torch::Tensor& texture_color,
 	const torch::Tensor& texture_alpha,
 	const float texture_sigma_factor,
+	const bool use_textures,
 	const torch::Tensor& geomBuffer,
 	const int R,
 	const torch::Tensor& binningBuffer,
@@ -186,8 +192,11 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
   CHECK_INPUT(projmatrix);
   CHECK_INPUT(sh);
   CHECK_INPUT(campos);
-  if (texture_color.numel() != 0) CHECK_INPUT(texture_color);
-  if (texture_alpha.numel() != 0) CHECK_INPUT(texture_alpha);
+  if (use_textures) {
+	if (texture_color.numel() == 0) AT_ERROR("use_textures=True but texture_color is empty");
+	CHECK_INPUT(texture_color);
+	if (texture_alpha.numel() != 0) CHECK_INPUT(texture_alpha);
+  }
   CHECK_INPUT(binningBuffer);
   CHECK_INPUT(imageBuffer);
   CHECK_INPUT(geomBuffer);
@@ -211,8 +220,8 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
   torch::Tensor dL_dsh = torch::zeros({P, M, 3}, means3D.options());
   torch::Tensor dL_dscales = torch::zeros({P, 2}, means3D.options());
   torch::Tensor dL_drotations = torch::zeros({P, 4}, means3D.options());
-  torch::Tensor dL_dtex_color = texture_color.numel() == 0 ? torch::empty({0}, means3D.options()) : torch::zeros_like(texture_color);
-  torch::Tensor dL_dtex_alpha = texture_alpha.numel() == 0 ? torch::empty({0}, means3D.options()) : torch::zeros_like(texture_alpha);
+  torch::Tensor dL_dtex_color = (!use_textures || texture_color.numel() == 0) ? torch::empty({0}, means3D.options()) : torch::zeros_like(texture_color);
+  torch::Tensor dL_dtex_alpha = (!use_textures || texture_alpha.numel() == 0) ? torch::empty({0}, means3D.options()) : torch::zeros_like(texture_alpha);
   
   if(P != 0)
   {  
@@ -220,8 +229,8 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
 	  background.contiguous().data<float>(),
 	  W, H, 
 	  means3D.contiguous().data<float>(),
-	  sh.contiguous().data<float>(),
-	  colors.contiguous().data<float>(),
+	  sh.numel() == 0 ? nullptr : sh.contiguous().data<float>(),
+	  colors.numel() == 0 ? nullptr : colors.contiguous().data<float>(),
 	  scales.data_ptr<float>(),
 	  scale_modifier,
 	  rotations.data_ptr<float>(),
@@ -229,9 +238,10 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
 	  viewmatrix.contiguous().data<float>(),
 	  projmatrix.contiguous().data<float>(),
 	  campos.contiguous().data<float>(),
-	  texture_color.contiguous().data_ptr<float>(),
-	  texture_alpha.contiguous().data_ptr<float>(),
-	  static_cast<int>(texture_color.numel() == 0 ? 0 : texture_color.size(2)),
+	  use_textures,
+	  use_textures ? texture_color.contiguous().data_ptr<float>() : nullptr,
+	  (use_textures && texture_alpha.numel() != 0) ? texture_alpha.contiguous().data_ptr<float>() : nullptr,
+	  static_cast<int>(use_textures ? texture_color.size(2) : 0),
 	  texture_sigma_factor,
 	  tan_fovx,
 	  tan_fovy,

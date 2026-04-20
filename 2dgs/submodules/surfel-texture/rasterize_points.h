@@ -37,7 +37,7 @@ RasterizeGaussiansCUDA(
 	const torch::Tensor& texture_color,
 	const torch::Tensor& texture_alpha,
 	const float texture_sigma_factor,
-	const bool enable_texture,
+	const bool use_textures,
 	const bool prefiltered,
 	const bool debug);
 
@@ -63,7 +63,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
 	const torch::Tensor& texture_color,
 	const torch::Tensor& texture_alpha,
 	const float texture_sigma_factor,
-	const bool enable_texture,
+	const bool use_textures,
 	const torch::Tensor& geomBuffer,
 	const int R,
 	const torch::Tensor& binningBuffer,

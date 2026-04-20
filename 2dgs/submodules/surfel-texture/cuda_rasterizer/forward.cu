@@ -157,6 +157,7 @@ __global__ void preprocessCUDA(int P, int D, int M,
 	bool* clamped,
 	const float* transMat_precomp,
 	const float* colors_precomp,
+	const bool use_textures,
 	const float* viewmatrix,
 	const float* projmatrix,
 	const glm::vec3* cam_pos,
@@ -238,10 +239,15 @@ __global__ void preprocessCUDA(int P, int D, int M,
 
 	// Compute colors 
 	if (colors_precomp == nullptr) {
-		glm::vec3 result = computeColorFromSH(idx, D, M, (glm::vec3*)orig_points, *cam_pos, shs, clamped);
-		rgb[idx * C + 0] = result.x;
-		rgb[idx * C + 1] = result.y;
-		rgb[idx * C + 2] = result.z;
+		if (use_textures) {
+			for (int ch = 0; ch < C; ch++)
+				rgb[idx * C + ch] = 0.0f;
+		} else {
+			glm::vec3 result = computeColorFromSH(idx, D, M, (glm::vec3*)orig_points, *cam_pos, shs, clamped);
+			rgb[idx * C + 0] = result.x;
+			rgb[idx * C + 1] = result.y;
+			rgb[idx * C + 2] = result.z;
+		}
 	}
 
 	depths[idx] = p_view.z;
@@ -266,7 +272,7 @@ renderCUDA(
 	const float* __restrict__ transMats,
 	const float* __restrict__ depths,
 	const float4* __restrict__ normal_opacity,
-	const bool enable_texture,
+	const bool use_textures,
 	const float* __restrict__ texture_color,
 	const float* __restrict__ texture_alpha,
 	int texture_resolution,
@@ -391,7 +397,7 @@ renderCUDA(
 			float du_dsx = 0.0f;
 			float dv_dsy = 0.0f;
 
-			if (enable_texture && texture_color != nullptr && texture_resolution > 0)
+			if (use_textures && texture_color != nullptr && texture_resolution > 0)
 			{
 				compute_texture_uv(s, texture_sigma_factor, u, v, du_dsx, dv_dsy);
 				sample_texture_bilinear(
@@ -418,7 +424,7 @@ renderCUDA(
 			// Obtain alpha by multiplying with Gaussian opacity
 			// and its exponential falloff from mean.
 			// Avoid numerical instabilities (see paper appendix). 
-			float alpha = min(0.99f, opa * tex_a * exp(power));
+			float alpha = min(0.999f, opa * tex_a * exp(power));
 			if (alpha < 1.0f / 255.0f)
 				continue;
 			float test_T = T * (1 - alpha);
@@ -493,7 +499,7 @@ void FORWARD::render(
 	const float* transMats,
 	const float* depths,
 	const float4* normal_opacity,
-	bool enable_texture,
+	bool use_textures,
 	const float* texture_color,
 	const float* texture_alpha,
 	int texture_resolution,
@@ -514,7 +520,7 @@ void FORWARD::render(
 		transMats,
 		depths,
 		normal_opacity,
-		enable_texture,
+		use_textures,
 		texture_color,
 		texture_alpha,
 		texture_resolution,
@@ -536,6 +542,7 @@ void FORWARD::preprocess(int P, int D, int M,
 	bool* clamped,
 	const float* transMat_precomp,
 	const float* colors_precomp,
+	const bool use_textures,
 	const float* viewmatrix,
 	const float* projmatrix,
 	const glm::vec3* cam_pos,
@@ -563,6 +570,7 @@ void FORWARD::preprocess(int P, int D, int M,
 		clamped,
 		transMat_precomp,
 		colors_precomp,
+		use_textures,
 		viewmatrix, 
 		projmatrix,
 		cam_pos,

@@ -104,7 +104,9 @@ class GaussianExtractor(object):
         self.clean()
         self.viewpoint_stack = viewpoint_stack
         for i, viewpoint_cam in tqdm(enumerate(self.viewpoint_stack), desc="reconstruct radiance fields"):
-            render_pkg = self.render(viewpoint_cam, self.gaussians)
+            if hasattr(viewpoint_cam, "update"):
+                viewpoint_cam.update()
+            render_pkg = self.render(viewpoint_cam, self.gaussians, deferred=True)
             rgb = render_pkg['render']
             alpha = render_pkg['rend_alpha']
             normal = torch.nn.functional.normalize(render_pkg['rend_normal'], dim=0)

@@ -101,7 +101,12 @@ def getProjectionMatrixWithPrincipalPoint(znear, zfar, fx, fy, cx, cy, width, he
     # NDC 坐标范围是 [-1, 1]，需要归一化主点
     P[0, 0] = 2.0 * fx / width
     P[1, 1] = 2.0 * fy / height
-    P[0, 2] = 1.0 - 2.0 * cx / width   # 注意：OpenGL 中图像中心默认是 (width/2, height/2)
+    # Match the screen-space convention used by diff-gaussian-rasterization:
+    # ndc2Pix(v, S) = ((v + 1) * S - 1) * 0.5
+    # so a principal-point shift of (cx - W/2, cy - H/2) maps to:
+    #   P[0, 2] = 2 * cx / W - 1
+    #   P[1, 2] = 2 * cy / H - 1
+    P[0, 2] = 2.0 * cx / width - 1.0
     P[1, 2] = 2.0 * cy / height - 1.0
 
     # Z buffer 设定

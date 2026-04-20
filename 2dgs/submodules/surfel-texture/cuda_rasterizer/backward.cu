@@ -156,7 +156,7 @@ renderCUDA(
 	const float* __restrict__ depths,
 	const float* __restrict__ final_Ts,
 	const uint32_t* __restrict__ n_contrib,
-	const bool enable_texture,
+	const bool use_textures,
 	const float* __restrict__ texture_color,
 	const float* __restrict__ texture_alpha,
 	int texture_resolution,
@@ -323,7 +323,7 @@ renderCUDA(
 			float du_dsx = 0.0f;
 			float dv_dsy = 0.0f;
 
-			if (enable_texture && texture_color != nullptr && texture_resolution > 0)
+			if (use_textures && texture_color != nullptr && texture_resolution > 0)
 			{
 				compute_texture_uv(s, texture_sigma_factor, u, v, du_dsx, dv_dsy);
 				sample_texture_bilinear(
@@ -349,7 +349,9 @@ renderCUDA(
 				continue;
 
 			const float G = exp(power);
-			const float alpha = min(0.99f, opa * tex_a * G);
+			const float raw_alpha = opa * tex_a * G;
+			const bool alpha_clamped = raw_alpha > 0.999f;
+			const float alpha = min(0.999f, raw_alpha);
 			if (alpha < 1.0f / 255.0f)
 				continue;
 
@@ -430,8 +432,8 @@ renderCUDA(
 
 
 			// Helpful reusable temporary variables
-			float dL_dsample_alpha = opa * G * dL_dalpha;
-			const float dL_dG = nor_o.w * tex_a * dL_dalpha;
+			float dL_dsample_alpha = alpha_clamped ? 0.0f : opa * G * dL_dalpha;
+			const float dL_dG = alpha_clamped ? 0.0f : nor_o.w * tex_a * dL_dalpha;
 			float dL_ds_texture_x = 0.0f;
 			float dL_ds_texture_y = 0.0f;
 			for (int ch = 0; ch < C; ++ch) {
@@ -476,13 +478,14 @@ renderCUDA(
 				// // Update gradients w.r.t. center of Gaussian 2D mean position
 				const float dG_ddelx = -G * FilterInvSquare * d.x;
 				const float dG_ddely = -G * FilterInvSquare * d.y;
-				atomicAdd(&dL_dmean2D[global_id].x, dL_dG * dG_ddelx); // not scaled
-				atomicAdd(&dL_dmean2D[global_id].y, dL_dG * dG_ddely); // not scaled
+				atomicAdd(&dL_dmean2D[global_id].x, dL_dG * dG_ddelx);
+				atomicAdd(&dL_dmean2D[global_id].y, dL_dG * dG_ddely);
 			}
 
 			// Update gradients w.r.t. opacity of the Gaussian
-			atomicAdd(&(dL_dopacity[global_id]), tex_a * G * dL_dalpha);
-			if (enable_texture && texture_color != nullptr && texture_resolution > 0)
+			if (!alpha_clamped)
+				atomicAdd(&(dL_dopacity[global_id]), tex_a * G * dL_dalpha);
+			if (use_textures && texture_color != nullptr && texture_resolution > 0)
 			{
 				accumulate_texture_bilinear_vjp(
 					global_id,
@@ -683,10 +686,15 @@ __global__ void preprocessCUDA(
 	if (shs)
 		computeColorFromSH(idx, D, M, (glm::vec3*)means3D, *campos, shs, clamped, (glm::vec3*)dL_dcolors, (glm::vec3*)dL_dmean3Ds, (glm::vec3*)dL_dshs);
 	
-	// hack the gradient here for densitification
-	float depth = transMats[idx * 9 + 8];
-	dL_dmean2Ds[idx].x = dL_dtransMats[idx * 9 + 2] * depth * 0.5 * float(W); // to ndc 
-	dL_dmean2Ds[idx].y = dL_dtransMats[idx * 9 + 5] * depth * 0.5 * float(H); // to ndc
+	// Prefer the true screen-space dL/dmean2D accumulated in renderCUDA.
+	// Only fall back to the legacy transMat-based proxy when the rasterizer
+	// produced no usable 2D gradient for this Gaussian.
+	if (fabsf(dL_dmean2Ds[idx].x) < 1e-12f && fabsf(dL_dmean2Ds[idx].y) < 1e-12f)
+	{
+		float depth = transMats[idx * 9 + 8];
+		dL_dmean2Ds[idx].x = dL_dtransMats[idx * 9 + 2] * depth * 0.5f * float(W);
+		dL_dmean2Ds[idx].y = dL_dtransMats[idx * 9 + 5] * depth * 0.5f * float(H);
+	}
 }
 
 
@@ -756,7 +764,7 @@ void BACKWARD::render(
 	const float* depths,
 	const float* final_Ts,
 	const uint32_t* n_contrib,
-	bool enable_texture,
+	bool use_textures,
 	const float* texture_color,
 	const float* texture_alpha,
 	int texture_resolution,
@@ -784,7 +792,7 @@ void BACKWARD::render(
 		depths,
 		final_Ts,
 		n_contrib,
-		enable_texture,
+		use_textures,
 		texture_color,
 		texture_alpha,
 		texture_resolution,

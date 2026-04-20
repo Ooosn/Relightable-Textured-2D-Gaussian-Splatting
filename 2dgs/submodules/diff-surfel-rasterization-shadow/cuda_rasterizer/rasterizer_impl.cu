@@ -465,6 +465,7 @@ int CudaRasterizer::Rasterizer::forwardColor(
 			imgState.ranges);
 	CHECK_CUDA(, debug)
 
+	const float* feature_ptr = colors_precomp != nullptr ? colors_precomp : geomState.rgb;
 	const float* transMat_ptr = transMat_precomp != nullptr ? transMat_precomp : geomState.transMat;
 	CHECK_CUDA(FORWARD::renderColor(
 		tile_grid, block,
@@ -472,6 +473,7 @@ int CudaRasterizer::Rasterizer::forwardColor(
 		binningState.point_list,
 		width, height,
 		geomState.means2D,
+		feature_ptr,
 		transMat_ptr,
 		geomState.normal_opacity,
 		texture_color,

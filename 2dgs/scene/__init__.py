@@ -15,10 +15,11 @@ import json
 import torch
 from utils.system_utils import searchForMaxIteration
 from utils.general_utils import get_expon_lr_func
-from scene.dataset_readers import sceneLoadTypeCallbacks
+from scene.dataset_readers import sceneLoadTypeCallbacks, readCamerasFromTransforms
 from scene.gaussian_model import GaussianModel
 from arguments import ModelParams
 from utils.camera_utils import cameraList_from_camInfos, camera_to_JSON
+from utils.graphics_utils import fov2focal
 
 class Scene:
 
@@ -50,6 +51,31 @@ class Scene:
             scene_info = sceneLoadTypeCallbacks["Blender"](args.source_path, args.white_background, args.eval, view_num)
         else:
             assert False, "Could not recognize scene type!"
+
+        if self.loaded_iter:
+            iteration_path = os.path.join(self.model_path, "point_cloud", "iteration_" + str(self.loaded_iter))
+            train_pose_path = os.path.join(iteration_path, "transforms_train.json")
+            test_pose_path = os.path.join(iteration_path, "transforms_test.json")
+            train_cameras = scene_info.train_cameras
+            test_cameras = scene_info.test_cameras
+            if os.path.exists(train_pose_path):
+                train_cameras = readCamerasFromTransforms(
+                    iteration_path,
+                    "transforms_train.json",
+                    args.white_background,
+                    getattr(args, "view_num", -1),
+                )
+            if os.path.exists(test_pose_path):
+                test_cameras = readCamerasFromTransforms(
+                    iteration_path,
+                    "transforms_test.json",
+                    args.white_background,
+                    -1,
+                )
+            scene_info = scene_info._replace(
+                train_cameras=train_cameras,
+                test_cameras=test_cameras,
+            )
 
         if not self.loaded_iter:
             with open(scene_info.ply_path, 'rb') as src_file, open(os.path.join(self.model_path, "input.ply") , 'wb') as dest_file:
@@ -136,6 +162,40 @@ class Scene:
         point_cloud_path = os.path.join(self.model_path, "point_cloud/iteration_{}".format(iteration))
         self.gaussians.save_ply(os.path.join(point_cloud_path, "point_cloud.ply"))
         self.gaussians.save_appearance(os.path.join(point_cloud_path, "appearance.pt"))
+        if self.pose_optimizer is not None:
+            scale = 1.0
+            ref_cam = self.train_cameras[scale][0]
+            intrinsics = [
+                ref_cam.cx,
+                ref_cam.cy,
+                fov2focal(ref_cam.FoVx, ref_cam.image_width),
+                fov2focal(ref_cam.FoVy, ref_cam.image_height),
+            ]
+
+            def _dump(split_name, cameras):
+                payload = {"camera_intrinsics": intrinsics, "frames": []}
+                for cam in cameras:
+                    R, T, pl_pos = cam.get()
+                    payload["frames"].append(
+                        {
+                            "file_path": cam.image_name,
+                            "img_path": cam.image_path,
+                            "R_opt": R.tolist(),
+                            "T_opt": T.tolist(),
+                            "pl_pos": None if pl_pos is None else pl_pos[0].tolist(),
+                            "camera_intrinsics": [
+                                cam.cx,
+                                cam.cy,
+                                fov2focal(cam.FoVx, cam.image_width),
+                                fov2focal(cam.FoVy, cam.image_height),
+                            ],
+                        }
+                    )
+                with open(os.path.join(point_cloud_path, f"transforms_{split_name}.json"), "w") as f:
+                    json.dump(payload, f)
+
+            _dump("train", self.train_cameras[scale])
+            _dump("test", self.test_cameras[scale])
 
     def getTrainCameras(self, scale=1.0):
         return self.train_cameras[scale]

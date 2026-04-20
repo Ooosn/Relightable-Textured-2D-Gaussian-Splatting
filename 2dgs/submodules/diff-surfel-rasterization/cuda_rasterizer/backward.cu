@@ -629,10 +629,15 @@ __global__ void preprocessCUDA(
 	if (shs)
 		computeColorFromSH(idx, D, M, (glm::vec3*)means3D, *campos, shs, clamped, (glm::vec3*)dL_dcolors, (glm::vec3*)dL_dmean3Ds, (glm::vec3*)dL_dshs);
 	
-	// hack the gradient here for densitification
-	float depth = transMats[idx * 9 + 8];
-	dL_dmean2Ds[idx].x = dL_dtransMats[idx * 9 + 2] * depth * 0.5 * float(W); // to ndc 
-	dL_dmean2Ds[idx].y = dL_dtransMats[idx * 9 + 5] * depth * 0.5 * float(H); // to ndc
+	// Prefer the true screen-space dL/dmean2D accumulated in renderCUDA.
+	// Only fall back to the legacy transMat-based proxy when the rasterizer
+	// produced no usable 2D gradient for this Gaussian.
+	if (fabsf(dL_dmean2Ds[idx].x) < 1e-12f && fabsf(dL_dmean2Ds[idx].y) < 1e-12f)
+	{
+		float depth = transMats[idx * 9 + 8];
+		dL_dmean2Ds[idx].x = dL_dtransMats[idx * 9 + 2] * depth * 0.5f * float(W); // to ndc
+		dL_dmean2Ds[idx].y = dL_dtransMats[idx * 9 + 5] * depth * 0.5f * float(H); // to ndc
+	}
 }
 
 

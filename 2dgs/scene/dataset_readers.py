@@ -196,23 +196,34 @@ def readCamerasFromTransforms(path, transformsfile, white_background, view_num=-
                 break
             file_ext = frame.get("file_ext", extension)
             file_path = frame["file_path"]
-            if file_path.endswith((".png", ".jpg", ".jpeg", ".exr")):
-                cam_name = os.path.join(path, file_path)
+            if "img_path" in frame:
+                image_path = frame["img_path"]
+            elif file_path.endswith((".png", ".jpg", ".jpeg", ".exr")):
+                image_path = os.path.join(path, file_path)
             else:
-                cam_name = os.path.join(path, file_path + file_ext)
+                image_path = os.path.join(path, file_path + file_ext)
+            image_name = Path(image_path).stem
 
-            # NeRF 'transform_matrix' is a camera-to-world transform
-            c2w = np.array(frame["transform_matrix"])
-            # change from OpenGL/Blender camera axes (Y up, Z back) to COLMAP (Y down, Z forward)
-            c2w[:3, 1:3] *= -1
+            if "transform_matrix" in frame:
+                # NeRF 'transform_matrix' is a camera-to-world transform
+                c2w = np.array(frame["transform_matrix"])
+                # change from OpenGL/Blender camera axes (Y up, Z back) to COLMAP (Y down, Z forward)
+                c2w[:3, 1:3] *= -1
 
-            # get the world-to-camera transform and set R, T
-            w2c = np.linalg.inv(c2w)
-            R = np.transpose(w2c[:3,:3])  # R is stored transposed due to 'glm' in CUDA code
-            T = w2c[:3, 3]
+                # get the world-to-camera transform and set R, T
+                w2c = np.linalg.inv(c2w)
+                R = np.transpose(w2c[:3,:3])  # R is stored transposed due to 'glm' in CUDA code
+                T = w2c[:3, 3]
+            elif "R_opt" in frame and "T_opt" in frame:
+                # Reload optimized cameras saved during training.
+                R = np.array(frame["R_opt"], dtype=np.float32)
+                T = np.array(frame["T_opt"], dtype=np.float32)
+            else:
+                raise KeyError(
+                    f"Frame in {transformsfile} must contain either "
+                    "'transform_matrix' or ('R_opt', 'T_opt')."
+                )
 
-            image_path = os.path.join(path, cam_name)
-            image_name = Path(cam_name).stem
             image = Image.open(image_path)
 
             im_data = np.array(image.convert("RGBA"))

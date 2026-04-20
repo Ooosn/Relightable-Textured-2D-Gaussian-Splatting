@@ -3,7 +3,7 @@
 # GRAPHDECO research group, https://team.inria.fr/graphdeco
 # All rights reserved.
 #
-# This software is free for non-commercial, research and evaluation use 
+# This software is free for non-commercial, research and evaluation use
 # under the terms of the LICENSE.md file.
 #
 # For inquiries contact  george.drettakis@inria.fr
@@ -24,18 +24,18 @@ class GaussianRasterizer(nn.Module):
         self.raster_settings = raster_settings
 
     def markVisible(self, positions):
-        # Mark visible points (based on frustum culling for camera) with a boolean 
+        # Mark visible points (based on frustum culling for camera) with a boolean
         with torch.no_grad():
             raster_settings = self.raster_settings
             visible = _C.mark_visible(
                 positions,
                 raster_settings.viewmatrix,
                 raster_settings.projmatrix)
-            
+
         return visible
 
     def forward(self, **kwargs):
-        
+
         raster_settings = self.raster_settings
         kwargs["raster_settings"] = raster_settings
 
@@ -53,10 +53,10 @@ class GaussianRasterizer(nn.Module):
 
         if (shs is None and colors_precomp is None) or (shs is not None and colors_precomp is not None):
             raise Exception('Please provide excatly one of either SHs or precomputed colors!')
-        
+
         if ((scales is None or rotations is None) and cov3Ds_precomp is None) or ((scales is not None or rotations is not None) and cov3Ds_precomp is not None):
             raise Exception('Please provide exactly one of either scale/rotation pair or precomputed 3D covariance!')
-        
+
         if shs is None:
             kwargs["shs"] = torch.Tensor([])
         if colors_precomp is None:
@@ -115,7 +115,7 @@ class _RasterizeGaussians(torch.autograd.Function):
 
         # Restructure arguments the way that the C++ lib expects them
         args = (
-            raster_settings.bg, 
+            raster_settings.bg,
             means3D,
             colors_precomp,
             opacities,
@@ -159,7 +159,7 @@ class _RasterizeGaussians(torch.autograd.Function):
         return color, radii, depth, alpha
 
     @staticmethod
-    def backward(ctx, grad_out_color, _):
+    def backward(ctx, grad_out_color, _, __, ___):
 
         # Restore necessary values from context
         num_rendered = ctx.num_rendered
@@ -168,20 +168,20 @@ class _RasterizeGaussians(torch.autograd.Function):
 
         # Restructure args as C++ method expects them
         args = (raster_settings.bg,
-                means3D, 
-                radii, 
-                colors_precomp, 
-                scales, 
-                rotations, 
-                raster_settings.scale_modifier, 
-                cov3Ds_precomp, 
-                raster_settings.viewmatrix, 
-                raster_settings.projmatrix, 
-                raster_settings.tanfovx, 
-                raster_settings.tanfovy, 
-                grad_out_color, 
-                sh, 
-                raster_settings.sh_degree, 
+                means3D,
+                radii,
+                colors_precomp,
+                scales,
+                rotations,
+                raster_settings.scale_modifier,
+                cov3Ds_precomp,
+                raster_settings.viewmatrix,
+                raster_settings.projmatrix,
+                raster_settings.tanfovx,
+                raster_settings.tanfovy,
+                grad_out_color,
+                sh,
+                raster_settings.sh_degree,
                 raster_settings.campos,
                 geomBuffer,
                 num_rendered,
@@ -211,7 +211,7 @@ class _RasterizeGaussians(torch.autograd.Function):
             grad_rotations,
             grad_cov3Ds_precomp,
             None,
-            
+
             None,
             None,
             None
@@ -219,10 +219,88 @@ class _RasterizeGaussians(torch.autograd.Function):
         return grads
 
 
+# ---------------------------------------------------------------------------
+# Differentiable camera-matrix wrapper
+# ---------------------------------------------------------------------------
+# The CUDA rasterizer treats viewmatrix / projmatrix as constants (they live
+# inside the NamedTuple *raster_settings*).  This thin wrapper re-introduces
+# them into the autograd graph so that cam_pose_adj (and any other parameter
+# that feeds into the matrices) receives proper gradients through the
+# projection path – matching what gsplat does natively via
+# fully_fused_projection.
+#
+# Usage (drop-in replacement in the render function):
+#   color, radii, depth, alpha = rasterizer(...)          # as before
+#   color = CamGradBridge.apply(color, viewmatrix,
+#                               projmatrix, means3D, means2D)
+# ---------------------------------------------------------------------------
+
+class CamGradBridge(torch.autograd.Function):
+    """Zero-cost forward; backward injects viewmatrix gradient via mean2D."""
+
+    @staticmethod
+    def forward(ctx, rendered_image, viewmatrix, projmatrix, means3D, means2D_grad_holder):
+        # rendered_image passes through unchanged
+        ctx.save_for_backward(viewmatrix, projmatrix, means3D, means2D_grad_holder)
+        return rendered_image
+
+    @staticmethod
+    def backward(ctx, grad_rendered_image):
+        viewmatrix, projmatrix, means3D, means2D_grad_holder = ctx.saved_tensors
+
+        # We need to propagate the CUDA-computed dL/d(mean2D) through a
+        # differentiable projection to obtain dL/d(viewmatrix).
+        #
+        # means2D_grad_holder.grad is filled by the inner _RasterizeGaussians
+        # backward (which ran first, since rendered_image depends on it).
+        # It contains dL/d(screen_xy) with the 0.5*W factor baked in.
+
+        grad_viewmatrix = None
+        grad_projmatrix = None
+
+        if viewmatrix.requires_grad and means2D_grad_holder.grad is not None:
+            dL_dmean2D = means2D_grad_holder.grad[:, :2].detach()  # [N, 2]
+
+            # Differentiable projection: world -> clip -> NDC -> pixel
+            # viewmatrix is row-major [4,4] (already transposed in camera.py)
+            means_h = torch.cat([means3D.detach(),
+                                 torch.ones_like(means3D[:, :1])], dim=-1)  # [N, 4]
+            # clip = means_h @ projmatrix  (row-vector convention)
+            clip = means_h @ projmatrix           # [N, 4]
+            w = clip[:, 3:4].clamp(min=1e-7)      # [N, 1]
+            ndc_xy = clip[:, :2] / w               # [N, 2]
+            H = viewmatrix.shape[0]  # just need image dims from raster_settings
+            # ndc2Pix: pixel = ((ndc + 1) * S - 1) * 0.5
+            # d(pixel)/d(ndc) = S * 0.5  (already baked into dL_dmean2D)
+            # So dL_dmean2D is effectively dL/d(ndc_xy) when we account
+            # for the 0.5*W factor the CUDA backward applied.
+
+            # Compute scalar proxy = sum(ndc_xy * dL_dmean2D)
+            # backward of this gives dL/d(projmatrix) and dL/d(viewmatrix)
+            # through the chain: projmatrix depends on viewmatrix in
+            # full_proj_transform = world_view_transform @ projection_matrix
+            # But here projmatrix is the *full* proj transform, so its
+            # gradient directly gives us what we need.
+            proxy = (ndc_xy * dL_dmean2D).sum()
+            # We only want gradients for viewmatrix/projmatrix, not means3D
+            # proxy.backward() would work but we need to be careful with graphs.
+            # Use torch.autograd.grad for targeted computation.
+            grads_out = torch.autograd.grad(
+                proxy, [v for v in [viewmatrix, projmatrix] if v.requires_grad],
+                retain_graph=False, allow_unused=True
+            )
+            idx = 0
+            if viewmatrix.requires_grad:
+                grad_viewmatrix = grads_out[idx]; idx += 1
+            if projmatrix.requires_grad:
+                grad_projmatrix = grads_out[idx]; idx += 1
+
+        return grad_rendered_image, grad_viewmatrix, grad_projmatrix, None, None
+
 
 class GaussianRasterizationSettings(NamedTuple):
     image_height: int
-    image_width: int 
+    image_width: int
     tanfovx : float
     tanfovy : float
     bg : torch.Tensor

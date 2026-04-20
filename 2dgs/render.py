@@ -72,6 +72,9 @@ if __name__ == "__main__":
     if not args.skip_train:
         print("export training images ...")
         os.makedirs(train_dir, exist_ok=True)
+        for cam in scene.getTrainCameras():
+            if hasattr(cam, "update"):
+                cam.update()
         gaussExtractor.reconstruction(scene.getTrainCameras())
         gaussExtractor.export_image(train_dir)
         
@@ -79,6 +82,9 @@ if __name__ == "__main__":
     if (not args.skip_test) and (len(scene.getTestCameras()) > 0):
         print("export rendered testing images ...")
         os.makedirs(test_dir, exist_ok=True)
+        for cam in scene.getTestCameras():
+            if hasattr(cam, "update"):
+                cam.update()
         gaussExtractor.reconstruction(scene.getTestCameras())
         gaussExtractor.export_image(test_dir)
     

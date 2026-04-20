@@ -153,12 +153,12 @@ __device__ float3 computeCov2D(const float3& mean, float focal_x, float focal_y,
 	// Transposes used to account for row-/column-major conventions.
 	float3 t = transformPoint4x3(mean, viewmatrix);
 
-	//const float limx = 1.3f * tan_fovx;
-	//const float limy = 1.3f * tan_fovy;
-	//const float txtz = t.x / t.z;
-	//const float tytz = t.y / t.z;
-	//t.x = min(limx, max(-limx, txtz)) * t.z;
-	//t.y = min(limy, max(-limy, tytz)) * t.z;
+	const float limx = 1.3f * tan_fovx;
+	const float limy = 1.3f * tan_fovy;
+	const float txtz = t.x / t.z;
+	const float tytz = t.y / t.z;
+	t.x = min(limx, max(-limx, txtz)) * t.z;
+	t.y = min(limy, max(-limy, tytz)) * t.z;
 
 	glm::mat3 J = glm::mat3(
 		focal_x / t.z, 0.0f, -(focal_x * t.x) / (t.z * t.z),
@@ -403,8 +403,8 @@ __global__ void preprocessCUDA(int P, int D, int M,
 	// of screen-space tiles that this Gaussian overlaps with. Quit if
 	// rectangle covers 0 tiles. 
 	float mid = 0.5f * (cov.x + cov.z);
-	float lambda1 = mid + sqrt(max(0.1f, mid * mid - det));
-	float lambda2 = mid - sqrt(max(0.1f, mid * mid - det));
+	float lambda1 = mid + sqrt(max(0.01f, mid * mid - det));
+	float lambda2 = mid - sqrt(max(0.01f, mid * mid - det));
 	float my_radius = 3.f * sqrt(max(lambda1, lambda2));
 	float my_radius_ceil = ceil(my_radius);
 	float2 point_image = { ndc2Pix(p_proj.x, W), ndc2Pix(p_proj.y, H) };

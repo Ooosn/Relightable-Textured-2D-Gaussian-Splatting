@@ -213,7 +213,7 @@ int CudaRasterizer::Rasterizer::forward(
 	const float* viewmatrix,
 	const float* projmatrix,
 	const float* cam_pos,
-	const bool enable_texture,
+	const bool use_textures,
 	const float* texture_color,
 	const float* texture_alpha,
 	const int texture_resolution,
@@ -245,7 +245,7 @@ int CudaRasterizer::Rasterizer::forward(
 	char* img_chunkptr = imageBuffer(img_chunk_size);
 	ImageState imgState = ImageState::fromChunk(img_chunkptr, width * height);
 
-	if (NUM_CHANNELS != 3 && colors_precomp == nullptr)
+	if (NUM_CHANNELS != 3 && colors_precomp == nullptr && !use_textures)
 	{
 		throw std::runtime_error("For non-RGB, provide precomputed Gaussian colors!");
 	}
@@ -262,6 +262,7 @@ int CudaRasterizer::Rasterizer::forward(
 		geomState.clamped,
 		transMat_precomp,
 		colors_precomp,
+		use_textures,
 		viewmatrix, projmatrix,
 		(glm::vec3*)cam_pos,
 		width, height,
@@ -337,10 +338,10 @@ int CudaRasterizer::Rasterizer::forward(
 		transMat_ptr,
 		geomState.depths,
 		geomState.normal_opacity,
-		enable_texture,
-		enable_texture ? texture_color : nullptr,
-		(enable_texture && texture_alpha != nullptr) ? texture_alpha : nullptr,
-		enable_texture ? texture_resolution : 0,
+		use_textures,
+		use_textures ? texture_color : nullptr,
+		(use_textures && texture_alpha != nullptr) ? texture_alpha : nullptr,
+		use_textures ? texture_resolution : 0,
 		texture_sigma_factor,
 		imgState.accum_alpha,
 		imgState.n_contrib,
@@ -367,7 +368,7 @@ void CudaRasterizer::Rasterizer::backward(
 	const float* viewmatrix,
 	const float* projmatrix,
 	const float* campos,
-	const bool enable_texture,
+	const bool use_textures,
 	const float* texture_color,
 	const float* texture_alpha,
 	const int texture_resolution,
@@ -428,10 +429,10 @@ void CudaRasterizer::Rasterizer::backward(
 		depth_ptr,
 		imgState.accum_alpha,
 		imgState.n_contrib,
-		enable_texture,
-		enable_texture ? texture_color : nullptr,
-		(enable_texture && texture_alpha != nullptr) ? texture_alpha : nullptr,
-		enable_texture ? texture_resolution : 0,
+		use_textures,
+		use_textures ? texture_color : nullptr,
+		(use_textures && texture_alpha != nullptr) ? texture_alpha : nullptr,
+		use_textures ? texture_resolution : 0,
 		texture_sigma_factor,
 		dL_dpix,
 		dL_depths,

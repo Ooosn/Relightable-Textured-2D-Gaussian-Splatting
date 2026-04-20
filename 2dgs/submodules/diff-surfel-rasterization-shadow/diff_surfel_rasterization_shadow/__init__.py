@@ -26,6 +26,7 @@ class GaussianRasterizationSettings(NamedTuple):
     debug: bool
     low_pass_filter_radius: float = 0.3
     ortho: bool = False
+    use_textures: bool = False
 
 
 def rasterize_gaussians(

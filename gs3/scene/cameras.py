@@ -12,7 +12,7 @@
 import torch
 from torch import nn
 import numpy as np
-from utils.graphics_utils import getWorld2View2, getWorld2View2_cu, getProjectionMatrix
+from utils.graphics_utils import getWorld2View2, getWorld2View2_cu, getProjectionMatrixWithPrincipalPoint
 from utils.lie_groups import exp_map_SO3xR3, exp_map_SE3
 
 class Camera(nn.Module):
@@ -85,7 +85,18 @@ class Camera(nn.Module):
         # self.cx = self.image_width / 2.0
         # self.cy = self.image_height / 2.0
         self.world_view_transform = torch.tensor(getWorld2View2(R, T, trans, scale)).transpose(0, 1).cuda()
-        self.projection_matrix = getProjectionMatrix(znear=self.znear, zfar=self.zfar, fovX=self.FoVx, fovY=self.FoVy).transpose(0,1).cuda()
+        fx = self.image_width / (2.0 * np.tan(self.FoVx / 2.0))
+        fy = self.image_height / (2.0 * np.tan(self.FoVy / 2.0))
+        self.projection_matrix = getProjectionMatrixWithPrincipalPoint(
+            znear=self.znear,
+            zfar=self.zfar,
+            fx=fx,
+            fy=fy,
+            cx=self.cx,
+            cy=self.cy,
+            width=self.image_width,
+            height=self.image_height,
+        ).transpose(0, 1).cuda()
         self.full_proj_transform = (self.world_view_transform.unsqueeze(0).bmm(self.projection_matrix.unsqueeze(0))).squeeze(0)
         self.camera_center = self.world_view_transform.inverse()[3, :3]
     

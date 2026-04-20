@@ -16,7 +16,9 @@ from utils.loss_utils import l1_loss, ssim
 from gaussian_renderer import render, network_gui
 import sys
 from scene import Scene, GaussianModel
+from scene.cameras import _getWorld2View2_cu
 from utils.general_utils import safe_state
+from utils.lie_groups import exp_map_SO3xR3
 import uuid
 from tqdm import tqdm
 from utils.image_utils import psnr, render_net_image
@@ -27,6 +29,85 @@ try:
     TENSORBOARD_FOUND = True
 except ImportError:
     TENSORBOARD_FOUND = False
+
+
+def _camera_projection_bridge(viewpoint_cam, means3D, viewspace_point_tensor, transmat_grad_holder=None, splat2world=None):
+    """Bridge dL/d(pixel mean2D) back into cam_pose_adj through full_proj_transform.
+
+    The surfel rasterizer treats view/proj matrices as constants inside CUDA, so
+    pose optimization otherwise only receives the regularization term. We rebuild
+    a lightweight differentiable projection here and inject the already-computed
+    dL/dmean2D from the rasterizer back into the camera parameters.
+    """
+    if viewspace_point_tensor is None or viewspace_point_tensor.grad is None:
+        return False
+    if not getattr(viewpoint_cam.cam_pose_adj, "requires_grad", False):
+        return False
+
+    dL_dmean2D = viewspace_point_tensor.grad.detach()
+    if dL_dmean2D.ndim == 3:
+        dL_dmean2D = dL_dmean2D.squeeze(0)
+    if dL_dmean2D.shape[-1] < 2:
+        return False
+    dL_dmean2D = dL_dmean2D[:, :2]
+    if not torch.isfinite(dL_dmean2D).all():
+        return False
+    if float(dL_dmean2D.abs().max().item()) < 1e-12:
+        return False
+
+    adj = exp_map_SO3xR3(viewpoint_cam.cam_pose_adj)
+    dR = adj[0, :3, :3]
+    dt = adj[0, :3, 3]
+    R = viewpoint_cam.R_cu.matmul(dR.T)
+    T = dt + dR.matmul(viewpoint_cam.T_cu)
+    world_view_transform = _getWorld2View2_cu(
+        R, T, viewpoint_cam.trans_cu, viewpoint_cam.scale_cu
+    ).transpose(0, 1)
+    full_proj_transform = (
+        world_view_transform.unsqueeze(0).bmm(viewpoint_cam.projection_matrix.unsqueeze(0))
+    ).squeeze(0)
+
+    means_h = torch.cat([means3D.detach(), torch.ones_like(means3D[:, :1])], dim=-1)
+    clip = means_h @ full_proj_transform
+    w = clip[:, 3:4].clamp_min(1e-7)
+    ndc_xy = clip[:, :2] / w
+
+    pixel_xy = torch.empty_like(ndc_xy)
+    pixel_xy[:, 0] = ((ndc_xy[:, 0] + 1.0) * viewpoint_cam.image_width - 1.0) * 0.5
+    pixel_xy[:, 1] = ((ndc_xy[:, 1] + 1.0) * viewpoint_cam.image_height - 1.0) * 0.5
+
+    proxy = (pixel_xy * dL_dmean2D).sum()
+
+    if transmat_grad_holder is not None and transmat_grad_holder.grad is not None and splat2world is not None:
+        dL_dtransMat = transmat_grad_holder.grad.detach()
+        if dL_dtransMat.ndim == 3:
+            dL_dtransMat = dL_dtransMat.reshape(dL_dtransMat.shape[0], -1)
+        if (
+            dL_dtransMat.shape[-1] == 9
+            and torch.isfinite(dL_dtransMat).all()
+            and float(dL_dtransMat.abs().max().item()) >= 1e-12
+        ):
+            W, H = viewpoint_cam.image_width, viewpoint_cam.image_height
+            near, far = viewpoint_cam.znear, viewpoint_cam.zfar
+            ndc2pix = torch.tensor(
+                [
+                    [W / 2, 0, 0, (W - 1) / 2],
+                    [0, H / 2, 0, (H - 1) / 2],
+                    [0, 0, far - near, near],
+                    [0, 0, 0, 1],
+                ],
+                dtype=full_proj_transform.dtype,
+                device=full_proj_transform.device,
+            ).T
+            trans_proxy = (
+                splat2world[:, [0, 1, 3]] @ (full_proj_transform @ ndc2pix)[:, [0, 1, 3]]
+            ).permute(0, 2, 1).reshape(-1, 9)
+            proxy = proxy + (trans_proxy * dL_dtransMat).sum()
+
+    if not torch.isfinite(proxy):
+        return False
+    proxy.backward()
+    return True
 
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint):
     first_iter = 0
@@ -48,7 +129,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     scene = Scene(dataset, gaussians, opt=opt)
     gaussians.training_setup(opt)
     if checkpoint:
-        (model_params, first_iter) = torch.load(checkpoint)
+        (model_params, first_iter) = torch.load(checkpoint, weights_only=False)
         gaussians.restore(model_params, opt)
 
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
@@ -58,6 +139,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     iter_end = torch.cuda.Event(enable_timing = True)
 
     viewpoint_stack = None
+    opt_test = False
+    opt_test_ready = False
     ema_loss_for_log = 0.0
     ema_dist_for_log = 0.0
     ema_normal_for_log = 0.0
@@ -85,7 +168,12 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         iter_start.record()
 
-        gaussians.update_learning_rate(iteration)
+        gaussians.update_learning_rate(
+            iteration,
+            asg_freeze_step=getattr(opt, "asg_lr_freeze_step", 0),
+            local_q_freeze_step=getattr(opt, "local_q_lr_freeze_step", 0),
+            freeze_phasefunc_steps=getattr(opt, "freeze_phasefunc_steps", 0),
+        )
 
         # ── Camera / light pose optimization ──────────────────────────────────
         scene.update_lr(iteration, opt)
@@ -138,13 +226,23 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             fix_lambert  = False
             apply_shadow = True
 
-        # Every 1000 its we increase the levels of SH up to a maximum degree
-        if iteration % 1000 == 0:
+        # Match gs3: SH degree growth is only meaningful for the non-mBRDF path.
+        if iteration % 1000 == 0 and not use_mbrdf:
             gaussians.oneupSHdegree()
 
-        # Pick a random Camera
+        # Pick a random Camera. When pose/light optimization is active, mirror gs3:
+        # alternate between train cameras and test cameras so test poses/lights are
+        # also optimized instead of being left as dead optimizer params.
         if not viewpoint_stack:
-            viewpoint_stack = scene.getTrainCameras().copy()
+            if scene.pose_optimizer is not None and opt_test_ready:
+                opt_test = True
+                viewpoint_stack = scene.getTestCameras().copy()
+                opt_test_ready = False
+            else:
+                opt_test = False
+                viewpoint_stack = scene.getTrainCameras().copy()
+                if scene.pose_optimizer is not None:
+                    opt_test_ready = True
         viewpoint_cam = viewpoint_stack.pop(randint(0, len(viewpoint_stack)-1))
 
         # Apply learned pose / light adjustment before rendering
@@ -152,37 +250,50 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             viewpoint_cam.update()
 
         render_pkg = render(viewpoint_cam, gaussians, pipe, background,
-                            fix_lambert=fix_lambert, apply_shadow=apply_shadow)
+                            fix_lambert=fix_lambert, apply_shadow=apply_shadow,
+                            deferred=True)
         image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
+        transmat_grad_holder = render_pkg.get("transmat_grad_holder")
         
         gt_image = viewpoint_cam.original_image.cuda()
+        if getattr(dataset, "use_mbrdf", False):
+            # Match the working gs3 relighting loss path: supervise the final
+            # image in display space and do not add 2DGS-specific normal/dist
+            # regularizers on top of the BRDF training objective.
+            image = torch.clamp(image, 0.0, 1.0)
+            normal_loss = torch.zeros([], dtype=image.dtype, device=image.device)
+            dist_loss = torch.zeros([], dtype=image.dtype, device=image.device)
+        else:
+            # Vanilla 2DGS path keeps the original geometric regularizers.
+            lambda_normal = opt.lambda_normal if iteration > 7000 else 0.0
+            lambda_dist = opt.lambda_dist if iteration > 3000 else 0.0
+
+            rend_dist = render_pkg["rend_dist"]
+            rend_normal  = render_pkg['rend_normal']
+            surf_normal = render_pkg['surf_normal']
+            normal_error = (1 - (rend_normal * surf_normal).sum(dim=0))[None]
+            normal_loss = lambda_normal * (normal_error).mean()
+            dist_loss = lambda_dist * (rend_dist).mean()
+
         Ll1 = l1_loss(image, gt_image)
         loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image))
-        
-        # regularization
-        lambda_normal = opt.lambda_normal if iteration > 7000 else 0.0
-        lambda_dist = opt.lambda_dist if iteration > 3000 else 0.0
 
-        rend_dist = render_pkg["rend_dist"]
-        rend_normal  = render_pkg['rend_normal']
-        surf_normal = render_pkg['surf_normal']
-        normal_error = (1 - (rend_normal * surf_normal).sum(dim=0))[None]
-        normal_loss = lambda_normal * (normal_error).mean()
-        dist_loss = lambda_dist * (rend_dist).mean()
-
-        # Camera / light pose regularization
-        if scene.pose_optimizer is not None:
-            pose_reg = viewpoint_cam.get_loss()
-            total_loss = loss + dist_loss + normal_loss + pose_reg
-        else:
-            total_loss = loss + dist_loss + normal_loss
+        total_loss = loss + dist_loss + normal_loss
 
         total_loss.backward()
 
         # Step pose optimizer (camera + light)
         if scene.pose_optimizer is not None:
+            _camera_projection_bridge(
+                viewpoint_cam,
+                gaussians.get_xyz,
+                viewspace_point_tensor,
+                transmat_grad_holder=transmat_grad_holder,
+                splat2world=gaussians.get_covariance(1.0),
+            )
             scene.pose_optimizer.step()
             scene.pose_optimizer.zero_grad(set_to_none=True)
+            viewpoint_cam.update()
 
         iter_end.record()
 
@@ -217,21 +328,25 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 scene.save(iteration)
 
 
-            # Densification
-            if iteration < opt.densify_until_iter:
-                gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
-                gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
+            # Only train/test pose-light optimization should run on test cameras.
+            if not opt_test:
+                # Densification
+                if iteration < opt.densify_until_iter:
+                    gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
+                    gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
 
-                if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
-                    size_threshold = 20 if iteration > opt.opacity_reset_interval else None
-                    gaussians.densify_and_prune(opt.densify_grad_threshold, opt.opacity_cull, scene.cameras_extent, size_threshold)
-                
-                if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
-                    gaussians.reset_opacity()
+                    if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
+                        size_threshold = 20 if iteration > opt.opacity_reset_interval else None
+                        gaussians.densify_and_prune(opt.densify_grad_threshold, opt.opacity_cull, scene.cameras_extent, size_threshold)
+                    
+                    if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
+                        gaussians.reset_opacity()
 
-            # Optimizer step
-            if iteration < opt.iterations:
-                gaussians.optimizer.step()
+                # Optimizer step
+                if iteration < opt.iterations:
+                    gaussians.optimizer.step()
+                    gaussians.optimizer.zero_grad(set_to_none = True)
+            else:
                 gaussians.optimizer.zero_grad(set_to_none = True)
 
             if (iteration in checkpoint_iterations):
@@ -303,6 +418,8 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
                 l1_test = 0.0
                 psnr_test = 0.0
                 for idx, viewpoint in enumerate(config['cameras']):
+                    if hasattr(viewpoint, "update"):
+                        viewpoint.update()
                     render_pkg = renderFunc(viewpoint, scene.gaussians, *renderArgs)
                     image = torch.clamp(render_pkg["render"], 0.0, 1.0).to("cuda")
                     gt_image = torch.clamp(viewpoint.original_image.to("cuda"), 0.0, 1.0)

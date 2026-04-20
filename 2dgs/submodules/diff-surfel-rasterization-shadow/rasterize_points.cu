@@ -216,7 +216,7 @@ RasterizeGaussiansCUDA(
 		viewmatrix.contiguous().data<float>(), 
 		projmatrix.contiguous().data<float>(),
 		campos.contiguous().data<float>(),
-		texture_alpha.contiguous().data_ptr<float>(),
+		texture_alpha.numel() == 0 ? nullptr : texture_alpha.contiguous().data_ptr<float>(),
 		static_cast<int>(texture_alpha.numel() == 0 ? 0 : texture_alpha.size(2)),
 		texture_sigma_factor,
 		tan_fovx,

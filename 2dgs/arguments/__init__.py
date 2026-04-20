@@ -87,7 +87,7 @@ class PipelineParams(ParamGroup):
         # True  -> 2DGS + texture sampling
         # False -> 2DGS behavior (no texture sampling), still using texture rasterizer module
         self.enable_texture = True
-        self.shadow_offset = 0.15
+        self.shadow_offset = 0.015
         self.shadow_light_scale = 10.0
         self.shadow_resolution_scale = 1.0
         super().__init__(parser, "Pipeline Parameters")
@@ -118,31 +118,37 @@ class OptimizationParams(ParamGroup):
         self.neural_phasefunc_lr_final = 0.00001
         self.neural_phasefunc_lr_delay_mult = 0.01
         self.neural_phasefunc_lr_max_steps = 50_000
-        # Camera & light pose optimization (mirroring gs3)
-        self.opt_cam_lr_init = 1e-4
-        self.opt_cam_lr_final = 1e-6
-        self.opt_cam_lr_delay_step = 0
-        self.opt_cam_lr_delay_mult = 1.0
-        self.opt_cam_lr_max_steps = 30_000
+        # Camera & light pose optimization (match gs3)
+        self.opt_cam_lr_init = 0.001
+        self.opt_cam_lr_final = 0.00001
+        self.opt_cam_lr_delay_step = 20_000
+        self.opt_cam_lr_delay_mult = 0.2
+        self.opt_cam_lr_max_steps = 80_000
         self.train_cam_freeze_step = 5_000
 
         self.opt_pl_lr_init = 1e-3
-        self.opt_pl_lr_final = 1e-5
-        self.opt_pl_lr_delay_step = 0
-        self.opt_pl_lr_delay_mult = 1.0
-        self.opt_pl_lr_max_steps = 30_000
+        self.opt_pl_lr_final = 0.00005
+        self.opt_pl_lr_delay_step = 30_000
+        self.opt_pl_lr_delay_mult = 0.1
+        self.opt_pl_lr_max_steps = 80_000
         self.train_pl_freeze_step = 15_000
 
         self.percent_dense = 0.01
         self.lambda_dssim = 0.2
         self.lambda_dist = 0.0
         self.lambda_normal = 0.05
-        self.opacity_cull = 0.05
+        # Match gs3's pruning floor. 0.05 was culling surfels far too
+        # aggressively once pose/light optimization started to perturb
+        # opacities, which starved late-stage regrowth.
+        self.opacity_cull = 0.005
 
         self.densification_interval = 100
         self.opacity_reset_interval = 3000
         self.densify_from_iter = 500
-        self.densify_until_iter = 15_000
+        # Match gs3's late-stage densification horizon. Stopping at 15k left
+        # 2dgs in a prune-only regime for the rest of training, which explains
+        # the 30k/100k point collapse we kept observing.
+        self.densify_until_iter = 100_000
         self.densify_grad_threshold = 0.0002
 
         # Multi-phase training schedule (mirrors gs3)
@@ -150,6 +156,9 @@ class OptimizationParams(ParamGroup):
         self.spcular_freeze_step = 9000
         self.fit_linear_step = 7000
         self.asg_freeze_step = 22000
+        self.asg_lr_freeze_step = 40_000
+        self.local_q_lr_freeze_step = 40_000
+        self.freeze_phasefunc_steps = 50_000
         super().__init__(parser, "Optimization Parameters")
 
 def get_combined_args(parser : ArgumentParser):

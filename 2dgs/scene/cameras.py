@@ -12,7 +12,7 @@
 import torch
 from torch import nn
 import numpy as np
-from utils.graphics_utils import getWorld2View2, getProjectionMatrix
+from utils.graphics_utils import getWorld2View2, getProjectionMatrixWithPrincipalPoint
 from utils.lie_groups import exp_map_SO3xR3
 
 
@@ -29,7 +29,7 @@ def _getWorld2View2_cu(R, t, translate, scale):
 
 
 class Camera(nn.Module):
-    def __init__(self, colmap_id, R, T, FoVx, FoVy, image, gt_alpha_mask,
+    def __init__(self, colmap_id, R, T, FoVx, FoVy, cx, cy, image, gt_alpha_mask,
                  image_name, uid, pl_pos=None, pl_intensity=None,
                  image_path=None,
                  trans=np.array([0.0, 0.0, 0.0]), scale=1.0, data_device = "cuda"
@@ -88,8 +88,14 @@ class Camera(nn.Module):
             self.pl_pos_init = None
             self.pl_pos      = None
 
-        self.projection_matrix = getProjectionMatrix(
-            znear=self.znear, zfar=self.zfar, fovX=self.FoVx, fovY=self.FoVy
+        self.cx = cx if cx is not None else self.image_width / 2.0
+        self.cy = cy if cy is not None else self.image_height / 2.0
+        fx = self.image_width / (2.0 * np.tan(self.FoVx / 2.0))
+        fy = self.image_height / (2.0 * np.tan(self.FoVy / 2.0))
+        self.projection_matrix = getProjectionMatrixWithPrincipalPoint(
+            znear=self.znear, zfar=self.zfar, fx=fx, fy=fy,
+            cx=self.cx, cy=self.cy,
+            width=self.image_width, height=self.image_height,
         ).transpose(0, 1).cuda()
 
         # Initialise view transform (no adj yet)
@@ -119,6 +125,20 @@ class Camera(nn.Module):
 
         if self.pl_pos_init is not None:
             self.pl_pos = self.pl_pos_init + self.pl_adj
+
+    def get(self):
+        """Return current optimized pose/light in numpy form for checkpoint export."""
+        adj = exp_map_SO3xR3(self.cam_pose_adj)
+        dR = adj[0, :3, :3]
+        dt = adj[0, :3, 3]
+        R = self.R_cu.matmul(dR.T)
+        T = dt + dR.matmul(self.T_cu)
+        pl_pos = None if self.pl_pos_init is None else (self.pl_pos_init + self.pl_adj)
+        return (
+            R.detach().cpu().numpy(),
+            T.detach().cpu().numpy(),
+            None if pl_pos is None else pl_pos.detach().cpu().numpy(),
+        )
 
     def get_loss(self):
         """L2 regularization on pose and light adjustments."""

@@ -11,6 +11,7 @@
 
 #include "backward.h"
 #include "auxiliary.h"
+#include "stream.h"
 #include <cooperative_groups.h>
 #include <cooperative_groups/reduce.h>
 namespace cg = cooperative_groups;
@@ -165,15 +166,15 @@ __global__ void computeCov2DCUDA(int P,
 	float3 dL_dconic = { dL_dconics[4 * idx], dL_dconics[4 * idx + 1], dL_dconics[4 * idx + 3] };
 	float3 t = transformPoint4x3(mean, view_matrix);
 	
-	//const float limx = 1.3f * tan_fovx;
-	//const float limy = 1.3f * tan_fovy;
-	//const float txtz = t.x / t.z;
-	//const float tytz = t.y / t.z;
-	//t.x = min(limx, max(-limx, txtz)) * t.z;
-	//t.y = min(limy, max(-limy, tytz)) * t.z;
+	const float limx = 1.3f * tan_fovx;
+	const float limy = 1.3f * tan_fovy;
+	const float txtz = t.x / t.z;
+	const float tytz = t.y / t.z;
+	t.x = min(limx, max(-limx, txtz)) * t.z;
+	t.y = min(limy, max(-limy, tytz)) * t.z;
 	
-	//const float x_grad_mul = txtz < -limx || txtz > limx ? 0 : 1;
-	//const float y_grad_mul = tytz < -limy || tytz > limy ? 0 : 1;
+	const float x_grad_mul = txtz < -limx || txtz > limx ? 0.f : 1.f;
+	const float y_grad_mul = tytz < -limy || tytz > limy ? 0.f : 1.f;
 
 	glm::mat3 J = glm::mat3(h_x / t.z, 0.0f, -(h_x * t.x) / (t.z * t.z),
 		0.0f, h_y / t.z, -(h_y * t.y) / (t.z * t.z),
@@ -259,10 +260,8 @@ __global__ void computeCov2DCUDA(int P,
 	float tz3 = tz2 * tz;
 
 	// Gradients of loss w.r.t. transformed Gaussian mean t
-	//float dL_dtx = x_grad_mul * -h_x * tz2 * dL_dJ02;
-	//float dL_dty = y_grad_mul * -h_y * tz2 * dL_dJ12;
-	float dL_dtx = -h_x * tz2 * dL_dJ02;
-	float dL_dty = -h_y * tz2 * dL_dJ12;
+	float dL_dtx = x_grad_mul * -h_x * tz2 * dL_dJ02;
+	float dL_dty = y_grad_mul * -h_y * tz2 * dL_dJ12;
 	float dL_dtz = -h_x * tz2 * dL_dJ00 - h_y * tz2 * dL_dJ11 + (2 * h_x * t.x) * tz3 * dL_dJ02 + (2 * h_y * t.y) * tz3 * dL_dJ12;
 
 	// Account for transformation of mean to t
@@ -498,7 +497,8 @@ renderCUDA(
 				continue;
 
 			const float G = exp(power);
-			const float alpha = min(0.999f, con_o.w * G);
+			const float raw_alpha = con_o.w * G;
+			const float alpha = min(0.999f, raw_alpha);
 			if (alpha < 1.0f / 255.0f)
 				continue;
 
@@ -536,24 +536,27 @@ renderCUDA(
 			dL_dalpha += (-T_final / (1.f - alpha)) * bg_dot_dpixel;
 
 
-			// Helpful reusable temporary variables
-			const float dL_dG = con_o.w * dL_dalpha;
-			const float gdx = G * d.x;
-			const float gdy = G * d.y;
-			const float dG_ddelx = -gdx * con_o.x - gdy * con_o.y;
-			const float dG_ddely = -gdy * con_o.z - gdx * con_o.y;
+			if (raw_alpha <= 0.999f)
+			{
+				// Helpful reusable temporary variables
+				const float dL_dG = con_o.w * dL_dalpha;
+				const float gdx = G * d.x;
+				const float gdy = G * d.y;
+				const float dG_ddelx = -gdx * con_o.x - gdy * con_o.y;
+				const float dG_ddely = -gdy * con_o.z - gdx * con_o.y;
 
-			// Update gradients w.r.t. 2D mean position of the Gaussian
-			atomicAdd(&dL_dmean2D[global_id].x, dL_dG * dG_ddelx * ddelx_dx);
-			atomicAdd(&dL_dmean2D[global_id].y, dL_dG * dG_ddely * ddely_dy);
+				// Update gradients w.r.t. 2D mean position of the Gaussian
+				atomicAdd(&dL_dmean2D[global_id].x, dL_dG * dG_ddelx * ddelx_dx);
+				atomicAdd(&dL_dmean2D[global_id].y, dL_dG * dG_ddely * ddely_dy);
 
-			// Update gradients w.r.t. 2D covariance (2x2 matrix, symmetric)
-			atomicAdd(&dL_dconic2D[global_id].x, -0.5f * gdx * d.x * dL_dG);
-			atomicAdd(&dL_dconic2D[global_id].y, -0.5f * gdx * d.y * dL_dG);
-			atomicAdd(&dL_dconic2D[global_id].w, -0.5f * gdy * d.y * dL_dG);
+				// Update gradients w.r.t. 2D covariance (2x2 matrix, symmetric)
+				atomicAdd(&dL_dconic2D[global_id].x, -0.5f * gdx * d.x * dL_dG);
+				atomicAdd(&dL_dconic2D[global_id].y, -0.5f * gdx * d.y * dL_dG);
+				atomicAdd(&dL_dconic2D[global_id].w, -0.5f * gdy * d.y * dL_dG);
 
-			// Update gradients w.r.t. opacity of the Gaussian
-			atomicAdd(&(dL_dopacity[global_id]), G * dL_dalpha);
+				// Update gradients w.r.t. opacity of the Gaussian
+				atomicAdd(&(dL_dopacity[global_id]), G * dL_dalpha);
+			}
 		}
 	}
 }
@@ -603,7 +606,7 @@ void BACKWARD::preprocess(
 	// Propagate gradients for remaining steps: finish 3D mean gradients,
 	// propagate color gradients to SH (if desireD), propagate 3D covariance
 	// matrix gradients to scale and rotation.
-	preprocessCUDA<NUM_CHANNELS> << < (P + 255) / 256, 256 >> > (
+	preprocessCUDA<NUM_CHANNELS> << < (P + 255) / 256, 256, 0, MY_STREAM >> > (
 		P, D, M,
 		(float3*)means3D,
 		radii,
@@ -640,7 +643,7 @@ void BACKWARD::render(
 	float* dL_dopacity,
 	float* dL_dcolors)
 {
-	renderCUDA<NUM_CHANNELS> << <grid, block >> >(
+	renderCUDA<NUM_CHANNELS> << <grid, block, 0, MY_STREAM>> >(
 		ranges,
 		point_list,
 		W, H,

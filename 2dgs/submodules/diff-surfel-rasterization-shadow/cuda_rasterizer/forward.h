@@ -81,6 +81,7 @@ namespace FORWARD
 		const uint32_t* point_list,
 		int W, int H,
 		const float2* points_xy_image,
+		const float* features,
 		const float* transMats,
 		const float4* normal_opacity,
 		const float* texture_color,    // [N, C, R, R] or nullptr
