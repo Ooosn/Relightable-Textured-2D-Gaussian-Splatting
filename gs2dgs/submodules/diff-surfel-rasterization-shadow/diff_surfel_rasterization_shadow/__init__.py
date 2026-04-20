@@ -39,6 +39,7 @@ def rasterize_gaussians(
     rotations,
     cov3Ds_precomp,
     texture_alpha,
+    texture_dims,
     texture_sigma_factor,
     non_trans,
     offset,
@@ -65,6 +66,7 @@ def rasterize_gaussians(
         raster_settings.sh_degree,
         raster_settings.campos,
         texture_alpha,
+        texture_dims,
         texture_sigma_factor,
         raster_settings.prefiltered,
         raster_settings.debug,
@@ -91,7 +93,8 @@ def rasterize_gaussians(
     P = means3D.shape[0]
     # Reshape UV-indexed shadow buffers to [P, res, res] when texture was provided.
     tex_res = 0
-    if texture_alpha is not None and texture_alpha.numel() > 0:
+    has_dynamic_texture = texture_dims is not None and texture_dims.numel() > 0
+    if texture_alpha is not None and texture_alpha.numel() > 0 and not has_dynamic_texture:
         tex_res = int(texture_alpha.shape[2])
     if tex_res > 0:
         out_trans = out_trans.view(P, tex_res, tex_res)
@@ -196,6 +199,7 @@ class GaussianRasterizer(nn.Module):
         rotations=None,
         cov3Ds_precomp=None,
         texture_alpha=None,
+        texture_dims=None,
         texture_sigma_factor=3.0,
         non_trans=None,
         offset=0.015,
@@ -225,10 +229,15 @@ class GaussianRasterizer(nn.Module):
             cov3Ds_precomp = torch.empty(0, device=means3D.device, dtype=means3D.dtype)
         if texture_alpha is None:
             texture_alpha = torch.empty(0, device=means3D.device, dtype=means3D.dtype)
+        if texture_dims is None:
+            texture_dims = torch.empty(0, device=means3D.device, dtype=torch.int32)
         if non_trans is None:
             # Allocate per-UV-texel buffer when texture is provided; otherwise per-Gaussian.
-            tex_res = int(texture_alpha.shape[2]) if texture_alpha.numel() > 0 else 0
-            shadow_size = means3D.shape[0] * tex_res * tex_res if tex_res > 0 else means3D.shape[0]
+            if texture_dims.numel() > 0:
+                shadow_size = int(texture_alpha.numel())
+            else:
+                tex_res = int(texture_alpha.shape[2]) if texture_alpha.numel() > 0 else 0
+                shadow_size = means3D.shape[0] * tex_res * tex_res if tex_res > 0 else means3D.shape[0]
             non_trans = torch.zeros(shadow_size, device=means3D.device, dtype=means3D.dtype)
 
         return rasterize_gaussians(
@@ -241,6 +250,7 @@ class GaussianRasterizer(nn.Module):
             rotations,
             cov3Ds_precomp,
             texture_alpha,
+            texture_dims,
             texture_sigma_factor,
             non_trans,
             offset,

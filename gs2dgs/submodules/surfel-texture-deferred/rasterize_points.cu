@@ -54,10 +54,11 @@ RasterizeGaussiansCUDA(
 	const int image_width,
 	const torch::Tensor& sh,
 	const int degree,
-	const torch::Tensor& campos,
-	const torch::Tensor& texture_color,
-	const torch::Tensor& texture_alpha,
-	const float texture_sigma_factor,
+		const torch::Tensor& campos,
+		const torch::Tensor& texture_color,
+		const torch::Tensor& texture_alpha,
+		const torch::Tensor& texture_dims,
+		const float texture_sigma_factor,
 	const bool use_textures,
 	const bool prefiltered,
 	const bool debug)
@@ -88,9 +89,19 @@ RasterizeGaussiansCUDA(
   CHECK_INPUT(campos);
   if (use_textures) {
 	if (texture_color.numel() == 0) AT_ERROR("use_textures=True but texture_color is empty");
-	CHECK_INPUT(texture_color);
-	if (texture_alpha.numel() != 0) CHECK_INPUT(texture_alpha);
-  }
+		CHECK_INPUT(texture_color);
+		if (texture_alpha.numel() != 0) CHECK_INPUT(texture_alpha);
+		if (texture_dims.numel() != 0) {
+			CHECK_INPUT(texture_dims);
+			TORCH_CHECK(texture_dims.scalar_type() == torch::kInt32, "texture_dims must be int32");
+			TORCH_CHECK(texture_dims.dim() == 2 && texture_dims.size(1) == 3, "texture_dims must have shape [P, 3]");
+			TORCH_CHECK(texture_dims.size(0) == means3D.size(0), "texture_dims first dimension must match point count");
+			TORCH_CHECK(texture_color.dim() == 2, "dynamic texture_color must have shape [total_texels, C]");
+			if (texture_alpha.numel() != 0) {
+				TORCH_CHECK(texture_alpha.dim() == 2 && texture_alpha.size(1) == 1, "dynamic texture_alpha must have shape [total_texels, 1]");
+			}
+		}
+	  }
 
   auto int_opts = means3D.options().dtype(torch::kInt32);
   auto float_opts = means3D.options().dtype(torch::kFloat32);
@@ -136,10 +147,11 @@ RasterizeGaussiansCUDA(
 		projmatrix.contiguous().data<float>(),
 		campos.contiguous().data<float>(),
 		use_textures,
-		use_textures ? texture_color.contiguous().data_ptr<float>() : nullptr,
-		(use_textures && texture_alpha.numel() != 0) ? texture_alpha.contiguous().data_ptr<float>() : nullptr,
-		static_cast<int>(use_textures ? texture_color.size(2) : 0),
-		texture_sigma_factor,
+			use_textures ? texture_color.contiguous().data_ptr<float>() : nullptr,
+			(use_textures && texture_alpha.numel() != 0) ? texture_alpha.contiguous().data_ptr<float>() : nullptr,
+			(use_textures && texture_dims.numel() != 0) ? texture_dims.contiguous().data_ptr<int>() : nullptr,
+			static_cast<int>((use_textures && texture_color.dim() >= 3) ? texture_color.size(2) : 0),
+			texture_sigma_factor,
 		tan_fovx,
 		tan_fovy,
 		prefiltered,
@@ -169,10 +181,11 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
 	const torch::Tensor& dL_dout_others,
 	const torch::Tensor& sh,
 	const int degree,
-	const torch::Tensor& campos,
-	const torch::Tensor& texture_color,
-	const torch::Tensor& texture_alpha,
-	const float texture_sigma_factor,
+		const torch::Tensor& campos,
+		const torch::Tensor& texture_color,
+		const torch::Tensor& texture_alpha,
+		const torch::Tensor& texture_dims,
+		const float texture_sigma_factor,
 	const bool use_textures,
 	const torch::Tensor& geomBuffer,
 	const int R,
@@ -194,9 +207,19 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
   CHECK_INPUT(campos);
   if (use_textures) {
 	if (texture_color.numel() == 0) AT_ERROR("use_textures=True but texture_color is empty");
-	CHECK_INPUT(texture_color);
-	if (texture_alpha.numel() != 0) CHECK_INPUT(texture_alpha);
-  }
+		CHECK_INPUT(texture_color);
+		if (texture_alpha.numel() != 0) CHECK_INPUT(texture_alpha);
+		if (texture_dims.numel() != 0) {
+			CHECK_INPUT(texture_dims);
+			TORCH_CHECK(texture_dims.scalar_type() == torch::kInt32, "texture_dims must be int32");
+			TORCH_CHECK(texture_dims.dim() == 2 && texture_dims.size(1) == 3, "texture_dims must have shape [P, 3]");
+			TORCH_CHECK(texture_dims.size(0) == means3D.size(0), "texture_dims first dimension must match point count");
+			TORCH_CHECK(texture_color.dim() == 2, "dynamic texture_color must have shape [total_texels, C]");
+			if (texture_alpha.numel() != 0) {
+				TORCH_CHECK(texture_alpha.dim() == 2 && texture_alpha.size(1) == 1, "dynamic texture_alpha must have shape [total_texels, 1]");
+			}
+		}
+	  }
   CHECK_INPUT(binningBuffer);
   CHECK_INPUT(imageBuffer);
   CHECK_INPUT(geomBuffer);
@@ -239,10 +262,11 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
 	  projmatrix.contiguous().data<float>(),
 	  campos.contiguous().data<float>(),
 	  use_textures,
-	  use_textures ? texture_color.contiguous().data_ptr<float>() : nullptr,
-	  (use_textures && texture_alpha.numel() != 0) ? texture_alpha.contiguous().data_ptr<float>() : nullptr,
-	  static_cast<int>(use_textures ? texture_color.size(2) : 0),
-	  texture_sigma_factor,
+		  use_textures ? texture_color.contiguous().data_ptr<float>() : nullptr,
+		  (use_textures && texture_alpha.numel() != 0) ? texture_alpha.contiguous().data_ptr<float>() : nullptr,
+		  (use_textures && texture_dims.numel() != 0) ? texture_dims.contiguous().data_ptr<int>() : nullptr,
+		  static_cast<int>((use_textures && texture_color.dim() >= 3) ? texture_color.size(2) : 0),
+		  texture_sigma_factor,
 	  tan_fovx,
 	  tan_fovy,
 	  radii.contiguous().data<int>(),

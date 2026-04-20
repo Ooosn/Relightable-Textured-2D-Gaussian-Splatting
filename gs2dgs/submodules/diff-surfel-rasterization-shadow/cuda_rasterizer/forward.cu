@@ -265,6 +265,7 @@ renderCUDA(
 	const float* __restrict__ transMats,
 	const float4* __restrict__ normal_opacity,
 	const float* __restrict__ texture_alpha,
+	const int* __restrict__ texture_dims,
 	int texture_resolution,
 	float texture_sigma_factor,
 	float* __restrict__ final_T,
@@ -390,10 +391,11 @@ renderCUDA(
 					compute_texture_uv(s_j, texture_sigma_factor, u_j, v_j, du_dsx_j, dv_dsy_j);
 					sample_texture_bilinear(
 						nullptr,
-						texture_alpha,
-						current_id,
-						texture_resolution,
-						u_j,
+							texture_alpha,
+							current_id,
+							texture_resolution,
+							texture_dims,
+							u_j,
 						v_j,
 						tex_dummy_rgb,
 						tex_a_j,
@@ -454,10 +456,11 @@ renderCUDA(
 							compute_texture_uv(s_o, texture_sigma_factor, u_o, v_o, du_dsx_o, dv_dsy_o);
 							sample_texture_bilinear(
 								nullptr,
-								texture_alpha,
-								offset_id,
-								texture_resolution,
-								u_o,
+									texture_alpha,
+									offset_id,
+									texture_resolution,
+									texture_dims,
+									u_o,
 								v_o,
 								tex_dummy_rgb_o,
 								tex_a_o,
@@ -504,16 +507,22 @@ renderCUDA(
 					{
 						contributor++;
 						float transition_trans = footprint_j * (T * (1.0f - (depth_diff / offset) + (depth_diff / offset) * temp));
-						if (texture_resolution > 0)
-						{
-							int ui = min(max((int)(u_j * texture_resolution), 0), texture_resolution - 1);
-							int vi = min(max((int)(v_j * texture_resolution), 0), texture_resolution - 1);
-							int sidx = texture_alpha_index(current_id, vi, ui, texture_resolution);
-							atomicAdd(&(out_trans[sidx]), transition_trans);
-							atomicAdd(&(non_trans[sidx]), footprint_j);
-						}
-						else
-						{
+							if (texture_resolution > 0 || texture_dims != nullptr)
+							{
+								int tex_h = 0;
+								int tex_w = 0;
+								int tex_offset = 0;
+								if (texture_layout(current_id, texture_resolution, texture_dims, tex_h, tex_w, tex_offset))
+								{
+									int ui = min(max((int)(u_j * tex_w), 0), tex_w - 1);
+									int vi = min(max((int)(v_j * tex_h), 0), tex_h - 1);
+									int sidx = texture_alpha_index(current_id, vi, ui, texture_resolution, texture_dims);
+									atomicAdd(&(out_trans[sidx]), transition_trans);
+									atomicAdd(&(non_trans[sidx]), footprint_j);
+								}
+							}
+							else
+							{
 							atomicAdd(&(out_trans[current_id]), transition_trans);
 							atomicAdd(&(non_trans[current_id]), footprint_j);
 						}
@@ -530,16 +539,22 @@ renderCUDA(
 			{
 				contributor++;
 				float transition_trans = footprint_j * (T * (1.0f - (depth_diff / offset) + (depth_diff / offset) * temp));
-				if (texture_resolution > 0)
-				{
-					int ui = min(max((int)(u_j * texture_resolution), 0), texture_resolution - 1);
-					int vi = min(max((int)(v_j * texture_resolution), 0), texture_resolution - 1);
-					int sidx = texture_alpha_index(current_id, vi, ui, texture_resolution);
-					atomicAdd(&(out_trans[sidx]), transition_trans);
-					atomicAdd(&(non_trans[sidx]), footprint_j);
-				}
-				else
-				{
+					if (texture_resolution > 0 || texture_dims != nullptr)
+					{
+						int tex_h = 0;
+						int tex_w = 0;
+						int tex_offset = 0;
+						if (texture_layout(current_id, texture_resolution, texture_dims, tex_h, tex_w, tex_offset))
+						{
+							int ui = min(max((int)(u_j * tex_w), 0), tex_w - 1);
+							int vi = min(max((int)(v_j * tex_h), 0), tex_h - 1);
+							int sidx = texture_alpha_index(current_id, vi, ui, texture_resolution, texture_dims);
+							atomicAdd(&(out_trans[sidx]), transition_trans);
+							atomicAdd(&(non_trans[sidx]), footprint_j);
+						}
+					}
+					else
+					{
 					atomicAdd(&(out_trans[current_id]), transition_trans);
 					atomicAdd(&(non_trans[current_id]), footprint_j);
 				}
@@ -706,6 +721,7 @@ void FORWARD::render(
 	const float* transMats,
 	const float4* normal_opacity,
 	const float* texture_alpha,
+	const int* texture_dims,
 	int texture_resolution,
 	float texture_sigma_factor,
 	float* final_T,
@@ -727,6 +743,7 @@ void FORWARD::render(
 		transMats,
 		normal_opacity,
 		texture_alpha,
+		texture_dims,
 		texture_resolution,
 		texture_sigma_factor,
 		final_T,

@@ -62,6 +62,7 @@ RasterizeGaussiansCUDA(
 	const int degree,
 	const torch::Tensor& campos,
 	const torch::Tensor& texture_alpha,
+	const torch::Tensor& texture_dims,
 	const float texture_sigma_factor,
 	const bool prefiltered,
 	const bool debug,

@@ -159,6 +159,7 @@ renderCUDA(
 	const bool use_textures,
 	const float* __restrict__ texture_color,
 	const float* __restrict__ texture_alpha,
+	const int* __restrict__ texture_dims,
 	int texture_resolution,
 	float texture_sigma_factor,
 	const float* __restrict__ dL_dpixels,
@@ -323,15 +324,16 @@ renderCUDA(
 			float du_dsx = 0.0f;
 			float dv_dsy = 0.0f;
 
-			if (use_textures && texture_color != nullptr && texture_resolution > 0)
-			{
-				compute_texture_uv(s, texture_sigma_factor, u, v, du_dsx, dv_dsy);
-				sample_texture_bilinear(
-					texture_color,
-					texture_alpha,
-					collected_id[j],
-					texture_resolution,
-					u,
+				if (use_textures && texture_color != nullptr && (texture_resolution > 0 || texture_dims != nullptr))
+				{
+					compute_texture_uv(s, texture_sigma_factor, u, v, du_dsx, dv_dsy);
+					sample_texture_bilinear(
+						texture_color,
+						texture_alpha,
+						collected_id[j],
+						texture_resolution,
+						texture_dims,
+						u,
 					v,
 					tex_rgb,
 					tex_a,
@@ -485,10 +487,11 @@ renderCUDA(
 			// Update gradients w.r.t. opacity of the Gaussian
 			if (!alpha_clamped)
 				atomicAdd(&(dL_dopacity[global_id]), tex_a * G * dL_dalpha);
-			accumulate_texture_bilinear_vjp(
-				global_id,
-				texture_resolution,
-				u,
+				accumulate_texture_bilinear_vjp(
+					global_id,
+					texture_resolution,
+					texture_dims,
+					u,
 				v,
 				dL_dtex_rgb,
 				dL_dsample_alpha,
@@ -764,6 +767,7 @@ void BACKWARD::render(
 	bool use_textures,
 	const float* texture_color,
 	const float* texture_alpha,
+	const int* texture_dims,
 	int texture_resolution,
 	float texture_sigma_factor,
 	const float* dL_dpixels,
@@ -789,10 +793,11 @@ void BACKWARD::render(
 		depths,
 		final_Ts,
 		n_contrib,
-		use_textures,
-		texture_color,
-		texture_alpha,
-		texture_resolution,
+			use_textures,
+			texture_color,
+			texture_alpha,
+			texture_dims,
+			texture_resolution,
 		texture_sigma_factor,
 		dL_dpixels,
 		dL_depths,

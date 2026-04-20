@@ -712,6 +712,8 @@ def training(modelset, opt, pipe, testing_iterations, saving_iterations, checkpo
                 splat2world=splat2world_2dgs,
             )
             _check_vram_limit(pipe)
+        if hasattr(gaussians, "accumulate_texture_rtg"):
+            gaussians.accumulate_texture_rtg()
         iter_end.record() # 记录迭代结束的时间
 
 
@@ -946,6 +948,12 @@ def training(modelset, opt, pipe, testing_iterations, saving_iterations, checkpo
                 # Optimizer step
                 if iteration < opt.iterations:  # 判断是否处于优化阶段
                     gaussians.optimizer.step()
+                    if hasattr(gaussians, "refine_textures_by_rtg"):
+                        num_rtg_refined = gaussians.refine_textures_by_rtg(iteration)
+                        if num_rtg_refined > 0:
+                            rtg_log = gaussians.texture_rtg_log_string() if hasattr(gaussians, "texture_rtg_log_string") else ""
+                            suffix = f" | {rtg_log}" if rtg_log else ""
+                            print(f"\n[ITER {iteration}] RTG refined {num_rtg_refined} texture charts{suffix}")
                     # opt the camera pose
                     if scene.optimizing:    # 判断是否开启相机优化
                         scene.optimizer.step()

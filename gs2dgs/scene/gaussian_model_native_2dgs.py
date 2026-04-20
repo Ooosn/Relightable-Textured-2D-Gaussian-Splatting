@@ -13,6 +13,7 @@ import os
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from plyfile import PlyData, PlyElement
 from simple_knn._C import distCUDA2
 from torch import nn
@@ -48,6 +49,9 @@ class GaussianModel:
         sh_degree: int,
         use_textures: bool = False,
         texture_resolution: int = 4,
+        texture_dynamic_resolution: bool = False,
+        texture_min_resolution: int = 4,
+        texture_max_resolution: int = 64,
         use_mbrdf: bool = False,
         basis_asg_num: int = 8,
         hidden_feature_size: int = 32,
@@ -62,6 +66,9 @@ class GaussianModel:
         self.max_sh_degree = sh_degree
         self.use_textures = use_textures
         self.texture_resolution = texture_resolution
+        self.texture_dynamic_resolution = texture_dynamic_resolution
+        self.texture_min_resolution = texture_min_resolution
+        self.texture_max_resolution = texture_max_resolution
         self.use_mbrdf = use_mbrdf
         self.basis_asg_num = basis_asg_num
         self.hidden_feature_size = hidden_feature_size
@@ -77,6 +84,8 @@ class GaussianModel:
         self._features_rest = torch.empty(0)
         self._tex_color = torch.empty(0)
         self._tex_alpha = torch.empty(0)
+        self._texture_dims = torch.empty(0, dtype=torch.int32)
+        self._rtg_score = torch.empty(0)
         self._scaling = torch.empty(0)
         self._rotation = torch.empty(0)
         self._opacity = torch.empty(0)
@@ -95,6 +104,15 @@ class GaussianModel:
         self.optimizer = None
         self.percent_dense = 0
         self.spatial_lr_scale = 0
+        self.texture_rtg_enabled = False
+        self.texture_rtg_refine_from_iter = 15_000
+        self.texture_rtg_refine_until_iter = 100_000
+        self.texture_rtg_refine_interval = 1_000
+        self.texture_rtg_refine_fraction = 0.02
+        self.texture_rtg_ema = 0.9
+        self.texture_rtg_alpha_weight = 1.0
+        self.texture_rtg_min_score = 0.0
+        self._last_rtg_refine_log = {}
         self.setup_functions()
 
     def capture(self):
@@ -131,6 +149,13 @@ class GaussianModel:
             self.neural_material,
             None if self.asg_func is None else self.asg_func.state_dict(),
             None if self.neural_phasefunc is None else self.neural_phasefunc.state_dict(),
+            {
+                "texture_dynamic_resolution": self.texture_dynamic_resolution,
+                "texture_min_resolution": self.texture_min_resolution,
+                "texture_max_resolution": self.texture_max_resolution,
+                "texture_dims": self._texture_dims,
+                "rtg_score": self._rtg_score,
+            },
         )
 
     def restore(self, model_args, training_args):
@@ -171,6 +196,7 @@ class GaussianModel:
                 self.texture_resolution,
             ) = model_args
         else:
+            extra_state = model_args[32] if len(model_args) > 32 and isinstance(model_args[32], dict) else {}
             (
                 self.active_sh_degree,
                 self._xyz,
@@ -204,7 +230,14 @@ class GaussianModel:
                 self.neural_material,
                 asg_state,
                 phase_state,
-            ) = model_args
+            ) = model_args[:32]
+            self.texture_dynamic_resolution = bool(extra_state.get("texture_dynamic_resolution", self.texture_dynamic_resolution))
+            self.texture_min_resolution = int(extra_state.get("texture_min_resolution", self.texture_min_resolution))
+            self.texture_max_resolution = int(extra_state.get("texture_max_resolution", self.texture_max_resolution))
+            texture_dims = extra_state.get("texture_dims", torch.empty(0))
+            self._texture_dims = texture_dims.to(device="cuda", dtype=torch.int32) if isinstance(texture_dims, torch.Tensor) else torch.empty(0, device="cuda", dtype=torch.int32)
+            rtg_score = extra_state.get("rtg_score", torch.empty(0))
+            self._rtg_score = rtg_score.to(device="cuda", dtype=torch.float32) if isinstance(rtg_score, torch.Tensor) else torch.empty(0, device="cuda")
             if self.use_mbrdf:
                 self._initialize_mbrdf_modules()
                 if asg_state is not None:
@@ -215,6 +248,8 @@ class GaussianModel:
         self.training_setup(training_args)
         if self.use_textures and self._tex_color.numel() == 0:
             self.initialize_texture_state()
+        if self.use_textures and self.has_dynamic_textures:
+            self._validate_dynamic_texture_layout(self._tex_color, self._tex_alpha, self._texture_dims)
         if self.use_mbrdf and not isinstance(self.kd, nn.Parameter):
             self.initialize_mbrdf_state()
         self.xyz_gradient_accum = xyz_gradient_accum
@@ -253,6 +288,22 @@ class GaussianModel:
         return torch.sigmoid(self._tex_alpha)
 
     @property
+    def get_texture_dims(self):
+        if not self.has_dynamic_textures:
+            device = self.get_xyz.device if self.get_xyz.numel() > 0 else "cuda"
+            return torch.empty(0, device=device, dtype=torch.int32)
+        return self._texture_dims
+
+    @property
+    def has_dynamic_textures(self):
+        return (
+            bool(self.use_textures)
+            and bool(self.texture_dynamic_resolution)
+            and isinstance(self._texture_dims, torch.Tensor)
+            and self._texture_dims.numel() > 0
+        )
+
+    @property
     def get_kd(self):
         return self.material_activation(self.kd)
 
@@ -278,6 +329,121 @@ class GaussianModel:
     def oneupSHdegree(self):
         if self.active_sh_degree < self.max_sh_degree:
             self.active_sh_degree += 1
+
+    def _build_texture_dims_from_resolutions(self, resolutions):
+        resolutions = resolutions.to(device=self.get_xyz.device, dtype=torch.int32)
+        counts = resolutions.to(torch.long) * resolutions.to(torch.long)
+        offsets = torch.zeros_like(resolutions, dtype=torch.int32)
+        if resolutions.numel() > 1:
+            offsets[1:] = torch.cumsum(counts[:-1], dim=0).to(torch.int32)
+        return torch.stack([resolutions, resolutions, offsets], dim=1)
+
+    def _texture_counts(self, dims=None):
+        dims = self._texture_dims if dims is None else dims
+        if dims.numel() == 0:
+            return torch.empty(0, device=self.get_xyz.device, dtype=torch.long)
+        return dims[:, 0].to(torch.long) * dims[:, 1].to(torch.long)
+
+    def _dynamic_texture_stats(self):
+        if not self.has_dynamic_textures:
+            return {
+                "points": 0,
+                "total_texels": 0,
+                "avg_texels": 0.0,
+                "hist": [],
+            }
+        dims = self._texture_dims.detach()
+        resolutions = dims[:, 0].to(torch.long)
+        counts = (dims[:, 0].to(torch.long) * dims[:, 1].to(torch.long)).clamp_min(1)
+        unique_res, unique_counts = torch.unique(resolutions, sorted=True, return_counts=True)
+        total_texels = int(counts.sum().item())
+        points = int(resolutions.numel())
+        return {
+            "points": points,
+            "total_texels": total_texels,
+            "avg_texels": float(total_texels) / max(1, points),
+            "hist": [(int(r.item()), int(c.item())) for r, c in zip(unique_res, unique_counts)],
+        }
+
+    def texture_rtg_log_string(self):
+        log = getattr(self, "_last_rtg_refine_log", None)
+        if not log:
+            return ""
+        hist = ", ".join(f"{res}x{res}:{count}" for res, count in log.get("hist", []))
+        return (
+            f"texels {log['before_texels']}->{log['after_texels']} "
+            f"(+{log['texel_delta']}), avg {log['avg_texels']:.1f}/G, "
+            f"score mean/max {log['score_mean']:.3e}/{log['score_max']:.3e}, "
+            f"res {{{hist}}}"
+        )
+
+    def _validate_dynamic_texture_layout(self, tex_color=None, tex_alpha=None, texture_dims=None):
+        dims = self._texture_dims if texture_dims is None else texture_dims
+        if dims.numel() == 0:
+            return
+        if dims.ndim != 2 or dims.shape[1] != 3:
+            raise ValueError("Dynamic texture_dims must have shape [num_points, 3].")
+        if dims.shape[0] != self.get_xyz.shape[0]:
+            raise ValueError("Dynamic texture_dims point count does not match Gaussian count.")
+        dims_long = dims.to(device=self.get_xyz.device, dtype=torch.long)
+        if torch.any(dims_long[:, :2] <= 0).item():
+            raise ValueError("Dynamic texture dimensions must be positive.")
+        counts = dims_long[:, 0] * dims_long[:, 1]
+        offsets = dims_long[:, 2]
+        expected_offsets = torch.zeros_like(offsets)
+        if offsets.numel() > 1:
+            expected_offsets[1:] = torch.cumsum(counts[:-1], dim=0)
+        if not torch.equal(offsets, expected_offsets):
+            raise ValueError("Dynamic texture offsets are not contiguous.")
+        total_texels = int(counts.sum().item())
+        if tex_color is not None and tex_color.numel() > 0 and tex_color.shape[0] != total_texels:
+            raise ValueError("Dynamic texture_color first dimension does not match texture_dims.")
+        if tex_alpha is not None and tex_alpha.numel() > 0 and tex_alpha.shape[0] != total_texels:
+            raise ValueError("Dynamic texture_alpha first dimension does not match texture_dims.")
+
+    def _ensure_rtg_buffers(self):
+        n_points = self.get_xyz.shape[0]
+        if self._rtg_score.numel() != n_points:
+            self._rtg_score = torch.zeros((n_points,), dtype=torch.float32, device=self.get_xyz.device)
+
+    def _replace_dynamic_texture_tensors(self, tex_color, tex_alpha, texture_dims):
+        self._validate_dynamic_texture_layout(tex_color, tex_alpha, texture_dims)
+        if self.optimizer is None:
+            self._tex_color = nn.Parameter(tex_color.requires_grad_(True))
+            self._tex_alpha = nn.Parameter(tex_alpha.requires_grad_(True))
+        else:
+            optimizable = self.replace_tensor_to_optimizer(tex_color, "tex_color")
+            self._tex_color = optimizable["tex_color"]
+            optimizable = self.replace_tensor_to_optimizer(tex_alpha, "tex_alpha")
+            self._tex_alpha = optimizable["tex_alpha"]
+        self._texture_dims = texture_dims.to(device=self.get_xyz.device, dtype=torch.int32)
+        self._ensure_rtg_buffers()
+
+    def _init_dynamic_textures_from_base_color(self, base_color):
+        num_points = base_color.shape[0]
+        tex_res = max(1, int(self.texture_min_resolution))
+        tex_res = min(tex_res, max(1, int(self.texture_max_resolution)))
+        resolutions = torch.full((num_points,), tex_res, dtype=torch.int32, device=base_color.device)
+        self._texture_dims = self._build_texture_dims_from_resolutions(resolutions)
+        texels_per_point = tex_res * tex_res
+        tex_color = base_color[:, None, :].expand(num_points, texels_per_point, 3).reshape(-1, 3)
+        tex_alpha = torch.full((num_points * texels_per_point, 1), 0.99, dtype=torch.float32, device=base_color.device)
+        self._validate_dynamic_texture_layout(tex_color, tex_alpha, self._texture_dims)
+        self._tex_color = nn.Parameter(inverse_sigmoid(tex_color.clamp(1e-6, 1 - 1e-6)).requires_grad_(True))
+        self._tex_alpha = nn.Parameter(inverse_sigmoid(tex_alpha).requires_grad_(True))
+        self._ensure_rtg_buffers()
+
+    def _texel_owner_ids(self, dims=None):
+        dims = self._texture_dims if dims is None else dims
+        counts = self._texture_counts(dims)
+        if counts.numel() == 0:
+            return torch.empty(0, device=self.get_xyz.device, dtype=torch.long)
+        return torch.repeat_interleave(torch.arange(counts.shape[0], device=counts.device), counts)
+
+    def _gather_dynamic_texels_by_mask(self, point_mask):
+        owner_ids = self._texel_owner_ids()
+        texel_mask = point_mask[owner_ids]
+        return self._tex_color.detach()[texel_mask], self._tex_alpha.detach()[texel_mask]
 
     def _initialize_mbrdf_modules(self):
         self.asg_func = Mixture_of_ASG(self.basis_asg_num, self.asg_channel_num)
@@ -332,15 +498,18 @@ class GaussianModel:
         self._opacity = nn.Parameter(opacities.requires_grad_(True))
 
         if self.use_textures:
-            tex_color = fused_color_rgb[:, :, None, None].repeat(1, 1, self.texture_resolution, self.texture_resolution)
-            tex_alpha = torch.full(
-                (fused_point_cloud.shape[0], 1, self.texture_resolution, self.texture_resolution),
-                1.0,
-                dtype=torch.float32,
-                device="cuda",
-            )
-            self._tex_color = nn.Parameter(inverse_sigmoid(tex_color).requires_grad_(True))
-            self._tex_alpha = nn.Parameter(inverse_sigmoid(tex_alpha).requires_grad_(True))
+            if self.texture_dynamic_resolution:
+                self._init_dynamic_textures_from_base_color(torch.clamp(fused_color_rgb, 1e-6, 1 - 1e-6))
+            else:
+                tex_color = fused_color_rgb[:, :, None, None].repeat(1, 1, self.texture_resolution, self.texture_resolution)
+                tex_alpha = torch.full(
+                    (fused_point_cloud.shape[0], 1, self.texture_resolution, self.texture_resolution),
+                    1.0,
+                    dtype=torch.float32,
+                    device="cuda",
+                )
+                self._tex_color = nn.Parameter(inverse_sigmoid(tex_color).requires_grad_(True))
+                self._tex_alpha = nn.Parameter(inverse_sigmoid(tex_alpha).requires_grad_(True))
 
         if self.use_mbrdf:
             self.initialize_mbrdf_state()
@@ -349,8 +518,17 @@ class GaussianModel:
 
     def training_setup(self, training_args):
         self.percent_dense = training_args.percent_dense
+        self.texture_rtg_enabled = bool(getattr(training_args, "texture_rtg_enabled", False))
+        self.texture_rtg_refine_from_iter = int(getattr(training_args, "texture_rtg_refine_from_iter", 15_000))
+        self.texture_rtg_refine_until_iter = int(getattr(training_args, "texture_rtg_refine_until_iter", 100_000))
+        self.texture_rtg_refine_interval = int(getattr(training_args, "texture_rtg_refine_interval", 1_000))
+        self.texture_rtg_refine_fraction = float(getattr(training_args, "texture_rtg_refine_fraction", 0.02))
+        self.texture_rtg_ema = float(getattr(training_args, "texture_rtg_ema", 0.9))
+        self.texture_rtg_alpha_weight = float(getattr(training_args, "texture_rtg_alpha_weight", 1.0))
+        self.texture_rtg_min_score = float(getattr(training_args, "texture_rtg_min_score", 0.0))
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
+        self._ensure_rtg_buffers()
 
         groups = [
             {"params": [self._xyz], "lr": training_args.position_lr_init * self.spatial_lr_scale, "name": "xyz"},
@@ -454,10 +632,17 @@ class GaussianModel:
             return
 
         mkdir_p(os.path.dirname(path))
-        payload = {"texture_resolution": self.texture_resolution}
+        payload = {
+            "texture_resolution": self.texture_resolution,
+            "texture_dynamic_resolution": self.texture_dynamic_resolution,
+            "texture_min_resolution": self.texture_min_resolution,
+            "texture_max_resolution": self.texture_max_resolution,
+        }
         if self.use_textures:
             payload["tex_color"] = self._tex_color.detach().cpu()
             payload["tex_alpha"] = self._tex_alpha.detach().cpu()
+            payload["texture_dims"] = self._texture_dims.detach().cpu() if self.has_dynamic_textures else torch.empty(0, dtype=torch.int32)
+            payload["rtg_score"] = self._rtg_score.detach().cpu() if self._rtg_score.numel() > 0 else torch.empty(0)
         if self.use_mbrdf:
             payload.update(
                 {
@@ -543,9 +728,14 @@ class GaussianModel:
         if num_points == 0:
             self._tex_color = nn.Parameter(torch.empty(0, device="cuda"))
             self._tex_alpha = nn.Parameter(torch.empty(0, device="cuda"))
+            self._texture_dims = torch.empty(0, device="cuda", dtype=torch.int32)
+            self._rtg_score = torch.empty(0, device="cuda")
             return
 
         base_color = torch.clamp(SH2RGB(self._features_dc.detach().squeeze(1)), 1e-6, 1 - 1e-6)
+        if self.texture_dynamic_resolution:
+            self._init_dynamic_textures_from_base_color(base_color)
+            return
         tex_color = base_color[:, :, None, None].repeat(1, 1, tex_res, tex_res)
         tex_alpha = torch.ones((num_points, 1, tex_res, tex_res), dtype=torch.float32, device="cuda")
         self._tex_color = nn.Parameter(inverse_sigmoid(tex_color).requires_grad_(True))
@@ -561,10 +751,19 @@ class GaussianModel:
 
         payload = torch.load(path, map_location="cpu")
         self.texture_resolution = int(payload.get("texture_resolution", self.texture_resolution))
+        self.texture_dynamic_resolution = bool(payload.get("texture_dynamic_resolution", self.texture_dynamic_resolution))
+        self.texture_min_resolution = int(payload.get("texture_min_resolution", self.texture_min_resolution))
+        self.texture_max_resolution = int(payload.get("texture_max_resolution", self.texture_max_resolution))
         if self.use_textures:
             if "tex_color" in payload:
                 self._tex_color = nn.Parameter(payload["tex_color"].to(device="cuda", dtype=torch.float).requires_grad_(True))
                 self._tex_alpha = nn.Parameter(payload["tex_alpha"].to(device="cuda", dtype=torch.float).requires_grad_(True))
+                texture_dims = payload.get("texture_dims", torch.empty(0, dtype=torch.int32))
+                self._texture_dims = texture_dims.to(device="cuda", dtype=torch.int32) if isinstance(texture_dims, torch.Tensor) else torch.empty(0, device="cuda", dtype=torch.int32)
+                rtg_score = payload.get("rtg_score", torch.empty(0))
+                self._rtg_score = rtg_score.to(device="cuda", dtype=torch.float32) if isinstance(rtg_score, torch.Tensor) else torch.empty(0, device="cuda")
+                if self.has_dynamic_textures:
+                    self._validate_dynamic_texture_layout(self._tex_color, self._tex_alpha, self._texture_dims)
             else:
                 self.initialize_texture_state()
         if self.use_mbrdf:
@@ -579,6 +778,175 @@ class GaussianModel:
                 self.neural_phasefunc.load_state_dict(payload["neural_phasefunc"])
             else:
                 self.initialize_mbrdf_state()
+
+    def _prune_dynamic_textures(self, valid_points_mask):
+        if not self.has_dynamic_textures:
+            return
+        tex_color, tex_alpha = self._gather_dynamic_texels_by_mask(valid_points_mask)
+        resolutions = self._texture_dims[valid_points_mask, 0]
+        texture_dims = self._build_texture_dims_from_resolutions(resolutions)
+        kept = int(valid_points_mask.sum().item())
+        self._rtg_score = self._rtg_score[valid_points_mask] if self._rtg_score.numel() == valid_points_mask.shape[0] else torch.zeros((kept,), device=self.get_xyz.device)
+        self._replace_dynamic_texture_tensors(tex_color, tex_alpha, texture_dims)
+
+    def _append_dynamic_textures_from_mask(self, selected_pts_mask, repeat_count=1):
+        if not self.has_dynamic_textures or selected_pts_mask.sum() == 0:
+            return
+        repeat_count = max(1, int(repeat_count))
+        selected_color, selected_alpha = self._gather_dynamic_texels_by_mask(selected_pts_mask)
+        if repeat_count > 1:
+            selected_color = selected_color.repeat(repeat_count, 1)
+            selected_alpha = selected_alpha.repeat(repeat_count, 1)
+        old_resolutions = self._texture_dims[:, 0]
+        new_resolutions = old_resolutions[selected_pts_mask].repeat(repeat_count)
+        texture_dims = self._build_texture_dims_from_resolutions(torch.cat([old_resolutions, new_resolutions], dim=0))
+        tex_color = torch.cat([self._tex_color.detach(), selected_color], dim=0)
+        tex_alpha = torch.cat([self._tex_alpha.detach(), selected_alpha], dim=0)
+        if self._rtg_score.numel() == old_resolutions.shape[0]:
+            self._rtg_score = torch.cat(
+                [self._rtg_score, torch.zeros((new_resolutions.shape[0],), dtype=torch.float32, device=self._rtg_score.device)],
+                dim=0,
+            )
+        self._replace_dynamic_texture_tensors(tex_color, tex_alpha, texture_dims)
+
+    def _resize_dynamic_textures(self, selected_pts_mask, new_resolutions):
+        if not self.has_dynamic_textures or selected_pts_mask.sum() == 0:
+            return 0
+
+        old_dims = self._texture_dims
+        old_resolutions = old_dims[:, 0].to(torch.long)
+        old_offsets = old_dims[:, 2].to(torch.long)
+        new_resolutions = new_resolutions.to(device=old_dims.device, dtype=torch.long)
+        new_counts = new_resolutions * new_resolutions
+        new_offsets = torch.zeros_like(new_resolutions)
+        if new_resolutions.numel() > 1:
+            new_offsets[1:] = torch.cumsum(new_counts[:-1], dim=0)
+        total_texels = int(new_counts.sum().item())
+
+        color_channels = self._tex_color.shape[1]
+        alpha_channels = self._tex_alpha.shape[1]
+        new_color = torch.empty((total_texels, color_channels), dtype=self._tex_color.dtype, device=self._tex_color.device)
+        new_alpha = torch.empty((total_texels, alpha_channels), dtype=self._tex_alpha.dtype, device=self._tex_alpha.device)
+        unchanged = old_resolutions == new_resolutions
+
+        for res_value in torch.unique(old_resolutions[unchanged]).tolist():
+            idx = torch.nonzero(torch.logical_and(unchanged, old_resolutions == res_value), as_tuple=False).flatten()
+            if idx.numel() == 0:
+                continue
+            local = torch.arange(res_value * res_value, device=old_dims.device, dtype=torch.long)
+            src = old_offsets[idx, None] + local[None, :]
+            dst = new_offsets[idx, None] + local[None, :]
+            new_color[dst.reshape(-1)] = self._tex_color.detach()[src.reshape(-1)]
+            new_alpha[dst.reshape(-1)] = self._tex_alpha.detach()[src.reshape(-1)]
+
+        changed = old_resolutions != new_resolutions
+        for res_value in torch.unique(old_resolutions[changed]).tolist():
+            idx = torch.nonzero(torch.logical_and(changed, old_resolutions == res_value), as_tuple=False).flatten()
+            if idx.numel() == 0:
+                continue
+            target_res = int(new_resolutions[idx[0]].item())
+            local_old = torch.arange(res_value * res_value, device=old_dims.device, dtype=torch.long)
+            src = old_offsets[idx, None] + local_old[None, :]
+            color_values = torch.sigmoid(self._tex_color.detach()[src.reshape(-1)]).view(idx.numel(), res_value, res_value, color_channels)
+            alpha_values = torch.sigmoid(self._tex_alpha.detach()[src.reshape(-1)]).view(idx.numel(), res_value, res_value, alpha_channels)
+            color_values = color_values.permute(0, 3, 1, 2).contiguous()
+            alpha_values = alpha_values.permute(0, 3, 1, 2).contiguous()
+            color_up = F.interpolate(color_values, size=(target_res, target_res), mode="bilinear", align_corners=False)
+            alpha_up = F.interpolate(alpha_values, size=(target_res, target_res), mode="bilinear", align_corners=False)
+            color_up = inverse_sigmoid(color_up.permute(0, 2, 3, 1).reshape(-1, color_channels).clamp(1e-6, 1 - 1e-6))
+            alpha_up = inverse_sigmoid(alpha_up.permute(0, 2, 3, 1).reshape(-1, alpha_channels).clamp(1e-6, 1 - 1e-6))
+            local_new = torch.arange(target_res * target_res, device=old_dims.device, dtype=torch.long)
+            dst = new_offsets[idx, None] + local_new[None, :]
+            new_color[dst.reshape(-1)] = color_up
+            new_alpha[dst.reshape(-1)] = alpha_up
+
+        texture_dims = torch.stack(
+            [new_resolutions.to(torch.int32), new_resolutions.to(torch.int32), new_offsets.to(torch.int32)],
+            dim=1,
+        )
+        refined = int(selected_pts_mask.sum().item())
+        self._replace_dynamic_texture_tensors(new_color, new_alpha, texture_dims)
+        if self._rtg_score.numel() == selected_pts_mask.shape[0]:
+            self._rtg_score[selected_pts_mask] = 0.0
+        return refined
+
+    def accumulate_texture_rtg(self):
+        if not (self.use_textures and self.texture_rtg_enabled):
+            return
+        if self._tex_color.grad is None and self._tex_alpha.grad is None:
+            return
+        self._ensure_rtg_buffers()
+        with torch.no_grad():
+            n_points = self.get_xyz.shape[0]
+            score = torch.zeros((n_points,), dtype=torch.float32, device=self.get_xyz.device)
+            if self.has_dynamic_textures:
+                counts = self._texture_counts().to(torch.float32).clamp_min(1.0)
+                owner_ids = self._texel_owner_ids()
+                if self._tex_color.grad is not None:
+                    tex_score = self._tex_color.grad.detach().abs().mean(dim=1)
+                    score.scatter_add_(0, owner_ids, tex_score)
+                if self._tex_alpha.grad is not None:
+                    alpha_score = self._tex_alpha.grad.detach().abs().mean(dim=1)
+                    score.scatter_add_(0, owner_ids, self.texture_rtg_alpha_weight * alpha_score)
+                score = score / counts
+            else:
+                if self._tex_color.grad is not None:
+                    score = score + self._tex_color.grad.detach().abs().flatten(start_dim=1).mean(dim=1)
+                if self._tex_alpha.grad is not None:
+                    score = score + self.texture_rtg_alpha_weight * self._tex_alpha.grad.detach().abs().flatten(start_dim=1).mean(dim=1)
+            score = torch.nan_to_num(score, nan=0.0, posinf=0.0, neginf=0.0)
+            ema = min(max(float(self.texture_rtg_ema), 0.0), 0.9999)
+            self._rtg_score.mul_(ema).add_(score, alpha=1.0 - ema)
+
+    def refine_textures_by_rtg(self, iteration):
+        self._last_rtg_refine_log = {}
+        if not (self.use_textures and self.texture_dynamic_resolution and self.texture_rtg_enabled and self.has_dynamic_textures):
+            return 0
+        if iteration < self.texture_rtg_refine_from_iter or iteration > self.texture_rtg_refine_until_iter:
+            return 0
+        interval = max(1, int(self.texture_rtg_refine_interval))
+        if iteration % interval != 0:
+            return 0
+        self._ensure_rtg_buffers()
+        old_resolutions = self._texture_dims[:, 0].to(torch.long)
+        valid = old_resolutions < int(self.texture_max_resolution)
+        if self.texture_rtg_min_score > 0:
+            valid = torch.logical_and(valid, self._rtg_score >= float(self.texture_rtg_min_score))
+        num_valid = int(valid.sum().item())
+        if num_valid == 0:
+            return 0
+        fraction = max(0.0, float(self.texture_rtg_refine_fraction))
+        if fraction <= 0.0:
+            return 0
+        k = max(1, int(np.ceil(num_valid * fraction)))
+        valid_idx = torch.nonzero(valid, as_tuple=False).flatten()
+        top_scores, top_order = torch.topk(self._rtg_score[valid_idx], k=min(k, valid_idx.numel()), largest=True)
+        if top_scores.numel() == 0 or float(top_scores.max().item()) <= 0.0:
+            return 0
+        selected = torch.zeros_like(valid)
+        selected[valid_idx[top_order]] = True
+        new_resolutions = old_resolutions.clone()
+        new_resolutions[selected] = torch.clamp(new_resolutions[selected] * 2, max=int(self.texture_max_resolution))
+        selected = torch.logical_and(selected, new_resolutions > old_resolutions)
+        if selected.sum() == 0:
+            return 0
+        before_stats = self._dynamic_texture_stats()
+        selected_scores = self._rtg_score[selected].detach()
+        refined = self._resize_dynamic_textures(selected, new_resolutions)
+        if refined > 0:
+            after_stats = self._dynamic_texture_stats()
+            self._last_rtg_refine_log = {
+                "iteration": int(iteration),
+                "refined": int(refined),
+                "before_texels": int(before_stats["total_texels"]),
+                "after_texels": int(after_stats["total_texels"]),
+                "texel_delta": int(after_stats["total_texels"] - before_stats["total_texels"]),
+                "avg_texels": float(after_stats["avg_texels"]),
+                "hist": after_stats["hist"],
+                "score_mean": float(selected_scores.mean().item()) if selected_scores.numel() > 0 else 0.0,
+                "score_max": float(selected_scores.max().item()) if selected_scores.numel() > 0 else 0.0,
+            }
+        return refined
 
     def replace_tensor_to_optimizer(self, tensor, name):
         optimizable_tensors = {}
@@ -626,9 +994,11 @@ class GaussianModel:
         self._opacity = optimizable_tensors["opacity"]
         self._scaling = optimizable_tensors["scaling"]
         self._rotation = optimizable_tensors["rotation"]
-        if self.use_textures:
+        if self.use_textures and not self.has_dynamic_textures:
             self._tex_color = optimizable_tensors["tex_color"]
             self._tex_alpha = optimizable_tensors["tex_alpha"]
+        elif self.use_textures and self.has_dynamic_textures:
+            self._prune_dynamic_textures(valid_points_mask)
         if self.use_mbrdf:
             self.kd = optimizable_tensors["kd"]
             self.ks = optimizable_tensors["ks"]
@@ -685,7 +1055,7 @@ class GaussianModel:
             "scaling": new_scaling,
             "rotation": new_rotation,
         }
-        if self.use_textures:
+        if self.use_textures and not self.has_dynamic_textures:
             tensors["tex_color"] = new_tex_color
             tensors["tex_alpha"] = new_tex_alpha
         if self.use_mbrdf:
@@ -702,7 +1072,7 @@ class GaussianModel:
         self._opacity = optimizable_tensors["opacity"]
         self._scaling = optimizable_tensors["scaling"]
         self._rotation = optimizable_tensors["rotation"]
-        if self.use_textures:
+        if self.use_textures and not self.has_dynamic_textures:
             self._tex_color = optimizable_tensors["tex_color"]
             self._tex_alpha = optimizable_tensors["tex_alpha"]
         if self.use_mbrdf:
@@ -737,8 +1107,8 @@ class GaussianModel:
         new_features_dc = self._features_dc[selected_pts_mask].repeat(N, 1, 1)
         new_features_rest = self._features_rest[selected_pts_mask].repeat(N, 1, 1)
         new_opacity = self._opacity[selected_pts_mask].repeat(N, 1)
-        new_tex_color = self._tex_color[selected_pts_mask].repeat(N, 1, 1, 1) if self.use_textures else None
-        new_tex_alpha = self._tex_alpha[selected_pts_mask].repeat(N, 1, 1, 1) if self.use_textures else None
+        new_tex_color = self._tex_color[selected_pts_mask].repeat(N, 1, 1, 1) if self.use_textures and not self.has_dynamic_textures else None
+        new_tex_alpha = self._tex_alpha[selected_pts_mask].repeat(N, 1, 1, 1) if self.use_textures and not self.has_dynamic_textures else None
         new_kd = self.kd[selected_pts_mask].repeat(N, 1) if self.use_mbrdf else None
         new_ks = self.ks[selected_pts_mask].repeat(N, 1) if self.use_mbrdf else None
         new_alpha_asg = self.alpha_asg[selected_pts_mask].repeat(N, 1, 1) if self.use_mbrdf else None
@@ -760,6 +1130,8 @@ class GaussianModel:
             new_local_q,
             new_neural_material,
         )
+        if self.use_textures and self.has_dynamic_textures:
+            self._append_dynamic_textures_from_mask(selected_pts_mask, repeat_count=N)
 
         prune_filter = torch.cat((selected_pts_mask, torch.zeros(N * selected_pts_mask.sum(), device="cuda", dtype=bool)))
         self.prune_points(prune_filter)
@@ -777,8 +1149,8 @@ class GaussianModel:
         new_opacities = self._opacity[selected_pts_mask]
         new_scaling = self._scaling[selected_pts_mask]
         new_rotation = self._rotation[selected_pts_mask]
-        new_tex_color = self._tex_color[selected_pts_mask] if self.use_textures else None
-        new_tex_alpha = self._tex_alpha[selected_pts_mask] if self.use_textures else None
+        new_tex_color = self._tex_color[selected_pts_mask] if self.use_textures and not self.has_dynamic_textures else None
+        new_tex_alpha = self._tex_alpha[selected_pts_mask] if self.use_textures and not self.has_dynamic_textures else None
         new_kd = self.kd[selected_pts_mask] if self.use_mbrdf else None
         new_ks = self.ks[selected_pts_mask] if self.use_mbrdf else None
         new_alpha_asg = self.alpha_asg[selected_pts_mask] if self.use_mbrdf else None
@@ -800,6 +1172,8 @@ class GaussianModel:
             new_local_q,
             new_neural_material,
         )
+        if self.use_textures and self.has_dynamic_textures:
+            self._append_dynamic_textures_from_mask(selected_pts_mask, repeat_count=1)
 
     def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size):
         grads = self.xyz_gradient_accum / self.denom
