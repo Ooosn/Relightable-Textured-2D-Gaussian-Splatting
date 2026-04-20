@@ -192,9 +192,31 @@ def _build_splat2world_2dgs(means3D, scaling_2d, rotation, scaling_modifier=1.0)
     return trans
 
 
-def save_gaussian_checkpoint(scene, gaussians, iteration, label="Checkpoint"):
+def _unpack_training_checkpoint(payload):
+    if isinstance(payload, dict) and "gaussians" in payload:
+        return payload["gaussians"], int(payload["iteration"]), payload.get("scene")
+    model_params, iteration = payload
+    return model_params, int(iteration), None
+
+
+def clear_checkpoint_gradients(scene, gaussians):
+    if getattr(gaussians, "optimizer", None) is not None:
+        gaussians.optimizer.zero_grad(set_to_none=True)
+    if getattr(scene, "optimizer", None) is not None:
+        scene.optimizer.zero_grad(set_to_none=True)
+
+
+def save_training_checkpoint(scene, gaussians, iteration, label="Checkpoint"):
     print(f"\n[ITER {iteration}] Saving {label}")
-    torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
+    clear_checkpoint_gradients(scene, gaussians)
+    payload = {
+        "type": "gs2dgs_training_checkpoint",
+        "version": 2,
+        "iteration": int(iteration),
+        "gaussians": gaussians.capture(),
+        "scene": scene.capture() if hasattr(scene, "capture") else None,
+    }
+    torch.save(payload, scene.model_path + "/chkpnt" + str(iteration) + ".pth")
 
 
 def _masked_vector_stats(values: torch.Tensor, mask: torch.Tensor | None = None):
@@ -437,14 +459,15 @@ def training(modelset, opt, pipe, testing_iterations, saving_iterations, checkpo
         2. 加载高斯模型，如果加载旧模型则直接从点云中加载高斯模型，否则从场景信息的点云信息中创建高斯模型
         3. 根据命令行参数判断是否需要添加优化相机参数和光源参数
     """
-    scene = Scene(modelset, gaussians, opt=opt, shuffle=True, checkpoint=checkpoint)
+    checkpoint_payload = torch.load(checkpoint, weights_only=False) if checkpoint else None
+    scene = Scene(modelset, gaussians, opt=opt, shuffle=True, checkpoint=checkpoint, checkpoint_state=checkpoint_payload)
     
     # 按照 opt对象 初始化参数设置
 
 
     # 恢复模型模型参数以及优化器状态，覆盖之前初始化的模型
     if checkpoint:
-        (model_params, first_iter) = torch.load(checkpoint, weights_only=False)
+        model_params, first_iter, _ = _unpack_training_checkpoint(checkpoint_payload)
         gaussians.restore(model_params, opt)
     else:
         gaussians.training_setup(opt)
@@ -960,20 +983,24 @@ def training(modelset, opt, pipe, testing_iterations, saving_iterations, checkpo
                         and bool(getattr(opt, "texture_dynamic_resolution", False))
                         and iteration == int(getattr(opt, "texture_rtg_refine_from_iter", -1))
                     )
-                    if is_rtg_start_checkpoint:
-                        save_gaussian_checkpoint(scene, gaussians, iteration, label="Pre-RTG Checkpoint")
-                        checkpoint_saved_this_iter = True
                     if hasattr(gaussians, "refine_textures_by_rtg"):
-                        num_rtg_refined = gaussians.refine_textures_by_rtg(iteration)
-                        if num_rtg_refined > 0:
-                            rtg_log = gaussians.texture_rtg_log_string() if hasattr(gaussians, "texture_rtg_log_string") else ""
-                            suffix = f" | {rtg_log}" if rtg_log else ""
-                            print(f"\n[ITER {iteration}] RTG refined {num_rtg_refined} texture charts{suffix}")
+                        should_refine_rtg = True
+                    else:
+                        should_refine_rtg = False
                     # opt the camera pose
                     if scene.optimizing:    # 判断是否开启相机优化
                         scene.optimizer.step()
                         scene.optimizer.zero_grad(set_to_none = True)
                     gaussians.optimizer.zero_grad(set_to_none = True)   # 梯度清零
+                    if is_rtg_start_checkpoint:
+                        save_training_checkpoint(scene, gaussians, iteration, label="Pre-RTG Checkpoint")
+                        checkpoint_saved_this_iter = True
+                    if should_refine_rtg:
+                        num_rtg_refined = gaussians.refine_textures_by_rtg(iteration)
+                        if num_rtg_refined > 0:
+                            rtg_log = gaussians.texture_rtg_log_string() if hasattr(gaussians, "texture_rtg_log_string") else ""
+                            suffix = f" | {rtg_log}" if rtg_log else ""
+                            print(f"\n[ITER {iteration}] RTG refined {num_rtg_refined} texture charts{suffix}")
 
             """
             1. 默认冻结 高斯点相位函数，初期训练高斯点场景空间为主，并只简单优化漫反射 kd (阴影和次要效果为 0)
@@ -1022,7 +1049,7 @@ def training(modelset, opt, pipe, testing_iterations, saving_iterations, checkpo
 
             # 判断是否保存模型
             if (iteration in checkpoint_iterations and not checkpoint_saved_this_iter):
-                save_gaussian_checkpoint(scene, gaussians, iteration)
+                save_training_checkpoint(scene, gaussians, iteration)
 
             if modelset.asg_mlp and iteration == opt.asg_mlp_freeze: # 40000
                 asg_mlp = True
@@ -1238,6 +1265,9 @@ if __name__ == "__main__":
         args.test_iterations.append(args.iterations)
     if args.iterations not in args.checkpoint_iterations:
         args.checkpoint_iterations.append(args.iterations)
+    for resume_iter in (30_000, 40_000):
+        if resume_iter <= args.iterations and resume_iter not in args.checkpoint_iterations:
+            args.checkpoint_iterations.append(resume_iter)
     if bool(getattr(args, "texture_rtg_enabled", False)) and bool(getattr(args, "texture_dynamic_resolution", False)):
         rtg_start_iter = int(getattr(args, "texture_rtg_refine_from_iter", 0))
         if 0 < rtg_start_iter <= args.iterations and rtg_start_iter not in args.checkpoint_iterations:

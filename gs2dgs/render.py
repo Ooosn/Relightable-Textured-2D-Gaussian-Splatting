@@ -63,7 +63,8 @@ def _restore_checkpoint_if_available(model_path: Path, iteration: int, gaussians
     checkpoint_path = model_path / f"chkpnt{iteration}.pth"
     if not checkpoint_path.exists():
         return None
-    model_params, _ = torch.load(checkpoint_path.as_posix(), weights_only=False)
+    payload = torch.load(checkpoint_path.as_posix(), weights_only=False)
+    model_params = payload["gaussians"] if isinstance(payload, dict) and "gaussians" in payload else payload[0]
     gaussians.restore(model_params, opt_args)
     return checkpoint_path
 

@@ -199,6 +199,9 @@ charts need stronger relighting-aware texture gradients to keep growing.
 - `test_iterations`
 - `checkpoint_iterations`
 
+It also appends the default resume milestones `30000` and `40000` whenever
+the requested total iteration count reaches them.
+
 That means a normal run will automatically:
 
 - save the final point cloud,
@@ -210,6 +213,12 @@ When RTG dynamic texture refinement is enabled, `train.py` also appends
 production default this writes `chkpnt30000.pth` immediately before the first
 RTG texture-chart refinement, so it can be used as a clean full-state warmup
 checkpoint for resumed RTG experiments.
+
+Full training checkpoints are saved as `chkpntxxxxx.pth` and include both the
+Gaussian/texture state and the scene camera/light optimization state. They are
+intended for `--start_checkpoint` resume, not just offline rendering.
+Before saving, current batch gradients are cleared with `set_to_none=True`;
+optimizer moments and densification / RTG accumulators are preserved.
 
 ## Rendering
 
