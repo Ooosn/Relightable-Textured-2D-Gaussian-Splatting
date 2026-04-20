@@ -16,6 +16,7 @@ from pathlib import Path
 import torch
 import numpy as np
 import math
+import random
 from random import randint
 from utils.loss_utils import l1_loss, ssim
 from gaussian_renderer import render, get_shadow_backward_stage
@@ -199,6 +200,66 @@ def _unpack_training_checkpoint(payload):
     return model_params, int(iteration), None
 
 
+def _capture_rng_state():
+    return {
+        "python": random.getstate(),
+        "numpy": np.random.get_state(),
+        "torch": torch.get_rng_state(),
+        "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+    }
+
+
+def _restore_rng_state(rng_state):
+    if not isinstance(rng_state, dict):
+        return
+    if "python" in rng_state:
+        random.setstate(rng_state["python"])
+    if "numpy" in rng_state:
+        np.random.set_state(rng_state["numpy"])
+    if "torch" in rng_state:
+        torch.set_rng_state(rng_state["torch"].cpu())
+    cuda_state = rng_state.get("cuda")
+    if cuda_state is not None and torch.cuda.is_available():
+        torch.cuda.set_rng_state_all([state.cpu() for state in cuda_state])
+
+
+def _camera_key(camera):
+    return getattr(camera, "image_name", str(getattr(camera, "uid", "")))
+
+
+def _capture_loop_state(viewpoint_stack, opt_test, opt_test_ready, ema_loss_for_log):
+    return {
+        "version": 1,
+        "viewpoint_stack": [_camera_key(cam) for cam in viewpoint_stack] if viewpoint_stack is not None else None,
+        "opt_test": bool(opt_test),
+        "opt_test_ready": bool(opt_test_ready),
+        "ema_loss_for_log": float(ema_loss_for_log),
+    }
+
+
+def _restore_viewpoint_stack(scene, loop_state):
+    if not isinstance(loop_state, dict) or loop_state.get("viewpoint_stack") is None:
+        return None
+    camera_names = loop_state.get("viewpoint_stack", [])
+    cameras = []
+    cameras.extend(scene.getTrainCameras())
+    cameras.extend(scene.getTestCameras())
+    if hasattr(scene, "getValidCameras"):
+        cameras.extend(scene.getValidCameras())
+    by_name = {_camera_key(cam): cam for cam in cameras}
+    restored = []
+    missing = []
+    for name in camera_names:
+        cam = by_name.get(name)
+        if cam is None:
+            missing.append(name)
+        else:
+            restored.append(cam)
+    if missing:
+        print(f"Warning: could not restore {len(missing)} cameras from checkpoint viewpoint stack")
+    return restored
+
+
 def clear_checkpoint_gradients(scene, gaussians):
     if getattr(gaussians, "optimizer", None) is not None:
         gaussians.optimizer.zero_grad(set_to_none=True)
@@ -206,15 +267,17 @@ def clear_checkpoint_gradients(scene, gaussians):
         scene.optimizer.zero_grad(set_to_none=True)
 
 
-def save_training_checkpoint(scene, gaussians, iteration, label="Checkpoint"):
+def save_training_checkpoint(scene, gaussians, iteration, label="Checkpoint", loop_state=None):
     print(f"\n[ITER {iteration}] Saving {label}")
     clear_checkpoint_gradients(scene, gaussians)
     payload = {
         "type": "gs2dgs_training_checkpoint",
-        "version": 2,
+        "version": 3,
         "iteration": int(iteration),
         "gaussians": gaussians.capture(),
         "scene": scene.capture() if hasattr(scene, "capture") else None,
+        "rng_state": _capture_rng_state(),
+        "loop_state": loop_state,
     }
     torch.save(payload, scene.model_path + "/chkpnt" + str(iteration) + ".pth")
 
@@ -469,6 +532,8 @@ def training(modelset, opt, pipe, testing_iterations, saving_iterations, checkpo
     if checkpoint:
         model_params, first_iter, _ = _unpack_training_checkpoint(checkpoint_payload)
         gaussians.restore(model_params, opt)
+        if isinstance(checkpoint_payload, dict):
+            _restore_rng_state(checkpoint_payload.get("rng_state"))
     else:
         gaussians.training_setup(opt)
     
@@ -487,11 +552,18 @@ def training(modelset, opt, pipe, testing_iterations, saving_iterations, checkpo
     viewpoint_stack = None    # 存储相机视点（viewpoints）的堆栈，在训练过程中，会从堆栈中弹出一个相机视点，用于渲染图像，从而完成对所有视角的遍历。
     opt_test = False    # 当前是否处于优化测试模式
     opt_test_ready = False    # 是否准备好进行优化测试
+    loop_state = checkpoint_payload.get("loop_state") if isinstance(checkpoint_payload, dict) else None
+    if loop_state is not None:
+        viewpoint_stack = _restore_viewpoint_stack(scene, loop_state)
+        opt_test = bool(loop_state.get("opt_test", opt_test))
+        opt_test_ready = bool(loop_state.get("opt_test_ready", opt_test_ready))
     """
     指数移动平均（EMA）损失，用于记录训练过程中的损失值，只是为了平滑损失曲线，更好地可视化训练过程，不参与模型的训练。
     ema_loss_for_log = α * 当前损失 + (1 - α) * ema_loss_for_log 类似于梯度更新中的一阶动量。
     """
     ema_loss_for_log = 0.0    # 初始值为 0.0，表示尚未计算损失值
+    if loop_state is not None:
+        ema_loss_for_log = float(loop_state.get("ema_loss_for_log", ema_loss_for_log))
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")    #使用 tqdm 创建一个可视化的进度条，用于显示训练的进度
     first_iter += 1    # 迭代次数加一，开始下一次迭代
     print("first_iter", first_iter)
@@ -993,7 +1065,13 @@ def training(modelset, opt, pipe, testing_iterations, saving_iterations, checkpo
                         scene.optimizer.zero_grad(set_to_none = True)
                     gaussians.optimizer.zero_grad(set_to_none = True)   # 梯度清零
                     if is_rtg_start_checkpoint:
-                        save_training_checkpoint(scene, gaussians, iteration, label="Pre-RTG Checkpoint")
+                        save_training_checkpoint(
+                            scene,
+                            gaussians,
+                            iteration,
+                            label="Pre-RTG Checkpoint",
+                            loop_state=_capture_loop_state(viewpoint_stack, opt_test, opt_test_ready, ema_loss_for_log),
+                        )
                         checkpoint_saved_this_iter = True
                     if should_refine_rtg:
                         num_rtg_refined = gaussians.refine_textures_by_rtg(iteration)
@@ -1049,7 +1127,12 @@ def training(modelset, opt, pipe, testing_iterations, saving_iterations, checkpo
 
             # 判断是否保存模型
             if (iteration in checkpoint_iterations and not checkpoint_saved_this_iter):
-                save_training_checkpoint(scene, gaussians, iteration)
+                save_training_checkpoint(
+                    scene,
+                    gaussians,
+                    iteration,
+                    loop_state=_capture_loop_state(viewpoint_stack, opt_test, opt_test_ready, ema_loss_for_log),
+                )
 
             if modelset.asg_mlp and iteration == opt.asg_mlp_freeze: # 40000
                 asg_mlp = True
