@@ -523,6 +523,28 @@ def training(modelset, opt, pipe, testing_iterations, saving_iterations, checkpo
         f"dynamic={bool(getattr(modelset, 'texture_dynamic_resolution', False))}",
         flush=True,
     )
+    rtg_dynamic_enabled = (
+        bool(getattr(opt, "texture_rtg_enabled", False))
+        and bool(getattr(modelset, "texture_dynamic_resolution", False))
+    )
+    gaussian_densify_until_iter = int(getattr(opt, "densify_until_iter", 0))
+    if (
+        rtg_dynamic_enabled
+        and bool(getattr(opt, "texture_rtg_freeze_gaussian_densify", False))
+        and int(getattr(opt, "texture_rtg_refine_from_iter", 0)) > 0
+    ):
+        gaussian_densify_until_iter = min(
+            gaussian_densify_until_iter,
+            int(getattr(opt, "texture_rtg_refine_from_iter", 0)),
+        )
+    print(
+        "Gaussian densify config: "
+        f"from={int(getattr(opt, 'densify_from_iter', -1))}, "
+        f"until={int(getattr(opt, 'densify_until_iter', -1))}, "
+        f"effective_until={gaussian_densify_until_iter}, "
+        f"freeze_for_rtg={bool(getattr(opt, 'texture_rtg_freeze_gaussian_densify', False)) and rtg_dynamic_enabled}",
+        flush=True,
+    )
 
     # 根据 训练args，优化args 以及 初始高斯 建立场景实例，最终的高斯实例
     """
@@ -542,6 +564,13 @@ def training(modelset, opt, pipe, testing_iterations, saving_iterations, checkpo
     if checkpoint:
         model_params, first_iter, _ = _unpack_training_checkpoint(checkpoint_payload)
         gaussians.restore(model_params, opt)
+        if (
+            bool(getattr(opt, "texture_rtg_enabled", False))
+            and int(first_iter) <= int(getattr(opt, "texture_rtg_refine_from_iter", 0))
+        ):
+            reset_rtg_scores = getattr(gaussians, "reset_texture_rtg_scores", None)
+            if callable(reset_rtg_scores):
+                reset_rtg_scores()
         if isinstance(checkpoint_payload, dict):
             _restore_rng_state(checkpoint_payload.get("rng_state"))
     else:
@@ -823,7 +852,7 @@ def training(modelset, opt, pipe, testing_iterations, saving_iterations, checkpo
             )
             _check_vram_limit(pipe)
         if hasattr(gaussians, "accumulate_texture_rtg"):
-            gaussians.accumulate_texture_rtg()
+            gaussians.accumulate_texture_rtg(iteration)
         iter_end.record() # 记录迭代结束的时间
 
 
@@ -831,8 +860,9 @@ def training(modelset, opt, pipe, testing_iterations, saving_iterations, checkpo
         """！！参数更新部分"""
         # torch.no_grad() 防止污染计算图，加快计算速度
         with torch.no_grad():
-            densify_due = iteration < opt.densify_until_iter and iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0
-            opacity_reset_due = iteration % opt.opacity_reset_interval == 0 or (modelset.white_background and iteration == opt.densify_from_iter)
+            in_gaussian_densify_window = iteration < gaussian_densify_until_iter
+            densify_due = in_gaussian_densify_window and iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0
+            opacity_reset_due = in_gaussian_densify_window and (iteration % opt.opacity_reset_interval == 0 or (modelset.white_background and iteration == opt.densify_from_iter))
             health_due = (
                 iteration in testing_iterations
                 or (
@@ -936,9 +966,9 @@ def training(modelset, opt, pipe, testing_iterations, saving_iterations, checkpo
             # 1) 对于非测试集，即训练集进入正常阶段，先进行高斯密集化，高斯修剪以及场景参数优化:
             else:
 
-                # 第一步：：Densification, 高斯复制或分裂，when opt.density_from_iter < iteration < opt.densify_until_iter
+                # 第一步：：Densification, 高斯复制或分裂，when opt.density_from_iter < iteration < gaussian_densify_until_iter
                 # 如果迭代次数小于高斯密集化迭代次数，则进行高斯密集化
-                if iteration < opt.densify_until_iter:
+                if iteration < gaussian_densify_until_iter:
                     # 更新每个可见高斯点在2D投影上的最大半径
                     # visibility_filter: 标记哪些点是可见的
                     # max_radii2D: 记录每个点在屏幕空间的最大半径
@@ -1074,11 +1104,12 @@ def training(modelset, opt, pipe, testing_iterations, saving_iterations, checkpo
                 )
                 rtg_method = getattr(gaussians, "refine_textures_by_rtg", None)
                 rtg_interval = max(1, int(getattr(opt, "texture_rtg_refine_interval", 1)))
+                rtg_from_iter = int(getattr(opt, "texture_rtg_refine_from_iter", 0))
                 rtg_due = (
                     bool(getattr(opt, "texture_rtg_enabled", False))
-                    and iteration >= int(getattr(opt, "texture_rtg_refine_from_iter", 0))
+                    and iteration > rtg_from_iter
                     and iteration <= int(getattr(opt, "texture_rtg_refine_until_iter", opt.iterations))
-                    and iteration % rtg_interval == 0
+                    and (iteration - rtg_from_iter) % rtg_interval == 0
                 )
                 if is_rtg_start_checkpoint:
                     save_training_checkpoint(
@@ -1115,6 +1146,9 @@ def training(modelset, opt, pipe, testing_iterations, saving_iterations, checkpo
                         print(f"\n[ITER {iteration}] RTG refined {num_rtg_refined} texture charts{suffix}", flush=True)
                     elif rtg_log:
                         print(f"\n[ITER {iteration}] RTG skipped | {rtg_log}", flush=True)
+                    reset_rtg_scores = getattr(gaussians, "reset_texture_rtg_scores", None)
+                    if callable(reset_rtg_scores):
+                        reset_rtg_scores()
 
             """
             1. 默认冻结 高斯点相位函数，初期训练高斯点场景空间为主，并只简单优化漫反射 kd (阴影和次要效果为 0)

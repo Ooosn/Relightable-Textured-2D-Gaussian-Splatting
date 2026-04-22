@@ -134,7 +134,7 @@ conda run -n mygs python D:\RTS\gs2dgs\train.py `
   --texture_rtg_refine_fraction 0.02 `
   --texture_rtg_min_score 0.0 `
   --texture_rtg_resolution_gamma 1.0 `
-  --texture_rtg_alpha_weight 1.0 `
+  --texture_rtg_alpha_weight 0.0 `
   --texture_rtg_chunk_texels 262144 `
   --cam_opt `
   --pl_opt `
@@ -175,11 +175,20 @@ The default RTG schedule starts later:
 - `--texture_rtg_refine_interval 1000`
 - `--texture_rtg_refine_fraction 0.02`
 - `--texture_rtg_min_score 1e-10`
+- `--texture_rtg_alpha_weight 0.0`
 - `--texture_rtg_resolution_gamma 1.0`
+- `--texture_rtg_freeze_gaussian_densify`
 
 So short tests should override these values as shown above. The production
 default starts after specular rendering is enabled and after the ASG
 anisotropic parameters have had several thousand iterations to settle.
+
+When RTG dynamic texture refinement is enabled, ordinary Gaussian
+densification/pruning is frozen at `--texture_rtg_refine_from_iter` by
+default. This keeps the Gaussian set fixed while texture charts grow, so PSNR
+changes after RTG start are attributable to texture refinement instead of mixed
+Gaussian topology changes. Use `--no_texture_rtg_freeze_gaussian_densify` only
+for an explicit coupled Gaussian+texture ablation.
 
 The production RTG gate is resolution-aware:
 

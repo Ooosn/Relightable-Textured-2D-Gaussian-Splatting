@@ -110,7 +110,7 @@ class GaussianModel:
         self.texture_rtg_refine_interval = 1_000
         self.texture_rtg_refine_fraction = 0.02
         self.texture_rtg_ema = 0.9
-        self.texture_rtg_alpha_weight = 1.0
+        self.texture_rtg_alpha_weight = 0.0
         self.texture_rtg_min_score = 1e-10
         self.texture_rtg_resolution_gamma = 1.0
         self.texture_rtg_chunk_texels = 262_144
@@ -255,6 +255,9 @@ class GaussianModel:
                     self.asg_func.load_state_dict(asg_state)
                 if phase_state is not None:
                     self.neural_phasefunc.load_state_dict(phase_state)
+
+        if self.use_textures:
+            self._sanitize_texture_logits_in_place()
 
         if requested_dynamic_textures:
             self.texture_dynamic_resolution = True
@@ -437,6 +440,28 @@ class GaussianModel:
         if tex_alpha is not None and tex_alpha.numel() > 0 and tex_alpha.shape[0] != total_texels:
             raise ValueError("Dynamic texture_alpha first dimension does not match texture_dims.")
 
+    def _sanitize_texture_logits(self, tensor, eps=1e-6):
+        if not isinstance(tensor, torch.Tensor) or tensor.numel() == 0:
+            return tensor
+        if torch.isfinite(tensor).all():
+            return tensor
+        values = torch.sigmoid(torch.nan_to_num(tensor.detach(), nan=0.0, posinf=20.0, neginf=-20.0))
+        values = torch.nan_to_num(values, nan=0.5, posinf=1.0, neginf=0.0).clamp(eps, 1.0 - eps)
+        return inverse_sigmoid(values)
+
+    def _sanitize_texture_logits_in_place(self):
+        for name in ("_tex_color", "_tex_alpha"):
+            tensor = getattr(self, name, None)
+            fixed = self._sanitize_texture_logits(tensor)
+            if fixed is tensor:
+                continue
+            if isinstance(tensor, nn.Parameter):
+                with torch.no_grad():
+                    tensor.copy_(fixed.to(device=tensor.device, dtype=tensor.dtype))
+            else:
+                fixed = fixed.to(device=tensor.device, dtype=tensor.dtype)
+                setattr(self, name, nn.Parameter(fixed.requires_grad_(True)) if getattr(tensor, "requires_grad", False) else fixed)
+
     def _ensure_rtg_buffers(self):
         n_points = self.get_xyz.shape[0]
         if self._rtg_score.numel() != n_points:
@@ -555,6 +580,32 @@ class GaussianModel:
                     src = old_offsets[chunk_idx, None] + local[None, :]
                     dst = new_offsets[chunk_idx, None] + local[None, :]
                     new_value[dst.reshape(-1)] = value[src.reshape(-1)]
+            changed = old_resolutions != new_resolutions
+            for res_value in torch.unique(old_resolutions[changed]).tolist():
+                idx = torch.nonzero(torch.logical_and(changed, old_resolutions == res_value), as_tuple=False).flatten()
+                if idx.numel() == 0:
+                    continue
+                for target_res_tensor in torch.unique(new_resolutions[idx]).tolist():
+                    target_res = int(target_res_tensor)
+                    target_idx = idx[new_resolutions[idx] == target_res]
+                    if target_idx.numel() == 0:
+                        continue
+                    old_texels = int(res_value * res_value)
+                    new_texels = int(target_res * target_res)
+                    charts_per_chunk = max(1, max_texels // max(1, max(old_texels, new_texels)))
+                    local_old = torch.arange(old_texels, device=old_dims.device, dtype=torch.long)
+                    local_new = torch.arange(new_texels, device=old_dims.device, dtype=torch.long)
+                    for chunk_start in range(0, int(target_idx.numel()), charts_per_chunk):
+                        chunk_idx = target_idx[chunk_start:chunk_start + charts_per_chunk]
+                        src = old_offsets[chunk_idx, None] + local_old[None, :]
+                        old_value = value[src.reshape(-1)].view(chunk_idx.numel(), int(res_value), int(res_value), value.shape[1])
+                        old_value = old_value.permute(0, 3, 1, 2).contiguous()
+                        up_value = F.interpolate(old_value, size=(target_res, target_res), mode="bilinear", align_corners=True)
+                        up_value = up_value.permute(0, 2, 3, 1).reshape(-1, value.shape[1])
+                        if key == "exp_avg_sq":
+                            up_value = up_value.clamp_min(0.0)
+                        dst = new_offsets[chunk_idx, None] + local_new[None, :]
+                        new_value[dst.reshape(-1)] = up_value
             resized_state[key] = new_value
         return resized_state or None
 
@@ -613,7 +664,7 @@ class GaussianModel:
         self._texture_dims = self._build_texture_dims_from_resolutions(resolutions)
         texels_per_point = tex_res * tex_res
         tex_color = base_color[:, None, :].expand(num_points, texels_per_point, 3).reshape(-1, 3)
-        tex_alpha = torch.full((num_points * texels_per_point, 1), 0.99, dtype=torch.float32, device=base_color.device)
+        tex_alpha = torch.full((num_points * texels_per_point, 1), 1.0 - 1e-6, dtype=torch.float32, device=base_color.device)
         self._validate_dynamic_texture_layout(tex_color, tex_alpha, self._texture_dims)
         self._tex_color = nn.Parameter(inverse_sigmoid(tex_color.clamp(1e-6, 1 - 1e-6)).requires_grad_(True))
         self._tex_alpha = nn.Parameter(inverse_sigmoid(tex_alpha).requires_grad_(True))
@@ -741,10 +792,10 @@ class GaussianModel:
             if self.texture_dynamic_resolution:
                 self._init_dynamic_textures_from_base_color(torch.clamp(fused_color_rgb, 1e-6, 1 - 1e-6))
             else:
-                tex_color = fused_color_rgb[:, :, None, None].repeat(1, 1, self.texture_resolution, self.texture_resolution)
+                tex_color = fused_color_rgb.clamp(1e-6, 1 - 1e-6)[:, :, None, None].repeat(1, 1, self.texture_resolution, self.texture_resolution)
                 tex_alpha = torch.full(
                     (fused_point_cloud.shape[0], 1, self.texture_resolution, self.texture_resolution),
-                    1.0,
+                    1.0 - 1e-6,
                     dtype=torch.float32,
                     device="cuda",
                 )
@@ -764,8 +815,8 @@ class GaussianModel:
         self.texture_rtg_refine_interval = int(getattr(training_args, "texture_rtg_refine_interval", 1_000))
         self.texture_rtg_refine_fraction = float(getattr(training_args, "texture_rtg_refine_fraction", 0.02))
         self.texture_rtg_ema = float(getattr(training_args, "texture_rtg_ema", 0.9))
-        self.texture_rtg_alpha_weight = float(getattr(training_args, "texture_rtg_alpha_weight", 1.0))
-        self.texture_rtg_min_score = float(getattr(training_args, "texture_rtg_min_score", 1e-5))
+        self.texture_rtg_alpha_weight = float(getattr(training_args, "texture_rtg_alpha_weight", 0.0))
+        self.texture_rtg_min_score = float(getattr(training_args, "texture_rtg_min_score", 1e-10))
         self.texture_rtg_resolution_gamma = float(getattr(training_args, "texture_rtg_resolution_gamma", 1.0))
         self.texture_rtg_chunk_texels = int(getattr(training_args, "texture_rtg_chunk_texels", 262_144))
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
@@ -978,8 +1029,8 @@ class GaussianModel:
         if self.texture_dynamic_resolution:
             self._init_dynamic_textures_from_base_color(base_color)
             return
-        tex_color = base_color[:, :, None, None].repeat(1, 1, tex_res, tex_res)
-        tex_alpha = torch.ones((num_points, 1, tex_res, tex_res), dtype=torch.float32, device="cuda")
+        tex_color = base_color.clamp(1e-6, 1 - 1e-6)[:, :, None, None].repeat(1, 1, tex_res, tex_res)
+        tex_alpha = torch.full((num_points, 1, tex_res, tex_res), 1.0 - 1e-6, dtype=torch.float32, device="cuda")
         self._tex_color = nn.Parameter(inverse_sigmoid(tex_color).requires_grad_(True))
         self._tex_alpha = nn.Parameter(inverse_sigmoid(tex_alpha).requires_grad_(True))
 
@@ -1004,6 +1055,7 @@ class GaussianModel:
                 self._texture_dims = texture_dims.to(device="cuda", dtype=torch.int32) if isinstance(texture_dims, torch.Tensor) else torch.empty(0, device="cuda", dtype=torch.int32)
                 rtg_score = payload.get("rtg_score", torch.empty(0))
                 self._rtg_score = rtg_score.to(device="cuda", dtype=torch.float32) if isinstance(rtg_score, torch.Tensor) else torch.empty(0, device="cuda")
+                self._sanitize_texture_logits_in_place()
                 if self.has_dynamic_textures:
                     self._validate_dynamic_texture_layout(self._tex_color, self._tex_alpha, self._texture_dims)
             else:
@@ -1108,8 +1160,8 @@ class GaussianModel:
                 alpha_values = torch.sigmoid(self._tex_alpha.detach()[src.reshape(-1)]).view(chunk_idx.numel(), res_value, res_value, alpha_channels)
                 color_values = color_values.permute(0, 3, 1, 2).contiguous()
                 alpha_values = alpha_values.permute(0, 3, 1, 2).contiguous()
-                color_up = F.interpolate(color_values, size=(target_res, target_res), mode="bilinear", align_corners=False)
-                alpha_up = F.interpolate(alpha_values, size=(target_res, target_res), mode="bilinear", align_corners=False)
+                color_up = F.interpolate(color_values, size=(target_res, target_res), mode="bilinear", align_corners=True)
+                alpha_up = F.interpolate(alpha_values, size=(target_res, target_res), mode="bilinear", align_corners=True)
                 color_up = inverse_sigmoid(color_up.permute(0, 2, 3, 1).reshape(-1, color_channels).clamp(1e-6, 1 - 1e-6))
                 alpha_up = inverse_sigmoid(alpha_up.permute(0, 2, 3, 1).reshape(-1, alpha_channels).clamp(1e-6, 1 - 1e-6))
                 dst = new_offsets[chunk_idx, None] + local_new[None, :]
@@ -1128,8 +1180,15 @@ class GaussianModel:
             self._rtg_score[selected_pts_mask] = 0.0
         return refined
 
-    def accumulate_texture_rtg(self):
+    def reset_texture_rtg_scores(self):
+        if torch.is_tensor(self._rtg_score) and self._rtg_score.numel() > 0:
+            self._rtg_score.zero_()
+
+    def accumulate_texture_rtg(self, iteration=None):
         if not (self.use_textures and self.texture_rtg_enabled):
+            return
+        if iteration is not None and int(iteration) <= int(self.texture_rtg_refine_from_iter):
+            self.reset_texture_rtg_scores()
             return
         if self._tex_color.grad is None and self._tex_alpha.grad is None:
             return
@@ -1157,10 +1216,10 @@ class GaussianModel:
 
     def refine_textures_by_rtg(self, iteration):
         self._last_rtg_refine_log = {}
-        if iteration < self.texture_rtg_refine_from_iter or iteration > self.texture_rtg_refine_until_iter:
+        if iteration <= self.texture_rtg_refine_from_iter or iteration > self.texture_rtg_refine_until_iter:
             return 0
         interval = max(1, int(self.texture_rtg_refine_interval))
-        if iteration % interval != 0:
+        if (iteration - int(self.texture_rtg_refine_from_iter)) % interval != 0:
             return 0
         flags = {
             "use_textures": bool(self.use_textures),

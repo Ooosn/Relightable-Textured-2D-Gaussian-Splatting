@@ -24,6 +24,7 @@ class ParamGroup:
             "use_shadow_refine_mlp",
             "shadow_backward_stage_enabled",
             "shadow_scale_reg_enabled",
+            "texture_rtg_freeze_gaussian_densify",
         }
         for key, value in vars(self).items():
             shorthand = False
@@ -163,10 +164,11 @@ class OptimizationParams(ParamGroup):
         self.texture_rtg_refine_interval = 1_000
         self.texture_rtg_refine_fraction = 0.02
         self.texture_rtg_ema = 0.9
-        self.texture_rtg_alpha_weight = 1.0
+        self.texture_rtg_alpha_weight = 0.0
         self.texture_rtg_min_score = 1e-10
         self.texture_rtg_resolution_gamma = 1.0
         self.texture_rtg_chunk_texels = 262_144
+        self.texture_rtg_freeze_gaussian_densify = True
         
         self.kd_lr = 0.01
         self.ks_lr = 0.01
