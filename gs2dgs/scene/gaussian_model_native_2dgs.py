@@ -273,13 +273,13 @@ class GaussianModel:
                     f"texels {stats['total_texels']}, avg {stats['avg_texels']:.1f}/G, res {{{hist}}}"
                 )
 
-        self.training_setup(training_args)
         if self.use_textures and self._tex_color.numel() == 0:
             self.initialize_texture_state()
         if self.use_textures and self.has_dynamic_textures:
             self._validate_dynamic_texture_layout(self._tex_color, self._tex_alpha, self._texture_dims)
         if self.use_mbrdf and not isinstance(self.kd, nn.Parameter):
             self.initialize_mbrdf_state()
+        self.training_setup(training_args)
         self.xyz_gradient_accum = xyz_gradient_accum
         self.denom = denom
         try:
@@ -287,7 +287,11 @@ class GaussianModel:
             if converted_static_textures:
                 self._reshape_static_texture_optimizer_state_for_dynamic()
         except ValueError:
-            pass
+            loaded_partial = self._load_optimizer_state_dict_by_group_name(opt_dict)
+            if converted_static_textures:
+                self._reshape_static_texture_optimizer_state_for_dynamic()
+            if not loaded_partial:
+                print("Warning: could not restore optimizer state; continuing with fresh optimizer state.")
 
     @property
     def get_scaling(self):
@@ -404,7 +408,8 @@ class GaussianModel:
                 f"skipped {log.get('reason', 'unknown')}, "
                 f"score mean/max {log.get('score_mean', 0.0):.3e}/{log.get('score_max', 0.0):.3e}, "
                 f"gate mean/max {log.get('gate_mean', 0.0):.3e}/{log.get('gate_max', 0.0):.3e}, "
-                f"candidates {log.get('candidate_count', 0)}/{log.get('eligible_count', 0)}"
+                f"candidates {log.get('candidate_count', 0)}/{log.get('eligible_count', 0)}, "
+                f"budget {log.get('budget_count', 0)}"
             )
         hist = ", ".join(f"{res}x{res}:{count}" for res, count in log.get("hist", []))
         return (
@@ -413,6 +418,7 @@ class GaussianModel:
             f"score mean/max {log['score_mean']:.3e}/{log['score_max']:.3e}, "
             f"gate mean/max {log['gate_mean']:.3e}/{log['gate_max']:.3e}, "
             f"candidates {log['candidate_count']}/{log['eligible_count']}, "
+            f"budget {log.get('budget_count', 0)}, "
             f"res {{{hist}}}"
         )
 
@@ -466,6 +472,101 @@ class GaussianModel:
         n_points = self.get_xyz.shape[0]
         if self._rtg_score.numel() != n_points:
             self._rtg_score = torch.zeros((n_points,), dtype=torch.float32, device=self.get_xyz.device)
+
+    def defer_texture_training(self):
+        device = self.get_xyz.device if isinstance(self.get_xyz, torch.Tensor) and self.get_xyz.numel() > 0 else "cuda"
+        self.use_textures = False
+        self._tex_color = torch.empty(0, device=device)
+        self._tex_alpha = torch.empty(0, device=device)
+        self._texture_dims = torch.empty(0, device=device, dtype=torch.int32)
+        self._rtg_score = torch.empty(0, device=device)
+        if self.optimizer is not None:
+            kept_groups = []
+            for group in self.optimizer.param_groups:
+                if group.get("name") in {"tex_color", "tex_alpha"}:
+                    for param in group.get("params", []):
+                        self.optimizer.state.pop(param, None)
+                else:
+                    kept_groups.append(group)
+            self.optimizer.param_groups[:] = kept_groups
+
+    def _add_texture_optimizer_groups(self, training_args):
+        if self.optimizer is None:
+            return
+        existing = {group.get("name") for group in self.optimizer.param_groups}
+        if "tex_color" not in existing:
+            self.optimizer.add_param_group(
+                {"params": [self._tex_color], "lr": training_args.texture_lr, "name": "tex_color"}
+            )
+        if "tex_alpha" not in existing:
+            self.optimizer.add_param_group(
+                {"params": [self._tex_alpha], "lr": training_args.texture_lr, "name": "tex_alpha"}
+            )
+
+    def enable_texture_training(self, training_args):
+        if self.use_textures and self._tex_color.numel() > 0:
+            return False
+        self.use_textures = True
+        self.texture_rtg_enabled = bool(getattr(training_args, "texture_rtg_enabled", False))
+        self.texture_rtg_refine_from_iter = int(getattr(training_args, "texture_rtg_refine_from_iter", 30_000))
+        self.texture_rtg_refine_until_iter = int(getattr(training_args, "texture_rtg_refine_until_iter", 100_000))
+        self.texture_rtg_refine_interval = int(getattr(training_args, "texture_rtg_refine_interval", 1_000))
+        self.texture_rtg_refine_fraction = float(getattr(training_args, "texture_rtg_refine_fraction", 0.02))
+        self.texture_rtg_ema = float(getattr(training_args, "texture_rtg_ema", 0.9))
+        self.texture_rtg_alpha_weight = float(getattr(training_args, "texture_rtg_alpha_weight", 0.0))
+        self.texture_rtg_min_score = float(getattr(training_args, "texture_rtg_min_score", 1e-10))
+        self.texture_rtg_resolution_gamma = float(getattr(training_args, "texture_rtg_resolution_gamma", 1.0))
+        self.texture_rtg_chunk_texels = int(getattr(training_args, "texture_rtg_chunk_texels", 262_144))
+        if self._tex_color.numel() == 0:
+            self.initialize_texture_state()
+        if self.use_textures and self.texture_dynamic_resolution and not self.has_dynamic_textures:
+            self._convert_static_textures_to_dynamic()
+        self._sanitize_texture_logits_in_place()
+        self._ensure_rtg_buffers()
+        self._add_texture_optimizer_groups(training_args)
+        if self.has_dynamic_textures:
+            self._validate_dynamic_texture_layout(self._tex_color, self._tex_alpha, self._texture_dims)
+        return True
+
+    def _load_optimizer_state_dict_by_group_name(self, opt_dict):
+        if self.optimizer is None or not isinstance(opt_dict, dict):
+            return False
+        saved_groups = opt_dict.get("param_groups", [])
+        saved_state = opt_dict.get("state", {})
+        if not isinstance(saved_groups, list) or not isinstance(saved_state, dict):
+            return False
+        current_by_name = {
+            group.get("name"): group
+            for group in self.optimizer.param_groups
+            if isinstance(group, dict) and len(group.get("params", [])) > 0 and group.get("name") is not None
+        }
+        loaded = False
+        for saved_group in saved_groups:
+            name = saved_group.get("name")
+            current_group = current_by_name.get(name)
+            saved_params = saved_group.get("params", [])
+            current_params = current_group.get("params", []) if current_group is not None else []
+            if current_group is None or len(saved_params) != len(current_params):
+                continue
+            for saved_param_id, current_param in zip(saved_params, current_params):
+                state = saved_state.get(saved_param_id)
+                if not isinstance(state, dict):
+                    continue
+                current_state = {}
+                compatible = True
+                for key, value in state.items():
+                    if isinstance(value, torch.Tensor):
+                        if key in {"exp_avg", "exp_avg_sq"} and value.shape != current_param.shape:
+                            compatible = False
+                            break
+                        current_state[key] = value.to(device=current_param.device, dtype=current_param.dtype)
+                    else:
+                        current_state[key] = value
+                if not compatible:
+                    continue
+                self.optimizer.state[current_param] = current_state
+                loaded = True
+        return loaded
 
     def _replace_dynamic_texture_tensors(self, tex_color, tex_alpha, texture_dims, tex_color_state=None, tex_alpha_state=None):
         self._validate_dynamic_texture_layout(tex_color, tex_alpha, texture_dims)
@@ -533,18 +634,24 @@ class GaussianModel:
                 gathered_state[key] = gathered
         return gathered_state or None
 
-    def _append_dynamic_optimizer_state(self, name, appended_texels):
+    def _append_dynamic_optimizer_state(self, name, selected_pts_mask, repeat_count=1):
         state = self._optimizer_state_for_name(name)
         if not isinstance(state, dict):
             return None
-        appended_texels = int(appended_texels)
+        repeat_count = max(1, int(repeat_count))
+        selected_counts = self._texture_counts()[selected_pts_mask]
+        appended_texels = int(selected_counts.sum().item()) * repeat_count
         appended_state = {}
         for key in ("exp_avg", "exp_avg_sq"):
             value = state.get(key)
             if not isinstance(value, torch.Tensor) or value.shape[0] != self._tex_color.shape[0]:
                 continue
-            zeros = torch.zeros((appended_texels, value.shape[1]), dtype=value.dtype, device=value.device)
-            appended_state[key] = torch.cat([value, zeros], dim=0)
+            selected_value = self._gather_dynamic_tensor_by_mask(value, selected_pts_mask)
+            if selected_value is None:
+                selected_value = torch.zeros((appended_texels, value.shape[1]), dtype=value.dtype, device=value.device)
+            elif repeat_count > 1:
+                selected_value = selected_value.repeat(repeat_count, 1)
+            appended_state[key] = torch.cat([value, selected_value], dim=0)
         return appended_state or None
 
     def _resize_dynamic_optimizer_state(self, name, old_dims, new_resolutions):
@@ -1098,8 +1205,8 @@ class GaussianModel:
         texture_dims = self._build_texture_dims_from_resolutions(torch.cat([old_resolutions, new_resolutions], dim=0))
         tex_color = torch.cat([self._tex_color.detach(), selected_color], dim=0)
         tex_alpha = torch.cat([self._tex_alpha.detach(), selected_alpha], dim=0)
-        tex_color_state = self._append_dynamic_optimizer_state("tex_color", selected_color.shape[0])
-        tex_alpha_state = self._append_dynamic_optimizer_state("tex_alpha", selected_alpha.shape[0])
+        tex_color_state = self._append_dynamic_optimizer_state("tex_color", selected_pts_mask, repeat_count)
+        tex_alpha_state = self._append_dynamic_optimizer_state("tex_alpha", selected_pts_mask, repeat_count)
         if self._rtg_score.numel() == old_resolutions.shape[0]:
             self._rtg_score = torch.cat(
                 [self._rtg_score, torch.zeros((new_resolutions.shape[0],), dtype=torch.float32, device=self._rtg_score.device)],
@@ -1254,6 +1361,8 @@ class GaussianModel:
         if base_gate > 0:
             valid = torch.logical_and(valid, self._rtg_score >= score_gate)
         candidate_count = int(valid.sum().item())
+        fraction = max(0.0, float(self.texture_rtg_refine_fraction))
+        budget_count = max(1, int(np.ceil(num_eligible * fraction))) if fraction > 0.0 else 0
         if candidate_count == 0:
             eligible_scores = self._rtg_score[eligible].detach()
             eligible_gates = score_gate[eligible].detach()
@@ -1266,18 +1375,19 @@ class GaussianModel:
                 "gate_max": float(eligible_gates.max().item()) if eligible_gates.numel() > 0 else 0.0,
                 "candidate_count": int(candidate_count),
                 "eligible_count": int(num_eligible),
+                "budget_count": int(budget_count),
             }
             return 0
-        fraction = max(0.0, float(self.texture_rtg_refine_fraction))
         if fraction <= 0.0:
             self._last_rtg_refine_log = {
                 "skipped": True,
                 "reason": "zero_fraction",
                 "candidate_count": int(candidate_count),
                 "eligible_count": int(num_eligible),
+                "budget_count": int(budget_count),
             }
             return 0
-        k = max(1, int(np.ceil(candidate_count * fraction)))
+        k = min(candidate_count, budget_count)
         valid_idx = torch.nonzero(valid, as_tuple=False).flatten()
         priority = self._rtg_score / resolution_scale
         top_priority, top_order = torch.topk(priority[valid_idx], k=min(k, valid_idx.numel()), largest=True)
@@ -1293,6 +1403,7 @@ class GaussianModel:
                 "gate_max": float(selected_gates.max().item()) if selected_gates.numel() > 0 else 0.0,
                 "candidate_count": int(candidate_count),
                 "eligible_count": int(num_eligible),
+                "budget_count": int(budget_count),
             }
             return 0
         selected = torch.zeros_like(valid)
@@ -1306,6 +1417,7 @@ class GaussianModel:
                 "reason": "empty_selection_after_resize",
                 "candidate_count": int(candidate_count),
                 "eligible_count": int(num_eligible),
+                "budget_count": int(budget_count),
             }
             return 0
         before_stats = self._dynamic_texture_stats()
@@ -1328,6 +1440,7 @@ class GaussianModel:
                 "gate_max": float(selected_gates.max().item()) if selected_gates.numel() > 0 else 0.0,
                 "candidate_count": int(candidate_count),
                 "eligible_count": int(num_eligible),
+                "budget_count": int(budget_count),
             }
         return refined
 

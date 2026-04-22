@@ -556,6 +556,15 @@ def training(modelset, opt, pipe, testing_iterations, saving_iterations, checkpo
     """
     checkpoint_payload = torch.load(checkpoint, weights_only=False) if checkpoint else None
     scene = Scene(modelset, gaussians, opt=opt, shuffle=True, checkpoint=checkpoint, checkpoint_state=checkpoint_payload)
+    texture_training_requested = bool(getattr(modelset, "use_textures", False))
+    texture_start_iter = int(getattr(opt, "texture_start_iter", 0))
+    delayed_texture_training = texture_training_requested and texture_start_iter > 0
+    if delayed_texture_training:
+        print(
+            f"Texture training delayed until iter>{texture_start_iter}; "
+            "Gaussian/MBRDF training runs without texture charts before that.",
+            flush=True,
+        )
     
     # 按照 opt对象 初始化参数设置
 
@@ -573,8 +582,20 @@ def training(modelset, opt, pipe, testing_iterations, saving_iterations, checkpo
                 reset_rtg_scores()
         if isinstance(checkpoint_payload, dict):
             _restore_rng_state(checkpoint_payload.get("rng_state"))
+        if delayed_texture_training and int(first_iter) < texture_start_iter:
+            gaussians.defer_texture_training()
+            print(f"Deferred texture state from checkpoint at iter {first_iter}.", flush=True)
     else:
+        if delayed_texture_training:
+            gaussians.defer_texture_training()
         gaussians.training_setup(opt)
+    if (
+        texture_training_requested
+        and int(first_iter) >= texture_start_iter
+        and not bool(getattr(gaussians, "use_textures", False))
+    ):
+        if gaussians.enable_texture_training(opt):
+            print(f"Enabled texture training immediately after restore at iter {first_iter}.", flush=True)
     
     # 设置背景颜色，1,1,1,1,0,0,0表示白色背景，0,0,0,0,0,0,0表示黑色背景
     bg_color = [1, 1, 1, 1, 0, 0, 0] if modelset.white_background else [0, 0, 0, 0, 0, 0, 0]
@@ -683,6 +704,23 @@ def training(modelset, opt, pipe, testing_iterations, saving_iterations, checkpo
         iter_start.record()    # 记录迭代开始的时间
         if torch.cuda.is_available():
             torch.cuda.reset_peak_memory_stats()
+
+        if (
+            texture_training_requested
+            and texture_start_iter > 0
+            and iteration > texture_start_iter
+            and not bool(getattr(gaussians, "use_textures", False))
+        ):
+            if gaussians.enable_texture_training(opt):
+                stats_method = getattr(gaussians, "_dynamic_texture_stats", None)
+                stats = stats_method() if callable(stats_method) else {}
+                hist = ", ".join(f"{res}x{res}:{count}" for res, count in stats.get("hist", []))
+                print(
+                    f"\n[ITER {iteration}] Texture training enabled | "
+                    f"texels {stats.get('total_texels', 0)}, "
+                    f"avg {stats.get('avg_texels', 0.0):.1f}/G, res {{{hist}}}",
+                    flush=True,
+                )
 
         # update lr of asg
         gaussians.update_learning_rate(iteration, \

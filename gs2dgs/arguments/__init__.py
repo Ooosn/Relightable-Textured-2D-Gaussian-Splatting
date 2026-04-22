@@ -158,6 +158,7 @@ class OptimizationParams(ParamGroup):
         self.position_lr_max_steps = 30_000
         self.feature_lr = 0.0025
         self.texture_lr = 0.0025
+        self.texture_start_iter = 0
         self.texture_rtg_enabled = False
         self.texture_rtg_refine_from_iter = 30_000
         self.texture_rtg_refine_until_iter = 100_000

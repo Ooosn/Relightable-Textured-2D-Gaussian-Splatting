@@ -111,6 +111,16 @@ Required switches:
 - `--texture_rtg_enabled`
 - `--texture_effect_mode per_uv`
 
+Optional delayed texture warmup:
+
+- `--texture_start_iter 30000`
+
+With this enabled, training runs without texture charts through iteration
+`30000`. On the next iteration, the current learned per-Gaussian base color is
+expanded into the initial dynamic texture atlas, so every Gaussian starts as a
+uniform `texture_min_resolution x texture_min_resolution` chart and only then
+learns per-texel variation.
+
 For a quick PC sanity test, force RTG refinement to happen early:
 
 ```powershell
@@ -170,6 +180,7 @@ What to check:
 
 The default RTG schedule starts later:
 
+- `--texture_start_iter 0`
 - `--texture_rtg_refine_from_iter 30000`
 - `--texture_rtg_refine_until_iter 100000`
 - `--texture_rtg_refine_interval 1000`
