@@ -223,14 +223,15 @@ It also appends every `10000` iterations to `test_iterations`, so long runs
 write evaluation metrics at regular 10k intervals in addition to the default
 early `7000` check and the final evaluation.
 
-It also appends the default resume milestones `30000` and `40000` whenever
-the requested total iteration count reaches them.
+It also appends every `30000` iterations to both `save_iterations` and
+`checkpoint_iterations`, so long runs keep matched point-cloud saves and full
+training checkpoints at 30k intervals.
 
 That means a normal run will automatically:
 
-- save the final point cloud,
+- save point clouds at 30k intervals plus the final point cloud,
 - run regular 10k evaluations plus final evaluation,
-- save the final full checkpoint.
+- save full checkpoints at 30k intervals plus the final full checkpoint.
 
 When RTG dynamic texture refinement is enabled, `train.py` also appends
 `--texture_rtg_refine_from_iter` to `checkpoint_iterations`. With the

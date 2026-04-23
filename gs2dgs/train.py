@@ -1453,15 +1453,17 @@ if __name__ == "__main__":
     for eval_iter in range(10_000, args.iterations + 1, 10_000):
         if eval_iter not in args.test_iterations:
             args.test_iterations.append(eval_iter)
+    for save_iter in range(30_000, args.iterations + 1, 30_000):
+        if save_iter not in args.save_iterations:
+            args.save_iterations.append(save_iter)
+        if save_iter not in args.checkpoint_iterations:
+            args.checkpoint_iterations.append(save_iter)
     if args.iterations not in args.save_iterations:
         args.save_iterations.append(args.iterations)
     if args.iterations not in args.test_iterations:
         args.test_iterations.append(args.iterations)
     if args.iterations not in args.checkpoint_iterations:
         args.checkpoint_iterations.append(args.iterations)
-    for resume_iter in (30_000, 40_000):
-        if resume_iter <= args.iterations and resume_iter not in args.checkpoint_iterations:
-            args.checkpoint_iterations.append(resume_iter)
     if bool(getattr(args, "texture_rtg_enabled", False)) and bool(getattr(args, "texture_dynamic_resolution", False)):
         rtg_start_iter = int(getattr(args, "texture_rtg_refine_from_iter", 0))
         if 0 < rtg_start_iter <= args.iterations and rtg_start_iter not in args.checkpoint_iterations:
