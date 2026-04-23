@@ -1587,6 +1587,11 @@ class GaussianModel:
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
 
+    def reset_densification_accumulators(self):
+        self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
+        self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
+        self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
+
     @staticmethod
     def _diagnostic_stats(values, prefix):
         if values is None:
@@ -1596,6 +1601,8 @@ class GaussianModel:
                 f"{prefix}_p05": None,
                 f"{prefix}_median": None,
                 f"{prefix}_p95": None,
+                f"{prefix}_p99": None,
+                f"{prefix}_p999": None,
                 f"{prefix}_max": None,
             }
         flat = values.detach().reshape(-1).float()
@@ -1607,6 +1614,8 @@ class GaussianModel:
                 f"{prefix}_p05": None,
                 f"{prefix}_median": None,
                 f"{prefix}_p95": None,
+                f"{prefix}_p99": None,
+                f"{prefix}_p999": None,
                 f"{prefix}_max": None,
             }
         return {
@@ -1615,6 +1624,8 @@ class GaussianModel:
             f"{prefix}_p05": float(torch.quantile(flat, 0.05).item()),
             f"{prefix}_median": float(flat.median().item()),
             f"{prefix}_p95": float(torch.quantile(flat, 0.95).item()),
+            f"{prefix}_p99": float(torch.quantile(flat, 0.99).item()),
+            f"{prefix}_p999": float(torch.quantile(flat, 0.999).item()),
             f"{prefix}_max": float(flat.max().item()),
         }
 
@@ -1773,6 +1784,7 @@ class GaussianModel:
         stats["num_points_after"] = int(self.get_xyz.shape[0])
         stats["num_pruned"] = int(stats["densify_prune_unique_count"])
         self.last_densify_stats = stats
+        self.reset_densification_accumulators()
         torch.cuda.empty_cache()
         return int(num_clone), int(num_split)
 

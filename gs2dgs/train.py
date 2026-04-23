@@ -632,6 +632,7 @@ def training(modelset, opt, pipe, testing_iterations, saving_iterations, checkpo
     densify_log_path = convergence_dir / "densify_events.jsonl"
     train_health_interval = max(_get_env_int("SSGS_TRAIN_HEALTH", 0), 0)
     collect_backward_stats = os.environ.get("SSGS_BACKWARD_INFO", "0") == "1"
+    last_gaussian_densify_iter = max(int(getattr(opt, "densify_from_iter", 0)), int(first_iter) - 1)
     """
     相位函数（Phase Function） 是一个来自图形学和物理学的概念，主要用于描述光与介质相互作用时，光的散射方向分布。
     本文中，即为神经相位函数（Neural Phase Function），是一个用于描述材质表面散射特性的神经网络模型。
@@ -899,7 +900,12 @@ def training(modelset, opt, pipe, testing_iterations, saving_iterations, checkpo
         # torch.no_grad() 防止污染计算图，加快计算速度
         with torch.no_grad():
             in_gaussian_densify_window = iteration < gaussian_densify_until_iter
-            densify_due = in_gaussian_densify_window and iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0
+            densify_due = (
+                in_gaussian_densify_window
+                and not opt_test
+                and iteration > opt.densify_from_iter
+                and iteration - last_gaussian_densify_iter >= opt.densification_interval
+            )
             opacity_reset_due = in_gaussian_densify_window and (iteration % opt.opacity_reset_interval == 0 or (modelset.white_background and iteration == opt.densify_from_iter))
             health_due = (
                 iteration in testing_iterations
@@ -1030,7 +1036,7 @@ def training(modelset, opt, pipe, testing_iterations, saving_iterations, checkpo
                     gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter, image.shape[2], image.shape[1], render_pkg["out_weight"])
 
                     # 如果迭代次数大于高斯密集化开始迭代次数，并且迭代次数是高斯密集化迭代间隔的倍数，则进行高斯密集化
-                    if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
+                    if densify_due:
                         # size_threshold 是高斯密集化过程中，高斯点尺寸阈值
                         size_threshold = 20 if iteration > opt.opacity_reset_interval else None
                         # 进行高斯密集化(复制和分裂)，传入的最大梯度，最小透明度，场景范围（相机视锥），尺寸阈值
@@ -1097,6 +1103,7 @@ def training(modelset, opt, pipe, testing_iterations, saving_iterations, checkpo
                             }
                         )
                         append_jsonl(densify_log_path, densify_diag)
+                        last_gaussian_densify_iter = iteration
                         if record_info is not None:
                             record_info["num_clone_ratio"] = record_info["num_clone_ratio"]*0.7 + num_clone / gaussians.get_xyz.shape[0]*0.3
                             record_info["num_split_ratio"] = record_info["num_split_ratio"]*0.7 + num_split / gaussians.get_xyz.shape[0]*0.3
