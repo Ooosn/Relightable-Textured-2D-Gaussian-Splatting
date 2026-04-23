@@ -62,11 +62,14 @@ class GaussianModel2DGSAdapter(_BaseGaussianModel2DGS):
                 param_group["lr"] = self.neural_phasefunc_scheduler_args(max(0, iteration - freeze_phasefunc_steps))
 
     def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size, bigsize_threshold=None, crop_extent=None):
-        before = int(self.get_xyz.shape[0])
-        super().densify_and_prune(max_grad, min_opacity, extent, max_screen_size)
-        after = int(self.get_xyz.shape[0])
-        # 2dgs native implementation does not report clone/split counts.
-        return 0, max(after - before, 0)
+        return super().densify_and_prune(
+            max_grad,
+            min_opacity,
+            extent,
+            max_screen_size,
+            bigsize_threshold=bigsize_threshold,
+            crop_extent=crop_extent,
+        )
 
     def add_densification_stats(self, viewspace_point_tensor, update_filter, image_width=None, image_height=None, out_weight=None):
         return super().add_densification_stats(viewspace_point_tensor, update_filter)

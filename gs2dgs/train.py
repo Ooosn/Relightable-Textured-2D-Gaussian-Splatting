@@ -1083,6 +1083,7 @@ def training(modelset, opt, pipe, testing_iterations, saving_iterations, checkpo
                         num_points_before = gaussians.get_xyz.shape[0]
                         num_clone, num_split = gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold, opt.bigsize_threshold, crop_extent)
                         num_points_after = gaussians.get_xyz.shape[0]
+                        densify_diag.update(getattr(gaussians, "last_densify_stats", {}) or {})
                         densify_diag.update(
                             {
                                 "num_clone": int(num_clone),
