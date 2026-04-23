@@ -5,6 +5,8 @@ view_num=2000
 output_dir="/home/wangyy/data_download/gsrelight_runs/gs3"
 model="Pixiu"
 
+export PYTHONPATH="/home/wangyy/RTS/gs3/submodules/simple-knn:/home/wangyy/RTS/gs3/submodules/diff-gaussian-rasterization:/home/wangyy/RTS/gs3/submodules/diff-gaussian-rasterization_light:/home/wangyy/RTS/gs3/submodules/diff-gaussian-rasterization_hgs:/home/wangyy/RTS/gs3/submodules/v_3dgs:/home/wangyy/RTS/gs3/submodules/v_3dgs_ortho:/home/wangyy/RTS/gs3${PYTHONPATH:+:${PYTHONPATH}}"
+
 ## ==========================================================
 ## =======================LightStage=========================
 
