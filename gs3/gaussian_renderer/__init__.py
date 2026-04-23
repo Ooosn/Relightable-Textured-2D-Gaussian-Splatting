@@ -25,9 +25,9 @@ _SUBMODULE_PATHS = [
     os.path.join(_REPO_ROOT, "submodules", "diff-gaussian-rasterization_hgs"),
     os.path.join(_REPO_ROOT, "submodules", "v_3dgs"),
     os.path.join(_REPO_ROOT, "submodules", "v_3dgs_ortho"),
-    os.path.join(_REPO_ROOT, "..", "2dgs", "submodules", "surfel-texture"),
-    os.path.join(_REPO_ROOT, "..", "2dgs", "submodules", "surfel-texture-deferred"),
-    os.path.join(_REPO_ROOT, "..", "2dgs", "submodules", "diff-surfel-rasterization-shadow"),
+    os.path.join(_REPO_ROOT, "..", "gs2dgs", "submodules", "surfel-texture"),
+    os.path.join(_REPO_ROOT, "..", "gs2dgs", "submodules", "surfel-texture-deferred"),
+    os.path.join(_REPO_ROOT, "..", "gs2dgs", "submodules", "diff-surfel-rasterization-shadow"),
 ]
 for _path in reversed(_SUBMODULE_PATHS):
     if os.path.isdir(_path) and _path not in sys.path:
@@ -1479,5 +1479,4 @@ def _NdotWi(nrm, wi, elu, a):
     """
     tmp  = a * (1. - 1 / math.e)
     return (elu(_dot(nrm, wi)) + tmp) / (1. + tmp)
-
 

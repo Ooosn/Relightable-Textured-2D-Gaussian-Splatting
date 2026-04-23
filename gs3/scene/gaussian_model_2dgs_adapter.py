@@ -1,5 +1,6 @@
 import importlib.util
 import os
+import sys
 from pathlib import Path
 
 import torch
@@ -8,7 +9,13 @@ from torch import nn
 
 _THIS_DIR = Path(__file__).resolve().parent
 _ROOT = _THIS_DIR.parent.parent
+_SIMPLE_KNN_PATH = _ROOT / "gs2dgs" / "submodules" / "simple-knn"
 _SRC = _ROOT / "2dgs" / "scene" / "gaussian_model.py"
+
+if _SIMPLE_KNN_PATH.is_dir():
+    _simple_knn = str(_SIMPLE_KNN_PATH)
+    if _simple_knn not in sys.path:
+        sys.path.insert(0, _simple_knn)
 
 _SPEC = importlib.util.spec_from_file_location("gaussian_model_2dgs_impl", _SRC)
 _MOD = importlib.util.module_from_spec(_SPEC)
