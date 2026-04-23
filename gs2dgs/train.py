@@ -1450,6 +1450,9 @@ if __name__ == "__main__":
 
     # 令 args 包含 parser 中定义的所有参数的键和值
     args = parser.parse_args(sys.argv[1:])  # argument vector， 第一位是文件名，所以从第二位开始解析
+    for eval_iter in range(10_000, args.iterations + 1, 10_000):
+        if eval_iter not in args.test_iterations:
+            args.test_iterations.append(eval_iter)
     if args.iterations not in args.save_iterations:
         args.save_iterations.append(args.iterations)
     if args.iterations not in args.test_iterations:
@@ -1463,6 +1466,9 @@ if __name__ == "__main__":
         rtg_start_iter = int(getattr(args, "texture_rtg_refine_from_iter", 0))
         if 0 < rtg_start_iter <= args.iterations and rtg_start_iter not in args.checkpoint_iterations:
             args.checkpoint_iterations.append(rtg_start_iter)
+    args.test_iterations = sorted(set(args.test_iterations))
+    args.save_iterations = sorted(set(args.save_iterations))
+    args.checkpoint_iterations = sorted(set(args.checkpoint_iterations))
     
     # Prepare training
     print("Optimizing " + args.model_path)

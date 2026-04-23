@@ -219,13 +219,17 @@ charts need stronger relighting-aware texture gradients to keep growing.
 - `test_iterations`
 - `checkpoint_iterations`
 
+It also appends every `10000` iterations to `test_iterations`, so long runs
+write evaluation metrics at regular 10k intervals in addition to the default
+early `7000` check and the final evaluation.
+
 It also appends the default resume milestones `30000` and `40000` whenever
 the requested total iteration count reaches them.
 
 That means a normal run will automatically:
 
 - save the final point cloud,
-- run final evaluation,
+- run regular 10k evaluations plus final evaluation,
 - save the final full checkpoint.
 
 When RTG dynamic texture refinement is enabled, `train.py` also appends
