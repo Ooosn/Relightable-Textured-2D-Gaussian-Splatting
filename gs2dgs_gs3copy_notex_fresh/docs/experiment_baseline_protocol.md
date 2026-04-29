@@ -17,15 +17,21 @@ The goal is:
 If no-texture in `gs2dgs_gs3copy_notex_fresh` does not match the `gs3` baseline,
 do not interpret texture results.
 
-## Trusted Script
+## Trusted Scripts
 
-Use this script as the canonical parameter source:
+Use this script as the canonical Fish no-texture / texture comparison runner:
+
+```text
+/home/wangyy/RTS/gs2dgs_gs3copy_notex_fresh/experiments/fish_testsh_protocol.sh
+```
+
+The simple local baseline script is:
 
 ```text
 /home/wangyy/RTS/gs2dgs_gs3copy_notex_fresh/test.sh
 ```
 
-Do not hand-type a training command when this script can be used.
+Do not hand-type a training command when one of these scripts can be used.
 
 As of this note, the dataset line is:
 
@@ -44,13 +50,13 @@ Fish, do not use Pixiu results or Pixiu checkpoints as evidence.
 
 ## Fixed Baseline Parameters
 
-These parameters come from `test.sh` and must remain aligned unless the change
-is deliberately documented:
+These parameters come from `experiments/fish_testsh_protocol.sh` and must
+remain aligned unless the change is deliberately documented:
 
 ```text
 view_num=2000
 data_device=cpu
-iterations=30000
+iterations=100000
 asg_freeze_step=22000
 spcular_freeze_step=9000
 fit_linear_step=7000
@@ -68,9 +74,9 @@ freeze_phasefunc_steps=50000
 neural_phasefunc_lr_max_steps=50000
 position_lr_max_steps=70000
 densify_until_iter=90000
-test_iterations=10000 20000 30000
-save_iterations=10000 20000 30000
-checkpoint_iterations=10000 20000 30000
+test_iterations=10000 20000 30000 40000 50000 60000 70000 80000 90000 100000
+save_iterations=10000 20000 30000 40000 50000 60000 70000 80000 90000 100000
+checkpoint_iterations=10000 20000 30000 40000 50000 60000 70000 80000 90000 100000
 unfreeze_iterations=5000
 use_nerual_phasefunc=true
 cam_opt=true
@@ -78,6 +84,36 @@ pl_opt=true
 densify_grad_threshold=0.00015
 eval=true
 ```
+
+## Launch And Import Rules
+
+Do not use `conda run` for long training in this project. It delays or buffers
+logs and makes failures harder to localize. Use the environment Python directly:
+
+```bash
+/home/wangyy/miniconda3/envs/gs3/bin/python -u train.py ...
+```
+
+Do not judge CUDA extension health with a bare extension import. A command such
+as this is not equivalent to the training import order:
+
+```bash
+python -c "import simple_knn._C"
+```
+
+The training process imports `torch` first, which loads the PyTorch shared
+libraries such as `libc10.so`. If an import smoke test is needed, use the same
+order:
+
+```bash
+ROOT=/home/wangyy/RTS/gs2dgs_gs3copy_notex_fresh
+PYTHONPATH="$ROOT/submodules/simple-knn:$ROOT/submodules/diff-gaussian-rasterization:$ROOT/submodules/diff-gaussian-rasterization_light:$ROOT/submodules/diff-gaussian-rasterization_hgs:$ROOT/submodules/v_3dgs:$ROOT/submodules/v_3dgs_ortho:$ROOT/../2dgs/submodules/surfel-texture:$ROOT/../2dgs/submodules/surfel-texture-deferred:$ROOT/../2dgs/submodules/diff-surfel-rasterization-shadow:$ROOT" \
+/home/wangyy/miniconda3/envs/gs3/bin/python -u -c "import torch; import simple_knn._C, diff_gaussian_rasterization, diff_gaussian_rasterization_light, v_3dgs; print('imports ok')"
+```
+
+For real validation, prefer a short training launch with the same script and
+environment that will be used for the actual run. A synthetic import check is
+only a smoke test.
 
 ## Known Good Fish Baseline Runs
 
@@ -201,4 +237,3 @@ For any new texture experiment:
    - texture resolution state if RTG is enabled.
 
 If any of these fields are missing, the run should be treated as non-comparable.
-

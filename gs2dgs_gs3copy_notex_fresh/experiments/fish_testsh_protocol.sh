@@ -7,6 +7,10 @@ set -euo pipefail
 # texture comparisons in this copy.  Keep the common optimization arguments
 # identical to gs3/test.sh; texture experiments may only add texture flags and,
 # for resume comparisons, a start checkpoint.
+#
+# Launch rule: use the environment Python directly, not `conda run`, for
+# training.  If CUDA imports need a smoke test, import torch first; bare
+# extension imports can fail on libc10.so even when training imports are fine.
 
 ROOT="${ROOT:-/home/wangyy/RTS/gs2dgs_gs3copy_notex_fresh}"
 DATA_ROOT="${DATA_ROOT:-/home/wangyy/data_download/gsrelight}"
