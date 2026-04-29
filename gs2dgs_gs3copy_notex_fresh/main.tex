@@ -1,0 +1,129 @@
+% Replace the citation keys below with the ones in your own .bib file.
+
+\section{Introduction}
+\label{sec:intro}
+
+3D Gaussian Splatting (3DGS) has emerged as a powerful representation for novel view synthesis and scene reconstruction due to its high visual fidelity and real-time rendering capability~\cite{3dgs}. Despite this progress, optimizing 3DGS from RGB supervision alone remains under-constrained for geometry and visibility, often leading to floaters, over-expanded structures, and inconsistent occlusion. To mitigate these issues, recent methods increasingly incorporate auxiliary supervision signals such as depth, normals, masks, edges, and frequency priors~\cite{depth_supervision_3dgs, normal_supervision_3dgs, edge_prior_3dgs, frequency_prior_3dgs}. These cues provide structural constraints beyond photometric reconstruction and have become an effective route toward more stable and accurate Gaussian learning.
+
+Among such cues, \emph{cast shadows} remain surprisingly underexplored. This is notable because shadows are one of the most common geometry-sensitive signals in visual observations. Unlike depth or normals, which mainly describe local surface geometry, cast shadows encode light-space visibility, occlusion ordering, contact relationships, and global spatial arrangement. As a result, shadow observations offer a supervision signal that is complementary to conventional geometric cues: they constrain not only local shape, but also how scene elements are spatially organized with respect to illumination and mutual occlusion. This property makes shadows particularly attractive for improving geometry and visibility reasoning in Gaussian reconstruction.
+
+However, turning shadows into a useful training signal is challenging. Cast-shadow formation is governed by occlusion events, and the resulting visibility changes can be highly non-smooth with respect to Gaussian position, scale, and opacity. Existing Gaussian-based shadow methods therefore mainly use shadows as forward cues for relighting, illumination decomposition, or domain-specific rendering constraints~\cite{gaussian_shadow_casting, gs3, rng, shadowgs}, rather than as an explicit differentiable supervision operator for 3DGS optimization. Consequently, the role of cast shadows in Gaussian reconstruction remains unclear: while shadows are physically informative, it is still underexplored whether they can be systematically integrated into training as a geometry-aware supervisory signal.
+
+In this paper, we answer this question affirmatively. We present a shadow-supervised 3DGS framework built on a differentiable cast-shadow function for Gaussian primitives. Our key idea is to explicitly model light-space visibility and propagate shadow errors back to Gaussian parameters, thereby converting cast shadows from a forward rendering artifact into a geometry-aware training cue. Rather than addressing in-the-wild shadow extraction or full inverse rendering, we focus on controlled illumination settings where the light direction is known or approximately available, allowing us to isolate the effect of shadow supervision itself. Experiments show that our formulation provides supervision complementary to existing cues and consistently improves geometry quality, occlusion consistency, and shadow-aware rendering.
+
+\noindent\textbf{Contributions.}
+Our contributions are three-fold:
+\begin{itemize}
+    \item We introduce cast shadows as a new supervision paradigm for 3D Gaussian reconstruction, and formulate shadow supervision as a light-space visibility learning problem.
+    
+    \item We derive a differentiable cast-shadow function for Gaussian primitives that enables shadow errors to be explicitly back-propagated to Gaussian geometry, scale, and opacity.
+    
+    \item We build a shadow-supervised 3DGS framework and demonstrate through extensive experiments and ablations that shadow supervision is complementary to existing cues, improving geometry, occlusion reasoning, and shadow-consistent rendering under controlled illumination.
+\end{itemize}
+
+\section{Method}
+\label{sec:method}
+
+\subsection{Overview}
+Let a scene be represented by a set of 3D Gaussians $\mathcal{G}=\{g_i\}_{i=1}^N$, where each Gaussian carries position, scale, rotation, opacity, and appearance parameters. Given a camera view and a known light source, our method performs two coupled splatting passes. First, we rasterize the Gaussians from the light view to estimate a differentiable cast-shadow signal for each Gaussian. Second, we render the scene from the target camera while using the estimated shadow as an explicit modulation term. This makes cast-shadow errors directly informative for Gaussian optimization rather than treating shadows as a purely forward rendering effect.
+
+The key design choice is to formulate shadows in \emph{light space}. Instead of only reasoning about view-space color consistency, we explicitly model which Gaussians attenuate the incoming light of other Gaussians. This yields a shadow signal that is sensitive to geometry, occlusion ordering, and spatial arrangement with respect to illumination.
+
+\subsection{Light-Space Differentiable Cast Shadows}
+\label{sec:method_shadow}
+
+For a light-space pixel $p$ and a Gaussian $g_i$, let $\mathcal{K}_{p,i}$ denote the projected 2D Gaussian response at that pixel. We use this response to define the corresponding light-space opacity contribution
+\begin{equation}
+\alpha_{p,i} = o_i \, \mathcal{K}_{p,i},
+\end{equation}
+where $o_i$ is the Gaussian opacity.
+
+To capture cast-shadow formation, we compute an offset-aware transmittance from the light toward each Gaussian. Specifically, for Gaussian $g_i$ we consider the set of Gaussians that are in front of it along the light ray and are sufficiently separated in depth:
+\begin{equation}
+\mathcal{F}(p,i) = \{j \mid z_{p,j} < z_{p,i}, \; z_{p,i}-z_{p,j} > \delta\},
+\end{equation}
+where $\delta$ is a small depth offset used to suppress near-coplanar self-occlusion artifacts. The light transmittance reaching $g_i$ at pixel $p$ is then
+\begin{equation}
+T_{p,i} = \prod_{j \in \mathcal{F}(p,i)} (1-\alpha_{p,j}).
+\end{equation}
+
+We aggregate this transmittance over the light-space footprint of each Gaussian using two accumulators:
+\begin{equation}
+S_i = \sum_p \mathcal{K}_{p,i} \, T_{p,i}, \qquad
+N_i = \sum_p \mathcal{K}_{p,i},
+\end{equation}
+and define the final per-Gaussian shadow ratio as
+\begin{equation}
+s_i = \frac{S_i}{N_i + \epsilon},
+\end{equation}
+where $\epsilon$ is a small constant for numerical stability. Intuitively, $S_i$ measures how much light survives through occluders before reaching $g_i$, while $N_i$ normalizes for the Gaussian's projected support. The resulting $s_i \in [0,1]$ acts as a soft cast-shadow visibility term: values near $0$ indicate strong occlusion and values near $1$ indicate full exposure to the light.
+
+Because the entire computation is implemented in a differentiable rasterization pipeline, the shadow error can be propagated back to Gaussian position, scale, and opacity. In this way, cast shadows become a geometry-aware training signal rather than a post-hoc rendering attribute.
+
+\subsection{Shadow-Aware Rendering}
+\label{sec:method_render}
+
+After computing the light-space shadow ratio $s_i$ for each Gaussian, we render the scene from the target camera. Let $\mathbf{c}_i$ denote the base color contribution of Gaussian $g_i$, and let $\mathbf{e}_i$ denote additional view-dependent appearance terms such as residual illumination effects. Our shadow-aware rendering can be expressed as
+\begin{equation}
+\mathbf{I} = \mathcal{R}_{\text{view}}(\mathbf{c} \odot \mathbf{s} + \mathbf{e}),
+\end{equation}
+where $\odot$ denotes element-wise modulation by the shadow term and $\mathcal{R}_{\text{view}}$ is the standard view-space Gaussian splatting operator.
+
+This design decouples the geometry-sensitive shadow reasoning from the final view-space composition. The shadow term is estimated in light space, where visibility is physically meaningful, and then injected into the camera-space rendering process as a differentiable factor.
+
+\subsection{Training with Shadow Supervision}
+\label{sec:method_training}
+
+Under controlled illumination, we assume the light direction or light position is known, or can be approximately specified. This allows us to isolate the role of shadow supervision without entangling it with full inverse rendering. Depending on the available supervision, the framework supports two complementary training modes.
+
+First, if shadow observations are directly available, we can supervise the predicted shadow field itself:
+\begin{equation}
+\mathcal{L}_{\text{shadow}} = \|\hat{\mathbf{S}} - \mathbf{S}^{\ast}\|_1,
+\end{equation}
+where $\hat{\mathbf{S}}$ is the rendered shadow and $\mathbf{S}^{\ast}$ is the target shadow observation.
+
+Second, the shadow term can also be used inside the final rendering process and optimized jointly with photometric reconstruction:
+\begin{equation}
+\mathcal{L} = \mathcal{L}_{\text{rgb}} + \lambda_s \mathcal{L}_{\text{shadow}} + \lambda_r \mathcal{L}_{\text{reg}},
+\end{equation}
+where $\mathcal{L}_{\text{rgb}}$ denotes the image reconstruction loss and $\mathcal{L}_{\text{reg}}$ includes optional regularizers.
+
+The important point is that, in both cases, the shadow loss is not merely refining appearance. Since the shadow term depends on light-space visibility, its gradients directly constrain occlusion structure, relative depth ordering, contact relations, and Gaussian support. This is precisely the supervision signal that is missing in purely RGB-driven Gaussian optimization.
+
+\subsection{Discussion}
+
+Our method is intentionally scoped to controlled lighting settings. We do not attempt to solve unconstrained shadow extraction or full scene relighting in the wild. Instead, we focus on a simpler and more targeted question: can cast shadows be turned into a stable, differentiable, and geometry-aware supervision signal for 3D Gaussian optimization? The proposed formulation is designed to answer this question directly.
+
+\section{Experiments}
+\label{sec:experiments}
+
+\subsection{Experimental Setup}
+
+We evaluate the proposed shadow-supervised 3DGS framework under controlled illumination, where the light direction or light position is known for each scene. This setting matches the scope of our method and allows us to isolate the effect of shadow supervision from the broader difficulty of unconstrained inverse rendering.
+
+\paragraph{Datasets.}
+We consider two classes of data. The first consists of synthetic scenes with rendered cast shadows, which provide clean supervision and allow us to study geometry, visibility, and shadow behavior in a controlled environment. The second consists of single-object captures with known or calibrated lighting, which are used to test whether the proposed supervision remains effective on real images under controlled illumination.
+
+\paragraph{Baselines.}
+We compare against a standard 3DGS reconstruction pipeline without explicit shadow supervision, and against recent Gaussian-based methods that model or exploit illumination and shadow effects, including representative relighting-oriented or shadow-aware Gaussian variants such as GS$^3$ and RNG-GS. We additionally include an internal ablation that keeps the same rendering backbone but removes the proposed shadow supervision term.
+
+\paragraph{Metrics.}
+We report standard image reconstruction metrics, including PSNR, SSIM, and LPIPS, to evaluate rendering fidelity. When geometry ground truth or proxy geometry is available, we additionally report geometry-sensitive metrics such as Chamfer distance, normal consistency, or depth error. For shadow-specific evaluation, we use shadow-region reconstruction error or mask overlap metrics when shadow annotations can be obtained from the controlled setup.
+
+\paragraph{Implementation details.}
+Unless otherwise stated, all experiments use the non-HGS analytic light rasterizer as the main differentiable shadow operator. The shadow computation is performed in light space and the resulting per-Gaussian shadow ratio is injected into the standard view-space Gaussian rendering pipeline. During training, we use known light parameters and optimize Gaussian position, scale, opacity, and appearance jointly.
+
+\subsection{Ablation Plan}
+\label{sec:ablation}
+
+To understand the contribution of each design choice, we consider the following ablations:
+\begin{itemize}
+    \item \textbf{Without shadow supervision.} Remove the shadow loss while keeping the same 3DGS backbone, in order to isolate the gain from the proposed supervision signal itself.
+    \item \textbf{Shadow-in-rendering only.} Use the shadow term only as a rendering modulation factor, without directly supervising the shadow prediction, to test whether explicit shadow supervision is necessary.
+    \item \textbf{Offset threshold variation.} Vary the light-space depth offset $\delta$ to study the trade-off between suppressing self-occlusion artifacts and preserving informative cast-shadow gradients.
+    \item \textbf{Geometry-only vs. full-parameter optimization.} Compare optimizing only a subset of Gaussian parameters against optimizing geometry, scale, and opacity jointly, to verify whether shadow supervision truly provides multi-parameter geometric constraints.
+\end{itemize}
+
+\subsection{What We Expect to Verify}
+
+Our experiments are designed to answer three questions. First, does differentiable cast-shadow supervision improve geometry and occlusion quality beyond RGB-only Gaussian optimization? Second, is the proposed shadow cue complementary to existing reconstruction signals rather than redundant with them? Third, can a light-space differentiable shadow operator remain stable enough to be used as a practical training signal in a Gaussian rasterization framework?
