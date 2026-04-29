@@ -2,18 +2,21 @@ date="gogo"
 subtask="NRHints"
 data_root="/home/wangyy/data_download/gsrelight"
 view_num=2000
-output_dir="/home/wangyy/data_download/gsrelight_runs/gs3"
+output_dir="/home/wangyy/data_download/gsrelight_runs/gs2dgs_gs3copy_testsh"
 model="Fish"
 
-export PYTHONPATH="/home/wangyy/RTS/gs3/submodules/simple-knn:/home/wangyy/RTS/gs3/submodules/diff-gaussian-rasterization:/home/wangyy/RTS/gs3/submodules/diff-gaussian-rasterization_light:/home/wangyy/RTS/gs3/submodules/diff-gaussian-rasterization_hgs:/home/wangyy/RTS/gs3/submodules/v_3dgs:/home/wangyy/RTS/gs3/submodules/v_3dgs_ortho:/home/wangyy/RTS/gs3${PYTHONPATH:+:${PYTHONPATH}}"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$ROOT"
+
+export PYTHONPATH="${ROOT}/submodules/simple-knn:${ROOT}/submodules/diff-gaussian-rasterization:${ROOT}/submodules/diff-gaussian-rasterization_light:${ROOT}/submodules/diff-gaussian-rasterization_hgs:${ROOT}/submodules/v_3dgs:${ROOT}/submodules/v_3dgs_ortho:${ROOT}/../2dgs/submodules/surfel-texture:${ROOT}/../2dgs/submodules/surfel-texture-deferred:${ROOT}/../2dgs/submodules/diff-surfel-rasterization-shadow:${ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
 
 ## ==========================================================
 ## =======================LightStage=========================
 
-python train.py -s $data_root/$subtask/$model/$model  \
+python -u train.py -s $data_root/$subtask/$model/$model  \
                 --data_device "cpu" \
                 --view_num $view_num \
-                --iterations 30000 \
+                --iterations 100000 \
                 --asg_freeze_step 22000 \
                 --spcular_freeze_step 9000 \
                 --fit_linear_step 7000 \
@@ -31,9 +34,9 @@ python train.py -s $data_root/$subtask/$model/$model  \
                 --neural_phasefunc_lr_max_steps 50000 \
                 --position_lr_max_steps 70000 \
                 --densify_until_iter 90000 \
-                --test_iterations 10000 20000 30000 \
-                --save_iterations 10000 20000 30000 \
-                --checkpoint_iterations 10000 20000 30000 \
+                --test_iterations 10000 20000 30000 40000 50000 60000 70000 80000 90000 100000 \
+                --save_iterations 10000 20000 30000 40000 50000 60000 70000 80000 90000 100000 \
+                --checkpoint_iterations 10000 20000 30000 40000 50000 60000 70000 80000 90000 100000 \
                 --unfreeze_iterations 5000 \
                 -m "$output_dir/$subtask/$date/$model" \
                 --use_nerual_phasefunc \
