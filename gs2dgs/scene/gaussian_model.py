@@ -1,0 +1,2 @@
+from scene.gaussian_model_2dgs_adapter import GaussianModel2DGSAdapter as GaussianModel
+

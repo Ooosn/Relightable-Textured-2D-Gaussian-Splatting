@@ -1,3 +1,4 @@
+import importlib.util
 import math
 import os
 import sys
@@ -9,6 +10,9 @@ import torch.nn.functional as F
 from gaussian_renderer.textured import TextureRenderInputs, rasterize_with_texture_module
 
 _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+_GS3_RENDER_PATH = os.path.abspath(
+    os.path.join(_REPO_ROOT, "..", "gs3", "gaussian_renderer", "__init__.py")
+)
 _SUBMODULE_PATHS = [
     os.path.join(_REPO_ROOT, "submodules", "surfel-texture"),
     os.path.join(_REPO_ROOT, "submodules", "surfel-texture-deferred"),
@@ -24,6 +28,24 @@ from surfel_texture import GaussianRasterizationSettings as SurfelRasterSettings
 
 from scene.gaussian_model_2dgs_adapter import GaussianModel2DGSAdapter as GaussianModel
 from utils.graphics_utils import getProjectionMatrix
+
+_GS3_LEGACY_RENDER_MOD = None
+
+
+def _load_gs3_legacy_render_module():
+    global _GS3_LEGACY_RENDER_MOD
+    if _GS3_LEGACY_RENDER_MOD is None:
+        spec = importlib.util.spec_from_file_location("gs3_legacy_gaussian_renderer", _GS3_RENDER_PATH)
+        if spec is None or spec.loader is None:
+            raise ImportError(f"Unable to load gs3 renderer from {_GS3_RENDER_PATH}")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        _GS3_LEGACY_RENDER_MOD = module
+    return _GS3_LEGACY_RENDER_MOD
+
+
+def _should_delegate_to_gs3_renderer(gau):
+    return getattr(gau, "gs2dgs_backend", None) == "legacy" and not bool(getattr(gau, "use_textures", False))
 
 
 def _safe_normalize(x):
@@ -475,6 +497,29 @@ def render(
     asg_mlp=False,
     iteration=0,
 ):
+    if _should_delegate_to_gs3_renderer(gau):
+        gs3_render = _load_gs3_legacy_render_module().render
+        return gs3_render(
+            viewpoint_camera,
+            gau,
+            light_stream,
+            calc_stream,
+            local_axises,
+            asg_scales,
+            asg_axises,
+            pipe,
+            bg_color,
+            modelset,
+            shadowmap_render=shadowmap_render,
+            scaling_modifier=scaling_modifier,
+            override_color=override_color,
+            fix_labert=fix_labert,
+            inten_scale=inten_scale,
+            is_train=is_train,
+            asg_mlp=asg_mlp,
+            iteration=iteration,
+        )
+
     rasterizer = str(getattr(gau, "rasterizer", ""))
     if rasterizer not in {"2dgs", "2dgs_3ch"}:
         raise NotImplementedError(f"gs2dgs only supports 2dgs rasterizers, got {rasterizer!r}")

@@ -31,9 +31,9 @@ python train.py -s $data_root/$subtask/$model/$model  \
                 --neural_phasefunc_lr_max_steps 50000 \
                 --position_lr_max_steps 70000 \
                 --densify_until_iter 90000 \
-                --test_iterations 2000 4000 7000 10000 15000 20000 25000 30000 \
-                --save_iterations 7000 10000 15000 20000 30000 \
-                --checkpoint_iterations 7000 10000 15000 20000 30000 \
+                --test_iterations 10000 20000 30000 \
+                --save_iterations 10000 20000 30000 \
+                --checkpoint_iterations 10000 20000 30000 \
                 --unfreeze_iterations 5000 \
                 -m "$output_dir/$subtask/$date/$model" \
                 --use_nerual_phasefunc \

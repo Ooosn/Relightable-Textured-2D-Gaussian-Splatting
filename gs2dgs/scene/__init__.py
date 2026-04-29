@@ -64,8 +64,6 @@ class Scene:
         """
         # 路径信息已经被更新/新建  tb_writer = prepare_output_and_logger(dataset)，在这里的 args 就是 train.py 中传递的 dataset
         self.resume_model_path = None
-        self.has_full_checkpoint_state = isinstance(checkpoint_state, dict) and "gaussians" in checkpoint_state
-        self.checkpoint_scene_state = checkpoint_state.get("scene") if isinstance(checkpoint_state, dict) else None
         if checkpoint:
             self.loaded_iter = extract_iter_from_checkpoint(checkpoint)
             self.resume_model_path = os.path.dirname(checkpoint)
@@ -104,25 +102,10 @@ class Scene:
         self.train_cameras = {}
         self.test_cameras = {}
         self.valid_cameras = {}
-
-        camera_source_path = self.source_path
-        if self.loaded_iter and self.checkpoint_scene_state is None:
-            load_model_path = self.resume_model_path or self.model_path
-            saved_camera_path = os.path.join(
-                load_model_path,
-                "point_cloud",
-                "iteration_" + str(self.loaded_iter),
-            )
-            if any(
-                os.path.exists(os.path.join(saved_camera_path, name))
-                for name in ("transforms_train.json", "transforms_test.json", "transforms_valid.json")
-            ):
-                camera_source_path = saved_camera_path
-                print(f"Using saved camera/light transforms from: {camera_source_path}")
         
         # 无论是否加载已训练的模型，都需要加载场景数据集
         # 仅判断是否存在transforms_train.json文件，如果存在则认为是Blender数据集，随后在sceneLoadTypeCallbacks中调用Blender函数加载训练和测试集的相机信息
-        if os.path.exists(os.path.join(camera_source_path, "transforms_train.json")):
+        if os.path.exists(os.path.join(self.source_path, "transforms_train.json")):
             print("Found transforms_train.json file, assuming Blender data set!")
         
             # scene_info 获得的是一个 SceneInfo 对象，包含了场景的所有信息，比如训练集和测试集的相机信息、点云信息、图片信息等
@@ -132,9 +115,10 @@ class Scene:
                            nerf_normalization=nerf_normalization,
                            ply_path=ply_path)   # 点云信息地址，不存在则随机初始化
             """
-            scene_info = sceneLoadTypeCallbacks["Blender"](camera_source_path, args.white_background, args.eval, args.view_num, args.load_num, \
-                                                       valid=valid, skip_train=skip_train, skip_test=skip_test,
-                                                       extension=".exr" if args.hdr else ".png")
+            if not getattr(args, "wang_debug", False):
+                scene_info = sceneLoadTypeCallbacks["Blender"](self.source_path, args.white_background, args.eval, args.view_num, args.load_num, \
+                                                           valid=valid, skip_train=skip_train, skip_test=skip_test,
+                                                           extension=".exr" if args.hdr else ".png")
         else:
             assert False, "Could not recognize scene type!"
 
@@ -199,20 +183,15 @@ class Scene:
                 print("Loading Test Cameras")
                 self.test_cameras[resolution_scale] = cameraList_from_camInfos(scene_info.test_cameras, resolution_scale, args)
 
-        if self.checkpoint_scene_state is not None:
-            self._restore_camera_state(self.checkpoint_scene_state)
-
         
         # 高斯部分
         # 如果需要加载已训练的模型，则直接从点云中加载高斯模型
-        if self.loaded_iter and not self.has_full_checkpoint_state:                                        # os.path.join 可输入多个参数，将多个参数拼接成一个路径
+        if self.loaded_iter:                                        # os.path.join 可输入多个参数，将多个参数拼接成一个路径
             load_model_path = self.resume_model_path or self.model_path
             self.gaussians.load_ply(os.path.join(load_model_path,
                                                            "point_cloud",
                                                            "iteration_" + str(self.loaded_iter),
                                                            "point_cloud.ply"))
-        elif self.has_full_checkpoint_state:
-            pass
         # 如果不加载已训练的模型，则从场景信息的点云信息中创建高斯模型（默认是创建随机点云，如果没有其他渠道获得场景对应的点云信息）
         else: 
             # create_from_pcd 中，会初始化神经网络 self.neural_phasefunc = Neural_phase(
@@ -282,14 +261,6 @@ class Scene:
             else:
                 self.optimizer = None
 
-            if self.checkpoint_scene_state is not None and self.optimizer is not None:
-                opt_state = self.checkpoint_scene_state.get("optimizer_state")
-                if opt_state is not None:
-                    try:
-                        self.optimizer.load_state_dict(opt_state)
-                    except ValueError as exc:
-                        print(f"Warning: failed to restore scene optimizer state: {exc}")
-
     # 根据迭代次数解冻/update lr rate 
     # self.cam_scheduler_args(iteration) 返回当前迭代次数下的学习率
     def update_lr(self, iteration, freez_train_cam, freez_train_pl, cam_opt, pl_opt):
@@ -309,62 +280,6 @@ class Scene:
                     else:
                         lr = self.pl_scheduler_args(iteration)
                         param_group['lr'] = lr
-
-    def _capture_camera_list(self, cameras):
-        return [
-            {
-                "image_name": cam.image_name,
-                "uid": int(cam.uid),
-                "cam_pose_adj": cam.cam_pose_adj.detach().cpu(),
-                "pl_adj": cam.pl_adj.detach().cpu(),
-            }
-            for cam in cameras
-        ]
-
-    def capture(self):
-        return {
-            "version": 1,
-            "optimizing": bool(getattr(self, "optimizing", False)),
-            "save_scale": float(getattr(self, "save_scale", 1.0)),
-            "cameras": {
-                "train": {str(scale): self._capture_camera_list(cams) for scale, cams in self.train_cameras.items()},
-                "test": {str(scale): self._capture_camera_list(cams) for scale, cams in self.test_cameras.items()},
-                "valid": {str(scale): self._capture_camera_list(cams) for scale, cams in self.valid_cameras.items()},
-            },
-            "optimizer_state": self.optimizer.state_dict() if getattr(self, "optimizer", None) is not None else None,
-        }
-
-    def _restore_camera_group(self, camera_dict, group_state):
-        for scale_key, camera_states in group_state.items():
-            try:
-                scale = float(scale_key)
-            except (TypeError, ValueError):
-                scale = scale_key
-            if scale not in camera_dict:
-                continue
-            cameras = camera_dict[scale]
-            by_name = {cam.image_name: cam for cam in cameras}
-            restored = []
-            used = set()
-            for state in camera_states:
-                cam = by_name.get(state.get("image_name"))
-                if cam is None:
-                    continue
-                if "cam_pose_adj" in state:
-                    cam.cam_pose_adj.data.copy_(state["cam_pose_adj"].to(device=cam.cam_pose_adj.device, dtype=cam.cam_pose_adj.dtype))
-                if "pl_adj" in state:
-                    cam.pl_adj.data.copy_(state["pl_adj"].to(device=cam.pl_adj.device, dtype=cam.pl_adj.dtype))
-                cam.update("SO3xR3")
-                restored.append(cam)
-                used.add(cam.image_name)
-            restored.extend([cam for cam in cameras if cam.image_name not in used])
-            camera_dict[scale] = restored
-
-    def _restore_camera_state(self, scene_state):
-        cameras_state = scene_state.get("cameras", {}) if isinstance(scene_state, dict) else {}
-        self._restore_camera_group(self.train_cameras, cameras_state.get("train", {}))
-        self._restore_camera_group(self.test_cameras, cameras_state.get("test", {}))
-        self._restore_camera_group(self.valid_cameras, cameras_state.get("valid", {}))
     
 
     # 保存高斯模型和相机参数（因为可能优化了）

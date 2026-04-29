@@ -16,12 +16,12 @@ from pathlib import Path
 import torch
 import numpy as np
 import math
-import random
 from random import randint
 from utils.loss_utils import l1_loss, ssim
 from gaussian_renderer import render, get_shadow_backward_stage
 import sys
 from scene import Scene, GaussianModel
+from scene.gaussian_model_2dgs_adapter import GaussianModel2DGSAdapter
 from utils.general_utils import safe_state, build_scaling_rotation
 from utils.graphics_utils import getWorld2View2_cu
 from utils.lie_groups import exp_map_SO3xR3
@@ -38,14 +38,7 @@ except ImportError:
     TENSORBOARD_FOUND = False
 
 import lpips
-loss_fn_alex = None
-
-
-def get_lpips_model():
-    global loss_fn_alex
-    if loss_fn_alex is None:
-        loss_fn_alex = lpips.LPIPS(net='vgg').cuda().eval()
-    return loss_fn_alex
+loss_fn_alex = lpips.LPIPS(net='vgg')
 
 
 def create_render_streams():
@@ -70,19 +63,6 @@ def append_jsonl(path: Path, payload: dict):
     with path.open("a", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False)
         f.write("\n")
-
-
-def _check_vram_limit(pipe):
-    if not torch.cuda.is_available():
-        return
-    limit_gb = float(getattr(pipe, "max_vram_gb", 0.0) or 0.0)
-    if limit_gb <= 0.0:
-        return
-    peak_reserved = torch.cuda.max_memory_reserved() / (1024 ** 3)
-    if peak_reserved > limit_gb:
-        raise RuntimeError(
-            f"VRAM limit exceeded: peak_reserved={peak_reserved:.2f} GB > limit={limit_gb:.2f} GB"
-        )
 
 
 def _tensor_finite(tensor):
@@ -191,95 +171,6 @@ def _build_splat2world_2dgs(means3D, scaling_2d, rotation, scaling_modifier=1.0)
     trans[:, 3, :3] = means3D
     trans[:, 3, 3] = 1
     return trans
-
-
-def _unpack_training_checkpoint(payload):
-    if isinstance(payload, dict) and "gaussians" in payload:
-        return payload["gaussians"], int(payload["iteration"]), payload.get("scene")
-    model_params, iteration = payload
-    return model_params, int(iteration), None
-
-
-def _capture_rng_state():
-    return {
-        "python": random.getstate(),
-        "numpy": np.random.get_state(),
-        "torch": torch.get_rng_state(),
-        "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
-    }
-
-
-def _restore_rng_state(rng_state):
-    if not isinstance(rng_state, dict):
-        return
-    if "python" in rng_state:
-        random.setstate(rng_state["python"])
-    if "numpy" in rng_state:
-        np.random.set_state(rng_state["numpy"])
-    if "torch" in rng_state:
-        torch.set_rng_state(rng_state["torch"].cpu())
-    cuda_state = rng_state.get("cuda")
-    if cuda_state is not None and torch.cuda.is_available():
-        torch.cuda.set_rng_state_all([state.cpu() for state in cuda_state])
-
-
-def _camera_key(camera):
-    return getattr(camera, "image_name", str(getattr(camera, "uid", "")))
-
-
-def _capture_loop_state(viewpoint_stack, opt_test, opt_test_ready, ema_loss_for_log):
-    return {
-        "version": 1,
-        "viewpoint_stack": [_camera_key(cam) for cam in viewpoint_stack] if viewpoint_stack is not None else None,
-        "opt_test": bool(opt_test),
-        "opt_test_ready": bool(opt_test_ready),
-        "ema_loss_for_log": float(ema_loss_for_log),
-    }
-
-
-def _restore_viewpoint_stack(scene, loop_state):
-    if not isinstance(loop_state, dict) or loop_state.get("viewpoint_stack") is None:
-        return None
-    camera_names = loop_state.get("viewpoint_stack", [])
-    cameras = []
-    train_camera_group = getattr(scene, "train_cameras", None)
-    if isinstance(train_camera_group, dict):
-        for camera_list in train_camera_group.values():
-            cameras.extend(camera_list)
-    by_name = {_camera_key(cam): cam for cam in cameras}
-    restored = []
-    missing = []
-    for name in camera_names:
-        cam = by_name.get(name)
-        if cam is None:
-            missing.append(name)
-        else:
-            restored.append(cam)
-    if missing:
-        print(f"Warning: could not restore {len(missing)} cameras from checkpoint viewpoint stack")
-    return restored
-
-
-def clear_checkpoint_gradients(scene, gaussians):
-    if getattr(gaussians, "optimizer", None) is not None:
-        gaussians.optimizer.zero_grad(set_to_none=True)
-    if getattr(scene, "optimizer", None) is not None:
-        scene.optimizer.zero_grad(set_to_none=True)
-
-
-def save_training_checkpoint(scene, gaussians, iteration, label="Checkpoint", loop_state=None):
-    print(f"\n[ITER {iteration}] Saving {label}")
-    clear_checkpoint_gradients(scene, gaussians)
-    payload = {
-        "type": "gs2dgs_training_checkpoint",
-        "version": 3,
-        "iteration": int(iteration),
-        "gaussians": gaussians.capture(),
-        "scene": scene.capture() if hasattr(scene, "capture") else None,
-        "rng_state": _capture_rng_state(),
-        "loop_state": loop_state,
-    }
-    torch.save(payload, scene.model_path + "/chkpnt" + str(iteration) + ".pth")
 
 
 def _masked_vector_stats(values: torch.Tensor, mask: torch.Tensor | None = None):
@@ -504,6 +395,9 @@ def save_fixed_view_collection(split_dir: Path, view_panels):
 
     canvas.save(split_dir / "panel.png")
 
+
+asgmlp_debug = False
+
 #training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.unfreeze_iterations, args.debug_from)
 def training(modelset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, unfreeze_iterations, debug_from):
     first_iter = 0
@@ -512,39 +406,10 @@ def training(modelset, opt, pipe, testing_iterations, saving_iterations, checkpo
     tb_writer = prepare_output_and_logger(modelset)
 
     # 初始化高斯实例
-    gaussians = GaussianModel(modelset, opt)
-    print(
-        "RTG config: "
-        f"enabled={bool(getattr(opt, 'texture_rtg_enabled', False))}, "
-        f"from={int(getattr(opt, 'texture_rtg_refine_from_iter', -1))}, "
-        f"until={int(getattr(opt, 'texture_rtg_refine_until_iter', -1))}, "
-        f"interval={int(getattr(opt, 'texture_rtg_refine_interval', -1))}, "
-        f"min_score={float(getattr(opt, 'texture_rtg_min_score', 0.0)):.3e}, "
-        f"dynamic={bool(getattr(modelset, 'texture_dynamic_resolution', False))}",
-        flush=True,
-    )
-    rtg_dynamic_enabled = (
-        bool(getattr(opt, "texture_rtg_enabled", False))
-        and bool(getattr(modelset, "texture_dynamic_resolution", False))
-    )
-    gaussian_densify_until_iter = int(getattr(opt, "densify_until_iter", 0))
-    if (
-        rtg_dynamic_enabled
-        and bool(getattr(opt, "texture_rtg_freeze_gaussian_densify", False))
-        and int(getattr(opt, "texture_rtg_refine_from_iter", 0)) > 0
-    ):
-        gaussian_densify_until_iter = min(
-            gaussian_densify_until_iter,
-            int(getattr(opt, "texture_rtg_refine_from_iter", 0)),
-        )
-    print(
-        "Gaussian densify config: "
-        f"from={int(getattr(opt, 'densify_from_iter', -1))}, "
-        f"until={int(getattr(opt, 'densify_until_iter', -1))}, "
-        f"effective_until={gaussian_densify_until_iter}, "
-        f"freeze_for_rtg={bool(getattr(opt, 'texture_rtg_freeze_gaussian_densify', False)) and rtg_dynamic_enabled}",
-        flush=True,
-    )
+    if str(getattr(modelset, "rasterizer", "")).startswith("2dgs"):
+        gaussians = GaussianModel2DGSAdapter(modelset, opt)
+    else:
+        gaussians = GaussianModel(modelset, opt)
 
     # 根据 训练args，优化args 以及 初始高斯 建立场景实例，最终的高斯实例
     """
@@ -554,48 +419,17 @@ def training(modelset, opt, pipe, testing_iterations, saving_iterations, checkpo
         2. 加载高斯模型，如果加载旧模型则直接从点云中加载高斯模型，否则从场景信息的点云信息中创建高斯模型
         3. 根据命令行参数判断是否需要添加优化相机参数和光源参数
     """
-    checkpoint_payload = torch.load(checkpoint, weights_only=False) if checkpoint else None
-    scene = Scene(modelset, gaussians, opt=opt, shuffle=True, checkpoint=checkpoint, checkpoint_state=checkpoint_payload)
-    texture_training_requested = bool(getattr(modelset, "use_textures", False))
-    texture_start_iter = int(getattr(opt, "texture_start_iter", 0))
-    delayed_texture_training = texture_training_requested and texture_start_iter > 0
-    if delayed_texture_training:
-        print(
-            f"Texture training delayed until iter>{texture_start_iter}; "
-            "Gaussian/MBRDF training runs without texture charts before that.",
-            flush=True,
-        )
+    scene = Scene(modelset, gaussians, opt=opt, shuffle=True, checkpoint=checkpoint)
     
     # 按照 opt对象 初始化参数设置
 
 
     # 恢复模型模型参数以及优化器状态，覆盖之前初始化的模型
     if checkpoint:
-        model_params, first_iter, _ = _unpack_training_checkpoint(checkpoint_payload)
+        (model_params, first_iter) = torch.load(checkpoint, weights_only=False)
         gaussians.restore(model_params, opt)
-        if (
-            bool(getattr(opt, "texture_rtg_enabled", False))
-            and int(first_iter) <= int(getattr(opt, "texture_rtg_refine_from_iter", 0))
-        ):
-            reset_rtg_scores = getattr(gaussians, "reset_texture_rtg_scores", None)
-            if callable(reset_rtg_scores):
-                reset_rtg_scores()
-        if isinstance(checkpoint_payload, dict):
-            _restore_rng_state(checkpoint_payload.get("rng_state"))
-        if delayed_texture_training and int(first_iter) < texture_start_iter:
-            gaussians.defer_texture_training()
-            print(f"Deferred texture state from checkpoint at iter {first_iter}.", flush=True)
     else:
-        if delayed_texture_training:
-            gaussians.defer_texture_training()
         gaussians.training_setup(opt)
-    if (
-        texture_training_requested
-        and int(first_iter) >= texture_start_iter
-        and not bool(getattr(gaussians, "use_textures", False))
-    ):
-        if gaussians.enable_texture_training(opt):
-            print(f"Enabled texture training immediately after restore at iter {first_iter}.", flush=True)
     
     # 设置背景颜色，1,1,1,1,0,0,0表示白色背景，0,0,0,0,0,0,0表示黑色背景
     bg_color = [1, 1, 1, 1, 0, 0, 0] if modelset.white_background else [0, 0, 0, 0, 0, 0, 0]
@@ -612,18 +446,11 @@ def training(modelset, opt, pipe, testing_iterations, saving_iterations, checkpo
     viewpoint_stack = None    # 存储相机视点（viewpoints）的堆栈，在训练过程中，会从堆栈中弹出一个相机视点，用于渲染图像，从而完成对所有视角的遍历。
     opt_test = False    # 当前是否处于优化测试模式
     opt_test_ready = False    # 是否准备好进行优化测试
-    loop_state = checkpoint_payload.get("loop_state") if isinstance(checkpoint_payload, dict) else None
-    if loop_state is not None:
-        viewpoint_stack = _restore_viewpoint_stack(scene, loop_state)
-        opt_test = bool(loop_state.get("opt_test", opt_test))
-        opt_test_ready = bool(loop_state.get("opt_test_ready", opt_test_ready))
     """
     指数移动平均（EMA）损失，用于记录训练过程中的损失值，只是为了平滑损失曲线，更好地可视化训练过程，不参与模型的训练。
     ema_loss_for_log = α * 当前损失 + (1 - α) * ema_loss_for_log 类似于梯度更新中的一阶动量。
     """
     ema_loss_for_log = 0.0    # 初始值为 0.0，表示尚未计算损失值
-    if loop_state is not None:
-        ema_loss_for_log = float(loop_state.get("ema_loss_for_log", ema_loss_for_log))
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")    #使用 tqdm 创建一个可视化的进度条，用于显示训练的进度
     first_iter += 1    # 迭代次数加一，开始下一次迭代
     print("first_iter", first_iter)
@@ -676,7 +503,7 @@ def training(modelset, opt, pipe, testing_iterations, saving_iterations, checkpo
             }
 
 
-    get_lpips_model().to(gaussians.get_features.device)
+    loss_fn_alex.to(gaussians.get_features.device)
 
     if first_iter < unfreeze_iterations:
         gaussians.neural_phasefunc.freeze()
@@ -702,25 +529,6 @@ def training(modelset, opt, pipe, testing_iterations, saving_iterations, checkpo
     # 每次迭代，都会从视点堆栈中选择一个视点，然后渲染图像，计算损失，更新模型参数，并不是每次计算全部视点的损失
     for iteration in range(first_iter, opt.iterations + 1):    #左闭右开区间，因此加1
         iter_start.record()    # 记录迭代开始的时间
-        if torch.cuda.is_available():
-            torch.cuda.reset_peak_memory_stats()
-
-        if (
-            texture_training_requested
-            and texture_start_iter > 0
-            and iteration > texture_start_iter
-            and not bool(getattr(gaussians, "use_textures", False))
-        ):
-            if gaussians.enable_texture_training(opt):
-                stats_method = getattr(gaussians, "_dynamic_texture_stats", None)
-                stats = stats_method() if callable(stats_method) else {}
-                hist = ", ".join(f"{res}x{res}:{count}" for res, count in stats.get("hist", []))
-                print(
-                    f"\n[ITER {iteration}] Texture training enabled | "
-                    f"texels {stats.get('total_texels', 0)}, "
-                    f"avg {stats.get('avg_texels', 0.0):.1f}/G, res {{{hist}}}",
-                    flush=True,
-                )
 
         # update lr of asg
         gaussians.update_learning_rate(iteration, \
@@ -795,8 +603,7 @@ def training(modelset, opt, pipe, testing_iterations, saving_iterations, checkpo
         else:    # 开始考虑镜面反射             
             renderArgs = {"modelset": modelset, "pipe": pipe, "bg_color": bg, "is_train": prune_visibility, "asg_mlp": asg_mlp, "iteration": iteration}
             render_pkg = render(viewpoint_cam, gaussians, light_stream, calc_stream, local_axises, asg_scales, asg_axises, **renderArgs)
-        _check_vram_limit(pipe)
-
+            
         # 此外，取出各个高斯点云坐标、可见性、半径，用于后续修剪
         viewspace_point_tensor, visibility_filter, radii = render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
 
@@ -809,7 +616,6 @@ def training(modelset, opt, pipe, testing_iterations, saving_iterations, checkpo
             image = image
         else:
             image = image * shadow + other_effects
-        _check_vram_limit(pipe)
 
 
 
@@ -869,7 +675,6 @@ def training(modelset, opt, pipe, testing_iterations, saving_iterations, checkpo
         # 反向传播，计算各个参数的梯度
         # 尚未更新参数，等待后续挑选更新
         loss.backward()
-        _check_vram_limit(pipe)
         if (
             scene.optimizing
             and str(getattr(gaussians, "rasterizer", ""))[:5] == "2dgs"
@@ -888,9 +693,6 @@ def training(modelset, opt, pipe, testing_iterations, saving_iterations, checkpo
                 transmat_grad_holder=transmat_grad_holder,
                 splat2world=splat2world_2dgs,
             )
-            _check_vram_limit(pipe)
-        if hasattr(gaussians, "accumulate_texture_rtg"):
-            gaussians.accumulate_texture_rtg(iteration)
         iter_end.record() # 记录迭代结束的时间
 
 
@@ -898,9 +700,8 @@ def training(modelset, opt, pipe, testing_iterations, saving_iterations, checkpo
         """！！参数更新部分"""
         # torch.no_grad() 防止污染计算图，加快计算速度
         with torch.no_grad():
-            in_gaussian_densify_window = iteration < gaussian_densify_until_iter
-            densify_due = in_gaussian_densify_window and iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0
-            opacity_reset_due = in_gaussian_densify_window and (iteration % opt.opacity_reset_interval == 0 or (modelset.white_background and iteration == opt.densify_from_iter))
+            densify_due = iteration < opt.densify_until_iter and iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0
+            opacity_reset_due = iteration % opt.opacity_reset_interval == 0 or (modelset.white_background and iteration == opt.densify_from_iter)
             health_due = (
                 iteration in testing_iterations
                 or (
@@ -967,7 +768,6 @@ def training(modelset, opt, pipe, testing_iterations, saving_iterations, checkpo
 
             # 对于测试集：：：：：  
             # 只用于优化场景光源和相机信息，因为这些信息可能是未知的，需要通过优化来估计    
-            checkpoint_saved_this_iter = False
             if opt_test and scene.optimizing:  
                 """这里是否有一个漏洞，当 scene.optimizing 为 false 时，测试集也会进入后续的 else 分支，但是本文中可能默认 optimizing 为 true ，阴差阳错"""
                 # 不会用于直接优化高斯模型
@@ -1004,9 +804,9 @@ def training(modelset, opt, pipe, testing_iterations, saving_iterations, checkpo
             # 1) 对于非测试集，即训练集进入正常阶段，先进行高斯密集化，高斯修剪以及场景参数优化:
             else:
 
-                # 第一步：：Densification, 高斯复制或分裂，when opt.density_from_iter < iteration < gaussian_densify_until_iter
+                # 第一步：：Densification, 高斯复制或分裂，when opt.density_from_iter < iteration < opt.densify_until_iter
                 # 如果迭代次数小于高斯密集化迭代次数，则进行高斯密集化
-                if iteration < gaussian_densify_until_iter:
+                if iteration < opt.densify_until_iter:
                     # 更新每个可见高斯点在2D投影上的最大半径
                     # visibility_filter: 标记哪些点是可见的
                     # max_radii2D: 记录每个点在屏幕空间的最大半径
@@ -1083,7 +883,6 @@ def training(modelset, opt, pipe, testing_iterations, saving_iterations, checkpo
                         num_points_before = gaussians.get_xyz.shape[0]
                         num_clone, num_split = gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold, opt.bigsize_threshold, crop_extent)
                         num_points_after = gaussians.get_xyz.shape[0]
-                        densify_diag.update(getattr(gaussians, "last_densify_stats", {}) or {})
                         densify_diag.update(
                             {
                                 "num_clone": int(num_clone),
@@ -1134,61 +933,6 @@ def training(modelset, opt, pipe, testing_iterations, saving_iterations, checkpo
                         scene.optimizer.zero_grad(set_to_none = True)
                     gaussians.optimizer.zero_grad(set_to_none = True)   # 梯度清零
 
-            if iteration < opt.iterations:
-                is_rtg_start_checkpoint = (
-                    iteration in checkpoint_iterations
-                    and bool(getattr(opt, "texture_rtg_enabled", False))
-                    and bool(getattr(gaussians, "texture_dynamic_resolution", False))
-                    and iteration == int(getattr(opt, "texture_rtg_refine_from_iter", -1))
-                )
-                rtg_method = getattr(gaussians, "refine_textures_by_rtg", None)
-                rtg_interval = max(1, int(getattr(opt, "texture_rtg_refine_interval", 1)))
-                rtg_from_iter = int(getattr(opt, "texture_rtg_refine_from_iter", 0))
-                rtg_due = (
-                    bool(getattr(opt, "texture_rtg_enabled", False))
-                    and iteration > rtg_from_iter
-                    and iteration <= int(getattr(opt, "texture_rtg_refine_until_iter", opt.iterations))
-                    and (iteration - rtg_from_iter) % rtg_interval == 0
-                )
-                if is_rtg_start_checkpoint:
-                    save_training_checkpoint(
-                        scene,
-                        gaussians,
-                        iteration,
-                        label="Pre-RTG Checkpoint",
-                        loop_state=_capture_loop_state(viewpoint_stack, opt_test, opt_test_ready, ema_loss_for_log),
-                    )
-                    checkpoint_saved_this_iter = True
-                if rtg_due:
-                    score = getattr(gaussians, "_rtg_score", None)
-                    if torch.is_tensor(score) and score.numel() > 0:
-                        score_mean = float(score.detach().float().mean().item())
-                        score_max = float(score.detach().float().max().item())
-                    else:
-                        score_mean = 0.0
-                        score_max = 0.0
-                    print(
-                        f"\n[ITER {iteration}] RTG due | "
-                        f"method={callable(rtg_method)}, "
-                        f"score mean/max {score_mean:.3e}/{score_max:.3e}",
-                        flush=True,
-                    )
-                    if not callable(rtg_method):
-                        print(f"\n[ITER {iteration}] RTG skipped | no_refine_method", flush=True)
-                        num_rtg_refined = 0
-                        rtg_log = ""
-                    else:
-                        num_rtg_refined = rtg_method(iteration)
-                        rtg_log = gaussians.texture_rtg_log_string() if hasattr(gaussians, "texture_rtg_log_string") else ""
-                    if num_rtg_refined > 0:
-                        suffix = f" | {rtg_log}" if rtg_log else ""
-                        print(f"\n[ITER {iteration}] RTG refined {num_rtg_refined} texture charts{suffix}", flush=True)
-                    elif rtg_log:
-                        print(f"\n[ITER {iteration}] RTG skipped | {rtg_log}", flush=True)
-                    reset_rtg_scores = getattr(gaussians, "reset_texture_rtg_scores", None)
-                    if callable(reset_rtg_scores):
-                        reset_rtg_scores()
-
             """
             1. 默认冻结 高斯点相位函数，初期训练高斯点场景空间为主，并只简单优化漫反射 kd (阴影和次要效果为 0)
             2. 抵达 unfreeze_iterations 时，解冻 高斯点相位函数，开始优化 阴影，材质，次要效果等
@@ -1233,22 +977,28 @@ def training(modelset, opt, pipe, testing_iterations, saving_iterations, checkpo
                     gaussians.local_q.requires_grad_(True)
                     if iteration % 5000 == 0:
                         gaussians.reset_local_q(temp)
+            
+
 
             # 判断是否保存模型
-            if (iteration in checkpoint_iterations and not checkpoint_saved_this_iter):
-                save_training_checkpoint(
-                    scene,
-                    gaussians,
-                    iteration,
-                    loop_state=_capture_loop_state(viewpoint_stack, opt_test, opt_test_ready, ema_loss_for_log),
-                )
-
+            if (iteration in checkpoint_iterations):
+                print("\n[ITER {}] Saving Checkpoint".format(iteration))
+                torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
+            
             if modelset.asg_mlp and iteration == opt.asg_mlp_freeze: # 40000
                 asg_mlp = True
             
             elif modelset.alpha_change and iteration == opt.asg_change_freeze:
                 gaussians.change_alpha_asg(gaussians.alpha_asg)
                 print("alpha changed")
+
+
+            if asgmlp_debug:
+                if iteration % 2000 == 0:
+                    print_params(gaussians)
+                    print("alpha.shape", gaussians.get_alpha_asg.shape)
+                    print("alpha", gaussians.get_alpha_asg)
+
         # 更新相机和光源参数：（之前只是更新了 adj 参数，尚未对相机和光源进行直接更新)，注意这里没有设置 torch.no_grad()
         # update cam and light
         if scene.optimizing:
@@ -1261,6 +1011,41 @@ def training(modelset, opt, pipe, testing_iterations, saving_iterations, checkpo
                 print(viewpoint_cam.pl_adj.grad)
                 print("################################")
                 
+
+def print_params(gaussians):
+    i = 0
+    para1 = gaussians.neural_phasefunc.shadow_func.parameters()
+    para2 = gaussians.neural_phasefunc.other_effects_func.parameters()
+    if gaussians.neural_phasefunc.asg_mlp:
+        para3 = gaussians.neural_phasefunc.asg_func.parameters()
+    else:
+        para3 = None
+    list_params1 = []
+    list_params2 = []
+    list_params3 = []
+    for param in para1:
+        list_params1.append(param)
+        i += 1
+        if i == 10:
+            print("param1", list_params1)
+            break
+    for param in para2:
+        list_params2.append(param)
+        i += 1
+        if i == 10:
+            print("param2", list_params2)
+            break
+    if para3 is not None:
+        for param in para3:
+            list_params3.append(param)
+            i += 1
+            if i == 10:
+                print("param3", list_params3)
+                break
+    else:
+        print("param3: no asg_mlp")
+    
+
 
 def prepare_output_and_logger(args):    
     if not args.model_path:
@@ -1359,7 +1144,7 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
                     view_l1 = l1_loss(image, gt_image).mean().double()
                     view_psnr = psnr(image, gt_image).mean().double()
                     view_ssim = ssim(image, gt_image).mean().double()
-                    view_lpips = get_lpips_model().forward(image, gt_image).squeeze()
+                    view_lpips = loss_fn_alex.forward(image, gt_image).squeeze()
                     if idx < 3:
                         fixed_metrics = {
                             "iteration": int(iteration),
@@ -1369,7 +1154,6 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
                             "psnr": float(view_psnr.item()),
                             "ssim": float(view_ssim.item()),
                             "lpips": float(view_lpips.item()),
-                            "texture_effect_mode": str(getattr(modelset, "texture_effect_mode", "per_uv")),
                         }
                         view_dir = fixed_dir / f"{idx:03d}_{viewpoint_cam.image_name}"
                         save_fixed_view_artifacts(
@@ -1400,7 +1184,6 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
                     "ssim": float(ssim_test.item()),
                     "lpips": float(lpips_test.item()),
                     "fixed_view": config["cameras"][0].image_name,
-                    "texture_effect_mode": str(getattr(modelset, "texture_effect_mode", "per_uv")),
                 }
                 shadow_stage = get_shadow_backward_stage(modelset, iteration)
                 eval_row.update(
@@ -1451,27 +1234,7 @@ if __name__ == "__main__":
 
     # 令 args 包含 parser 中定义的所有参数的键和值
     args = parser.parse_args(sys.argv[1:])  # argument vector， 第一位是文件名，所以从第二位开始解析
-    for eval_iter in range(10_000, args.iterations + 1, 10_000):
-        if eval_iter not in args.test_iterations:
-            args.test_iterations.append(eval_iter)
-    for save_iter in range(30_000, args.iterations + 1, 30_000):
-        if save_iter not in args.save_iterations:
-            args.save_iterations.append(save_iter)
-        if save_iter not in args.checkpoint_iterations:
-            args.checkpoint_iterations.append(save_iter)
-    if args.iterations not in args.save_iterations:
-        args.save_iterations.append(args.iterations)
-    if args.iterations not in args.test_iterations:
-        args.test_iterations.append(args.iterations)
-    if args.iterations not in args.checkpoint_iterations:
-        args.checkpoint_iterations.append(args.iterations)
-    if bool(getattr(args, "texture_rtg_enabled", False)) and bool(getattr(args, "texture_dynamic_resolution", False)):
-        rtg_start_iter = int(getattr(args, "texture_rtg_refine_from_iter", 0))
-        if 0 < rtg_start_iter <= args.iterations and rtg_start_iter not in args.checkpoint_iterations:
-            args.checkpoint_iterations.append(rtg_start_iter)
-    args.test_iterations = sorted(set(args.test_iterations))
-    args.save_iterations = sorted(set(args.save_iterations))
-    args.checkpoint_iterations = sorted(set(args.checkpoint_iterations))
+    args.save_iterations.append(args.iterations)    # 将最后一个迭代次数加入保存迭代次数列表
     
     # Prepare training
     print("Optimizing " + args.model_path)

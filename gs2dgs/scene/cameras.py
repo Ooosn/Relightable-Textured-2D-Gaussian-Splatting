@@ -19,7 +19,7 @@ class Camera(nn.Module):
     def __init__(self, colmap_id, R, T, FoVx, FoVy, cx, cy, image, gt_alpha_mask,
                  image_name, uid, pl_pos = None, pl_intensity = None,
                  trans=np.array([0.0, 0.0, 0.0]), scale=1.0, data_device = "cuda",
-                 is_hdr=False, image_path=None,
+                 is_hdr=False, image_path=None, use_hgs_finetune=False,
                  image_width=None, image_height=None
                  ):
         super(Camera, self).__init__()
@@ -34,8 +34,12 @@ class Camera(nn.Module):
         self.cy = cy
         self.image_name = image_name
         self.image_path = image_path
-        self.cam_pose_adj = torch.nn.Parameter(torch.zeros((1, 6), requires_grad=True).cuda())
-        self.pl_adj = torch.nn.Parameter(torch.zeros((1, 3), requires_grad=True).cuda())
+        if not use_hgs_finetune:
+            self.cam_pose_adj = torch.nn.Parameter(torch.zeros((1, 6), requires_grad=True).cuda())
+            self.pl_adj = torch.nn.Parameter(torch.zeros((1, 3), requires_grad=True).cuda())
+        else:
+            self.cam_pose_adj = torch.nn.Parameter(torch.zeros((1, 6), requires_grad=False).cuda())
+            self.pl_adj = torch.nn.Parameter(torch.zeros((1, 3), requires_grad=False).cuda())
 
         self.R_cu = torch.tensor(R, dtype=torch.float32).cuda()
         self.T_cu = torch.tensor(T, dtype=torch.float32).cuda()

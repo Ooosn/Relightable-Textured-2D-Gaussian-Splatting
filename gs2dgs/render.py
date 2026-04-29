@@ -15,6 +15,7 @@ from scene.gaussian_model_2dgs_adapter import GaussianModel2DGSAdapter as Gaussi
 from utils.general_utils import safe_state
 from utils.image_utils import psnr
 from utils.loss_utils import l1_loss, ssim
+from utils.system_utils import searchForMaxIteration
 
 
 loss_fn_alex = None
@@ -67,6 +68,62 @@ def _restore_checkpoint_if_available(model_path: Path, iteration: int, gaussians
     model_params = payload["gaussians"] if isinstance(payload, dict) and "gaussians" in payload else payload[0]
     gaussians.restore(model_params, opt_args)
     return checkpoint_path
+
+
+def _checkpoint_meta(payload):
+    if not isinstance(payload, dict):
+        return {}
+    meta = payload.get("meta")
+    return meta if isinstance(meta, dict) else {}
+
+
+def _checkpoint_backend(payload):
+    meta = _checkpoint_meta(payload)
+    backend = meta.get("gaussian_backend")
+    if backend in {"legacy", "native"}:
+        return backend
+    if isinstance(payload, dict) and "gaussians" in payload:
+        return "native"
+    return None
+
+
+def _apply_checkpoint_model_hints(modelset, payload):
+    if payload is None:
+        return
+    meta = _checkpoint_meta(payload)
+    model_flags = meta.get("model_flags", {})
+    if isinstance(model_flags, dict):
+        for key, value in model_flags.items():
+            setattr(modelset, key, value)
+    backend = _checkpoint_backend(payload)
+    if backend is not None:
+        setattr(modelset, "force_native_2dgs_core", backend == "native")
+
+
+def _resolve_iteration(model_path: Path, load_iteration: int):
+    if load_iteration != -1:
+        return load_iteration
+    point_cloud_root = model_path / "point_cloud"
+    if not point_cloud_root.exists():
+        return None
+    return searchForMaxIteration(point_cloud_root.as_posix())
+
+
+def _resolve_checkpoint_path(model_path: Path, load_iteration: int):
+    iteration = _resolve_iteration(model_path, load_iteration)
+    if iteration is None:
+        return None
+    checkpoint_path = model_path / f"chkpnt{iteration}.pth"
+    if not checkpoint_path.exists():
+        return None
+    return checkpoint_path
+
+
+def _peek_checkpoint_payload(model_path: Path, load_iteration: int):
+    checkpoint_path = _resolve_checkpoint_path(model_path, load_iteration)
+    if checkpoint_path is None:
+        return None
+    return torch.load(checkpoint_path.as_posix(), weights_only=False)
 
 
 def render_split(modelset, scene, gaussians, pipe, split_name, cameras, output_root: Path):
@@ -125,18 +182,40 @@ def render_split(modelset, scene, gaussians, pipe, split_name, cameras, output_r
 
 def render_sets(modelset, opt_args, pipe, load_iteration, skip_train, skip_test):
     modelset.data_device = "cpu"
+    model_path = Path(modelset.model_path)
+    checkpoint_path = _resolve_checkpoint_path(model_path, load_iteration)
+    checkpoint_payload = None if checkpoint_path is None else torch.load(checkpoint_path.as_posix(), weights_only=False)
+    _apply_checkpoint_model_hints(modelset, checkpoint_payload)
     gaussians = GaussianModel(modelset)
-    scene = Scene(modelset, gaussians, load_iteration=load_iteration, shuffle=False, skip_train=skip_train, skip_test=skip_test)
-    checkpoint_path = _restore_checkpoint_if_available(Path(scene.model_path), scene.loaded_iter, gaussians, opt_args)
+    checkpoint_scene_state = checkpoint_payload if isinstance(checkpoint_payload, dict) and "gaussians" in checkpoint_payload else None
+    resolved_iteration = _resolve_iteration(model_path, load_iteration)
+    point_cloud_exists = (
+        resolved_iteration is not None
+        and (model_path / "point_cloud" / f"iteration_{resolved_iteration}" / "point_cloud.ply").exists()
+    )
+    if checkpoint_path is not None and not point_cloud_exists:
+        scene = Scene(
+            modelset,
+            gaussians,
+            shuffle=False,
+            skip_train=skip_train,
+            skip_test=skip_test,
+            checkpoint=checkpoint_path.as_posix(),
+            checkpoint_state=checkpoint_scene_state,
+        )
+    else:
+        scene = Scene(modelset, gaussians, load_iteration=load_iteration, shuffle=False, skip_train=skip_train, skip_test=skip_test)
+    restored_checkpoint_path = _restore_checkpoint_if_available(Path(scene.model_path), scene.loaded_iter, gaussians, opt_args)
 
     output_root = Path(scene.model_path) / "render_eval" / f"iteration_{scene.loaded_iter:05d}"
     output_root.mkdir(parents=True, exist_ok=True)
     metadata = {
         "iteration": int(scene.loaded_iter),
-        "checkpoint_path": None if checkpoint_path is None else checkpoint_path.as_posix(),
+        "checkpoint_path": None if restored_checkpoint_path is None else restored_checkpoint_path.as_posix(),
         "rasterizer": str(getattr(modelset, "rasterizer", "2dgs")),
         "use_textures": bool(getattr(modelset, "use_textures", False)),
         "texture_effect_mode": str(getattr(modelset, "texture_effect_mode", "per_uv")),
+        "gaussian_backend": _checkpoint_backend(checkpoint_payload),
     }
 
     results = {"meta": metadata, "splits": {}}
