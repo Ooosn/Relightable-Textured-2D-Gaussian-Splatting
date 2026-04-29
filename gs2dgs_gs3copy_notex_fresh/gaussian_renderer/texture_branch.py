@@ -58,40 +58,36 @@ def _frame_from_texture_local_q(fallback_axises, texture_local_q):
     )
 
 
-def _iter_texture_point_chunks(counts, max_points, max_texels):
-    if isinstance(counts, torch.Tensor):
-        counts_values = [int(v) for v in counts.detach().cpu().tolist()]
-    else:
-        counts_values = [int(v) for v in counts]
-    num_points = len(counts_values)
-    start = 0
-    while start < num_points:
-        end = start
-        texels = 0
-        while end < num_points and (end == start or (end - start < max_points and texels + counts_values[end] <= max_texels)):
-            texels += counts_values[end]
-            end += 1
-        yield start, end
-        start = end
-
-
-def _mean_dynamic_texture_values(flat_values, texture_dims, max_points, max_texels):
+def _mean_dynamic_texture_values(flat_values, texture_dims):
     if texture_dims.numel() == 0:
         return flat_values
     counts = (texture_dims[:, 0].to(torch.long) * texture_dims[:, 1].to(torch.long)).clamp_min(1)
     offsets = texture_dims[:, 2].to(torch.long)
     values = flat_values.reshape(flat_values.shape[0], -1)
     out = torch.empty((texture_dims.shape[0], values.shape[1]), dtype=values.dtype, device=values.device)
-    for start, end in _iter_texture_point_chunks(counts, max_points=max_points, max_texels=max_texels):
-        chunk_counts = counts[start:end]
-        flat_start = int(offsets[start].item())
-        flat_end = int((offsets[end - 1] + counts[end - 1]).item())
-        point_ids = torch.arange(start, end, dtype=torch.long, device=values.device)
-        local_ids = torch.repeat_interleave(point_ids - start, chunk_counts)
-        accum = torch.zeros((end - start, values.shape[1]), dtype=values.dtype, device=values.device)
-        accum.index_add_(0, local_ids, values[flat_start:flat_end])
-        out[start:end] = accum / chunk_counts.to(values.dtype).unsqueeze(-1)
+    point_ids = torch.arange(texture_dims.shape[0], dtype=torch.long, device=values.device)
+    texel_point_ids = torch.repeat_interleave(point_ids, counts)
+    total_texels = int(counts.sum().item())
+    if total_texels > 0:
+        starts = torch.cumsum(counts, dim=0) - counts
+        local_offsets = torch.arange(total_texels, dtype=torch.long, device=values.device) - torch.repeat_interleave(starts, counts)
+        flat_ids = torch.repeat_interleave(offsets, counts) + local_offsets
+        accum = torch.zeros_like(out)
+        accum.index_add_(0, texel_point_ids, values[flat_ids])
+        out = accum / counts.to(values.dtype).unsqueeze(-1)
     return out.reshape(texture_dims.shape[0], *flat_values.shape[1:])
+
+
+def _dynamic_texture_flat_ids(texture_dims, device):
+    counts = (texture_dims[:, 0].to(torch.long) * texture_dims[:, 1].to(torch.long)).clamp_min(1)
+    offsets = texture_dims[:, 2].to(torch.long)
+    point_ids = torch.arange(texture_dims.shape[0], dtype=torch.long, device=device)
+    texel_ids = torch.repeat_interleave(point_ids, counts.to(device))
+    total_texels = int(counts.sum().item())
+    starts = torch.cumsum(counts, dim=0) - counts
+    local_offsets = torch.arange(total_texels, dtype=torch.long, device=device) - torch.repeat_interleave(starts.to(device), counts.to(device))
+    flat_ids = torch.repeat_interleave(offsets.to(device), counts.to(device)) + local_offsets
+    return counts.to(device), texel_ids, flat_ids, total_texels
 
 
 def _look_at_2dgs(camera_position, target_position, up_dir):
@@ -237,8 +233,6 @@ def _compute_texture_shadow_pass(viewpoint_camera, gau, pipe, bg_color, scaling_
         per_point_shadow = _mean_dynamic_texture_values(
             per_uv_shadow,
             texture_dims,
-            max_points=int(getattr(gau, "texture_phase_chunk_points", 4096)),
-            max_texels=int(getattr(gau, "texture_phase_chunk_texels", 262_144)),
         ).unsqueeze(-1)
     else:
         tex_res = int(getattr(gau, "texture_resolution", 1))
@@ -297,11 +291,7 @@ def _compute_texture_mbrdf(viewpoint_camera, gau, shadow_pkg, fix_labert=False):
         texture_effect_mode = str(getattr(gau, "texture_effect_mode", "per_uv_micro_normal"))
 
         texture_dims = gau.get_texture_dims
-        counts = (texture_dims[:, 0].to(torch.long) * texture_dims[:, 1].to(torch.long)).clamp_min(1)
-        offsets = texture_dims[:, 2].to(torch.long)
-        total_texels = int(counts.sum().item())
-        chunk_points = max(1, int(getattr(gau, "texture_phase_chunk_points", 4096)))
-        chunk_texels = max(1, int(getattr(gau, "texture_phase_chunk_texels", 262_144)))
+        counts, texel_ids, flat_ids, total_texels = _dynamic_texture_flat_ids(texture_dims, dev)
         per_uv_shadow = per_uv_shadow.reshape(total_texels, 1)
 
         if texture_effect_mode == "per_uv_micro_normal":
@@ -313,58 +303,52 @@ def _compute_texture_mbrdf(viewpoint_camera, gau, shadow_pkg, fix_labert=False):
             if texture_local_q.numel() == 0:
                 texture_local_q = None
 
-            for start, end in _iter_texture_point_chunks(counts, chunk_points, chunk_texels):
-                point_ids = torch.arange(start, end, dtype=torch.long, device=dev)
-                texel_ids = torch.repeat_interleave(point_ids, counts[start:end])
-                flat_start = int(offsets[start].item())
-                flat_end = int((offsets[end - 1] + counts[end - 1]).item())
+            local_axes_uv = _frame_from_texture_local_q(
+                local_axises[texel_ids],
+                texture_local_q[flat_ids] if texture_local_q is not None else None,
+            )
+            wi_uv = wi[texel_ids]
+            wo_uv = wo[texel_ids]
+            wi_local_uv = _project_to_local(wi_uv, local_axes_uv)
+            wo_local_uv = _project_to_local(wo_uv, local_axes_uv)
+            cos_theta_uv = _NdotWi(local_axes_uv[:, :, 2], wi_uv, torch.nn.ELU(alpha=0.01), 0.01)
+            asg_uv = gau.asg_func(
+                wi_local_uv,
+                wo_local_uv,
+                gau.get_alpha_asg[texel_ids],
+                asg_scales,
+                asg_axises,
+            )
 
-                local_axes_uv = _frame_from_texture_local_q(
-                    local_axises[texel_ids],
-                    texture_local_q[flat_start:flat_end] if texture_local_q is not None else None,
-                )
-                wi_uv = wi[texel_ids]
-                wo_uv = wo[texel_ids]
-                wi_local_uv = _project_to_local(wi_uv, local_axes_uv)
-                wo_local_uv = _project_to_local(wo_uv, local_axes_uv)
-                cos_theta_uv = _NdotWi(local_axes_uv[:, :, 2], wi_uv, torch.nn.ELU(alpha=0.01), 0.01)
-                asg_uv = gau.asg_func(
-                    wi_local_uv,
-                    wo_local_uv,
-                    gau.get_alpha_asg[texel_ids],
-                    asg_scales,
-                    asg_axises,
-                )
+            decay_flat, other_effects_flat, asg_3_flat, _ = gau.neural_phasefunc(
+                wi_uv,
+                wo_uv,
+                gau.get_xyz[texel_ids],
+                gau.get_neural_material[texel_ids],
+                hint=per_uv_shadow[flat_ids],
+                asg_1=asg_uv,
+                asg_mlp=gau.asg_mlp,
+            )
+            if decay_flat is None:
+                decay_flat = torch.ones((total_texels, 1), dtype=torch.float32, device=dev)
+            if other_effects_flat is None:
+                other_effects[:] = 0.0
+            else:
+                other_effects[flat_ids] = other_effects_flat * dist_2_inv[texel_ids]
 
-                decay_flat, other_effects_flat, asg_3_flat, _ = gau.neural_phasefunc(
-                    wi_uv,
-                    wo_uv,
-                    gau.get_xyz[texel_ids],
-                    gau.get_neural_material[texel_ids],
-                    hint=per_uv_shadow[flat_start:flat_end],
-                    asg_1=asg_uv,
-                    asg_mlp=gau.asg_mlp,
-                )
-                if decay_flat is None:
-                    decay_flat = torch.ones((flat_end - flat_start, 1), dtype=torch.float32, device=dev)
-                if other_effects_flat is None:
-                    other_effects[flat_start:flat_end] = 0.0
-                else:
-                    other_effects[flat_start:flat_end] = other_effects_flat * dist_2_inv[texel_ids]
-
-                diffuse_flat = gau.get_kd[texel_ids] * texture_multiplier[flat_start:flat_end] / math.pi
-                if fix_labert:
-                    specular_flat = 0.0
-                else:
-                    if asg_3_flat is None:
-                        asg_3_flat = asg_uv
-                    specular_flat = gau.get_ks[texel_ids] * asg_3_flat
-                basecolor[flat_start:flat_end] = (
-                    (diffuse_flat + specular_flat)
-                    * cos_theta_uv
-                    * dist_2_inv[texel_ids]
-                )
-                shadow[flat_start:flat_end] = decay_flat
+            diffuse_flat = gau.get_kd[texel_ids] * texture_multiplier[flat_ids] / math.pi
+            if fix_labert:
+                specular_flat = 0.0
+            else:
+                if asg_3_flat is None:
+                    asg_3_flat = asg_uv
+                specular_flat = gau.get_ks[texel_ids] * asg_3_flat
+            basecolor[flat_ids] = (
+                (diffuse_flat + specular_flat)
+                * cos_theta_uv
+                * dist_2_inv[texel_ids]
+            )
+            shadow[flat_ids] = decay_flat
 
             return {"basecolor": basecolor, "shadow": shadow, "other_effects": other_effects}
 
@@ -374,8 +358,6 @@ def _compute_texture_mbrdf(viewpoint_camera, gau, shadow_pkg, fix_labert=False):
                 point_shadow = _mean_dynamic_texture_values(
                     per_uv_shadow,
                     texture_dims,
-                    max_points=chunk_points,
-                    max_texels=chunk_texels,
                 )
             decay_g, other_effects_g, _, _ = gau.neural_phasefunc(
                 wi,
@@ -399,25 +381,19 @@ def _compute_texture_mbrdf(viewpoint_camera, gau, shadow_pkg, fix_labert=False):
             if specular_gain.numel() == 0:
                 specular_gain = torch.ones((total_texels, 1), dtype=torch.float32, device=dev)
 
-            for start, end in _iter_texture_point_chunks(counts, chunk_points, chunk_texels):
-                point_ids = torch.arange(start, end, dtype=torch.long, device=dev)
-                texel_ids = torch.repeat_interleave(point_ids, counts[start:end])
-                flat_start = int(offsets[start].item())
-                flat_end = int((offsets[end - 1] + counts[end - 1]).item())
-
-                diffuse_flat = gau.get_kd[texel_ids] * texture_multiplier[flat_start:flat_end] / math.pi
-                if fix_labert:
-                    specular_flat = 0.0
-                else:
-                    specular_flat = gau.get_ks[texel_ids] * asg_1[texel_ids] * specular_gain[flat_start:flat_end]
-                basecolor[flat_start:flat_end] = (
-                    (diffuse_flat + specular_flat)
-                    * cos_theta[texel_ids]
-                    * dist_2_inv[texel_ids]
-                )
-                shadow_delta = per_uv_shadow[flat_start:flat_end] - point_shadow[texel_ids]
-                shadow[flat_start:flat_end] = torch.clamp(decay_g[texel_ids] + shadow_delta, 0.0, 1.0)
-                other_effects[flat_start:flat_end] = other_effects_g[texel_ids] * dist_2_inv[texel_ids]
+            diffuse_flat = gau.get_kd[texel_ids] * texture_multiplier[flat_ids] / math.pi
+            if fix_labert:
+                specular_flat = 0.0
+            else:
+                specular_flat = gau.get_ks[texel_ids] * asg_1[texel_ids] * specular_gain[flat_ids]
+            basecolor[flat_ids] = (
+                (diffuse_flat + specular_flat)
+                * cos_theta[texel_ids]
+                * dist_2_inv[texel_ids]
+            )
+            shadow_delta = per_uv_shadow[flat_ids] - point_shadow[texel_ids]
+            shadow[flat_ids] = torch.clamp(decay_g[texel_ids] + shadow_delta, 0.0, 1.0)
+            other_effects[flat_ids] = other_effects_g[texel_ids] * dist_2_inv[texel_ids]
 
             return {"basecolor": basecolor, "shadow": shadow, "other_effects": other_effects}
 
@@ -429,45 +405,35 @@ def _compute_texture_mbrdf(viewpoint_camera, gau, shadow_pkg, fix_labert=False):
         other_effects = torch.empty((total_texels, 3), dtype=torch.float32, device=dev)
         texture_multiplier = 2.0 * gau.get_texture_color
 
-        for start, end in _iter_texture_point_chunks(counts, chunk_points, chunk_texels):
-            point_ids = torch.arange(start, end, dtype=torch.long, device=dev)
-            texel_ids = torch.repeat_interleave(point_ids, counts[start:end])
-            flat_start = int(offsets[start].item())
-            flat_end = int((offsets[end - 1] + counts[end - 1]).item())
-            num_texels = flat_end - flat_start
+        decay_flat, other_effects_flat, asg_3_flat, _ = gau.neural_phasefunc(
+            wi[texel_ids],
+            wo[texel_ids],
+            gau.get_xyz[texel_ids],
+            gau.get_neural_material[texel_ids],
+            hint=per_uv_shadow[flat_ids],
+            asg_1=asg_1[texel_ids],
+            asg_mlp=gau.asg_mlp,
+        )
+        if decay_flat is None:
+            decay_flat = torch.ones((total_texels, 1), dtype=torch.float32, device=dev)
+        if other_effects_flat is None:
+            other_effects[:] = 0.0
+        else:
+            other_effects[flat_ids] = other_effects_flat * (1.0 / wi_dist2[texel_ids])
 
-            def _expand_chunk(tensor):
-                return tensor[texel_ids]
-
-            decay_flat, other_effects_flat, asg_3_flat, _ = gau.neural_phasefunc(
-                _expand_chunk(wi),
-                _expand_chunk(wo),
-                _expand_chunk(gau.get_xyz),
-                _expand_chunk(gau.get_neural_material),
-                hint=per_uv_shadow[flat_start:flat_end],
-                asg_1=_expand_chunk(asg_1),
-                asg_mlp=gau.asg_mlp,
-            )
-            if decay_flat is None:
-                decay_flat = torch.ones((num_texels, 1), dtype=torch.float32, device=dev)
-            if other_effects_flat is None:
-                other_effects[flat_start:flat_end] = 0.0
-            else:
-                other_effects[flat_start:flat_end] = other_effects_flat * (1.0 / _expand_chunk(wi_dist2))
-
-            if fix_labert:
-                specular_flat = 0.0
-            else:
-                if asg_3_flat is None:
-                    asg_3_flat = _expand_chunk(asg_1)
-                specular_flat = _expand_chunk(gau.get_ks) * asg_3_flat
-            diffuse_flat = _expand_chunk(gau.get_kd) * texture_multiplier[flat_start:flat_end] / math.pi
-            shadow[flat_start:flat_end] = decay_flat
-            basecolor[flat_start:flat_end] = (
-                (diffuse_flat + specular_flat)
-                * _expand_chunk(cos_theta)
-                * _expand_chunk(dist_2_inv)
-            )
+        if fix_labert:
+            specular_flat = 0.0
+        else:
+            if asg_3_flat is None:
+                asg_3_flat = asg_1[texel_ids]
+            specular_flat = gau.get_ks[texel_ids] * asg_3_flat
+        diffuse_flat = gau.get_kd[texel_ids] * texture_multiplier[flat_ids] / math.pi
+        shadow[flat_ids] = decay_flat
+        basecolor[flat_ids] = (
+            (diffuse_flat + specular_flat)
+            * cos_theta[texel_ids]
+            * dist_2_inv[texel_ids]
+        )
 
         return {"basecolor": basecolor, "shadow": shadow, "other_effects": other_effects}
 
@@ -483,66 +449,62 @@ def _compute_texture_mbrdf(viewpoint_camera, gau, shadow_pkg, fix_labert=False):
         if texture_local_q.numel() == 0:
             texture_local_q = None
 
-        chunk_points = max(1, int(getattr(gau, "texture_phase_chunk_points", 4096)))
-        for start in range(0, num_points, chunk_points):
-            end = min(start + chunk_points, num_points)
-            count = end - start
-            num_texels = count * tex_res * tex_res
-            texel_ids = torch.arange(start, end, dtype=torch.long, device=dev).repeat_interleave(tex_res * tex_res)
-            q = (
-                texture_local_q[start:end].permute(0, 2, 3, 1).reshape(num_texels, 4)
-                if texture_local_q is not None
-                else None
-            )
-            local_axes_uv = _frame_from_texture_local_q(local_axises[texel_ids], q)
-            wi_uv = wi[texel_ids]
-            wo_uv = wo[texel_ids]
-            wi_local_uv = _project_to_local(wi_uv, local_axes_uv)
-            wo_local_uv = _project_to_local(wo_uv, local_axes_uv)
-            cos_theta_uv = _NdotWi(local_axes_uv[:, :, 2], wi_uv, torch.nn.ELU(alpha=0.01), 0.01)
-            asg_uv = gau.asg_func(
-                wi_local_uv,
-                wo_local_uv,
-                gau.get_alpha_asg[texel_ids],
-                asg_scales,
-                asg_axises,
-            )
+        num_texels = num_points * tex_res * tex_res
+        texel_ids = torch.arange(num_points, dtype=torch.long, device=dev).repeat_interleave(tex_res * tex_res)
+        q = (
+            texture_local_q.permute(0, 2, 3, 1).reshape(num_texels, 4)
+            if texture_local_q is not None
+            else None
+        )
+        local_axes_uv = _frame_from_texture_local_q(local_axises[texel_ids], q)
+        wi_uv = wi[texel_ids]
+        wo_uv = wo[texel_ids]
+        wi_local_uv = _project_to_local(wi_uv, local_axes_uv)
+        wo_local_uv = _project_to_local(wo_uv, local_axes_uv)
+        cos_theta_uv = _NdotWi(local_axes_uv[:, :, 2], wi_uv, torch.nn.ELU(alpha=0.01), 0.01)
+        asg_uv = gau.asg_func(
+            wi_local_uv,
+            wo_local_uv,
+            gau.get_alpha_asg[texel_ids],
+            asg_scales,
+            asg_axises,
+        )
 
-            decay_flat, other_effects_flat, asg_3_flat, _ = gau.neural_phasefunc(
-                wi_uv,
-                wo_uv,
-                gau.get_xyz[texel_ids],
-                gau.get_neural_material[texel_ids],
-                hint=per_uv_shadow[start:end].reshape(num_texels, 1),
-                asg_1=asg_uv,
-                asg_mlp=gau.asg_mlp,
-            )
-            if decay_flat is None:
-                decay_flat = torch.ones((num_texels, 1), dtype=torch.float32, device=dev)
-            shadow[start:end] = decay_flat.reshape(count, tex_res, tex_res, 1).permute(0, 3, 1, 2).contiguous()
-            if other_effects_flat is None:
-                other_effects[start:end] = 0.0
-            else:
-                other_effects[start:end] = (
-                    other_effects_flat * dist_2_inv[texel_ids]
-                ).reshape(count, tex_res, tex_res, 3).permute(0, 3, 1, 2).contiguous()
+        decay_flat, other_effects_flat, asg_3_flat, _ = gau.neural_phasefunc(
+            wi_uv,
+            wo_uv,
+            gau.get_xyz[texel_ids],
+            gau.get_neural_material[texel_ids],
+            hint=per_uv_shadow.reshape(num_texels, 1),
+            asg_1=asg_uv,
+            asg_mlp=gau.asg_mlp,
+        )
+        if decay_flat is None:
+            decay_flat = torch.ones((num_texels, 1), dtype=torch.float32, device=dev)
+        shadow[:] = decay_flat.reshape(num_points, tex_res, tex_res, 1).permute(0, 3, 1, 2).contiguous()
+        if other_effects_flat is None:
+            other_effects[:] = 0.0
+        else:
+            other_effects[:] = (
+                other_effects_flat * dist_2_inv[texel_ids]
+            ).reshape(num_points, tex_res, tex_res, 3).permute(0, 3, 1, 2).contiguous()
 
-            diffuse_flat = (
-                gau.get_kd[texel_ids]
-                * texture_multiplier[start:end].permute(0, 2, 3, 1).reshape(num_texels, 3)
-                / math.pi
-            )
-            if fix_labert:
-                specular_flat = 0.0
-            else:
-                if asg_3_flat is None:
-                    asg_3_flat = asg_uv
-                specular_flat = gau.get_ks[texel_ids] * asg_3_flat
-            basecolor[start:end] = (
-                (diffuse_flat + specular_flat)
-                * cos_theta_uv
-                * dist_2_inv[texel_ids]
-            ).reshape(count, tex_res, tex_res, 3).permute(0, 3, 1, 2).contiguous()
+        diffuse_flat = (
+            gau.get_kd[texel_ids]
+            * texture_multiplier.permute(0, 2, 3, 1).reshape(num_texels, 3)
+            / math.pi
+        )
+        if fix_labert:
+            specular_flat = 0.0
+        else:
+            if asg_3_flat is None:
+                asg_3_flat = asg_uv
+            specular_flat = gau.get_ks[texel_ids] * asg_3_flat
+        basecolor[:] = (
+            (diffuse_flat + specular_flat)
+            * cos_theta_uv
+            * dist_2_inv[texel_ids]
+        ).reshape(num_points, tex_res, tex_res, 3).permute(0, 3, 1, 2).contiguous()
 
         return {"basecolor": basecolor, "shadow": shadow, "other_effects": other_effects}
 
@@ -578,7 +540,6 @@ def _compute_texture_mbrdf(viewpoint_camera, gau, shadow_pkg, fix_labert=False):
         basecolor = (texture_diffuse + specular_uv) * cos_theta[:, :, None, None] * dist_2_inv[:, :, None, None]
         return {"basecolor": basecolor, "shadow": shadow, "other_effects": other_effects}
 
-    chunk_points = max(1, int(getattr(gau, "texture_phase_chunk_points", 4096)))
     shadow = torch.empty((num_points, tex_res, tex_res), dtype=torch.float32, device=dev)
     specular_uv = torch.empty((num_points, 3, tex_res, tex_res), dtype=torch.float32, device=dev)
     if texture_effect_mode == "per_uv":
@@ -588,49 +549,45 @@ def _compute_texture_mbrdf(viewpoint_camera, gau, shadow_pkg, fix_labert=False):
     else:
         raise ValueError(f"Unknown texture_effect_mode: {texture_effect_mode}")
 
-    for start in range(0, num_points, chunk_points):
-        end = min(start + chunk_points, num_points)
-        count = end - start
-        num_texels = count * tex_res * tex_res
+    num_texels = num_points * tex_res * tex_res
+    texel_ids = torch.arange(num_points, dtype=torch.long, device=dev).repeat_interleave(tex_res * tex_res)
 
-        def _expand_chunk(tensor):
-            tensor = tensor[start:end]
-            dim = tensor.shape[-1]
-            return tensor[:, None, None, :].expand(count, tex_res, tex_res, dim).reshape(num_texels, dim)
+    def _expand_all(tensor):
+        dim = tensor.shape[-1]
+        return tensor[:, None, None, :].expand(num_points, tex_res, tex_res, dim).reshape(num_texels, dim)
 
-        decay_flat, other_effects_flat, asg_3_flat, _ = gau.neural_phasefunc(
-            _expand_chunk(wi),
-            _expand_chunk(wo),
-            _expand_chunk(gau.get_xyz),
-            _expand_chunk(gau.get_neural_material),
-            hint=per_uv_shadow[start:end].reshape(num_texels, 1),
-            asg_1=_expand_chunk(asg_1),
-            asg_mlp=gau.asg_mlp,
-        )
-        if decay_flat is None:
-            decay_flat = torch.ones((num_texels, 1), dtype=torch.float32, device=dev)
+    decay_flat, other_effects_flat, asg_3_flat, _ = gau.neural_phasefunc(
+        _expand_all(wi),
+        _expand_all(wo),
+        _expand_all(gau.get_xyz),
+        _expand_all(gau.get_neural_material),
+        hint=per_uv_shadow.reshape(num_texels, 1),
+        asg_1=_expand_all(asg_1),
+        asg_mlp=gau.asg_mlp,
+    )
+    if decay_flat is None:
+        decay_flat = torch.ones((num_texels, 1), dtype=torch.float32, device=dev)
 
-        shadow[start:end] = decay_flat.reshape(count, tex_res, tex_res)
-        if fix_labert:
-            specular_uv[start:end] = 0.0
+    shadow[:] = decay_flat.reshape(num_points, tex_res, tex_res)
+    if fix_labert:
+        specular_uv[:] = 0.0
+    else:
+        if asg_3_flat is None:
+            asg_3_flat = _expand_all(asg_1)
+        specular_uv[:] = (
+            _expand_all(gau.get_ks) * asg_3_flat
+        ).reshape(num_points, tex_res, tex_res, 3).permute(0, 3, 1, 2).contiguous()
+
+    if other_effects_flat is None:
+        other_effects[:] = 0.0
+    else:
+        other_effects_uv = (
+            other_effects_flat * (1.0 / _expand_all(wi_dist2))
+        ).reshape(num_points, tex_res, tex_res, 3).permute(0, 3, 1, 2).contiguous()
+        if texture_effect_mode == "per_uv":
+            other_effects[:] = other_effects_uv
         else:
-            if asg_3_flat is None:
-                asg_3_flat = _expand_chunk(asg_1)
-            specular_chunk = (
-                _expand_chunk(gau.get_ks) * asg_3_flat
-            ).reshape(count, tex_res, tex_res, 3).permute(0, 3, 1, 2).contiguous()
-            specular_uv[start:end] = specular_chunk
-
-        if other_effects_flat is None:
-            other_effects[start:end] = 0.0
-        else:
-            other_effects_uv = (
-                other_effects_flat * (1.0 / _expand_chunk(wi_dist2))
-            ).reshape(count, tex_res, tex_res, 3).permute(0, 3, 1, 2).contiguous()
-            if texture_effect_mode == "per_uv":
-                other_effects[start:end] = other_effects_uv
-            else:
-                other_effects[start:end] = other_effects_uv.mean(dim=(2, 3))
+            other_effects[:] = other_effects_uv.mean(dim=(2, 3))
 
     texture_diffuse = gau.get_kd[:, :, None, None] * (2.0 * gau.get_texture_color) / math.pi
     basecolor = (texture_diffuse + specular_uv) * cos_theta[:, :, None, None] * dist_2_inv[:, :, None, None]

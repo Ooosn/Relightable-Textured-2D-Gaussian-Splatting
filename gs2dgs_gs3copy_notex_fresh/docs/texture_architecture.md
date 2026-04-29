@@ -33,6 +33,11 @@ Texture level: tex_color, tex_alpha, tex_normal/local_q
 `tex_color` and `tex_alpha` are default texture-rasterizer channels and are
 expected to exist. Do not call their existence a bug.
 
+Current per-step texture phase is intentionally unchunked: per-UV shadow,
+normal/ASG, shadow MLP, and other-effect MLP are evaluated as full tensors.
+Only RTG score/refine keeps `texture_rtg_chunk_texels`, because that is a
+separate refinement/aggregation path rather than the normal render step.
+
 ## Main Files
 
 - `arguments/__init__.py`
@@ -436,4 +441,3 @@ conversion did not change initial rendering at texture start.
   `tex_normal` should exactly equal expanded/repeated Gaussian `local_q`.
 - Do not compare texture and no-texture runs unless source path, data device,
   view count, densification threshold, checkpoint, and test iterations match.
-

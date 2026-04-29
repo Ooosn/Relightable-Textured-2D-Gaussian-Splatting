@@ -112,8 +112,6 @@ class _NativeTextureAdapter(_TextureGaussianModel2DGS):
         self.texture_sigma_factor = float(getattr(modelset, "texture_sigma_factor", 3.0))
         self.texture_effect_mode = str(getattr(modelset, "texture_effect_mode", "per_uv_micro_normal"))
         self.texture_normal_scale = float(getattr(modelset, "texture_normal_scale", 0.35))
-        self.texture_phase_chunk_points = int(getattr(modelset, "texture_phase_chunk_points", 4096))
-        self.texture_phase_chunk_texels = int(getattr(modelset, "texture_phase_chunk_texels", 262_144))
         self.gs2dgs_backend = "native"
 
     def update_learning_rate(self, iteration, asg_freeze_step=0, local_q_freeze_step=0, freeze_phasefunc_steps=0):

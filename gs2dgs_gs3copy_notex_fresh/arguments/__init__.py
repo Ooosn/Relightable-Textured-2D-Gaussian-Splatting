@@ -103,8 +103,6 @@ class ModelParams(ParamGroup):
         self.texture_max_resolution = 64
         self.texture_effect_mode = "per_uv_micro_normal"
         self.texture_normal_scale = 0.35
-        self.texture_phase_chunk_points = 4096
-        self.texture_phase_chunk_texels = 262_144
 
 
         """
