@@ -5,8 +5,8 @@ set -euo pipefail
 #
 # This script is intentionally the single source of truth for Fish no-texture /
 # texture comparisons in this copy.  Keep the common optimization arguments
-# identical to gs3/test.sh; texture experiments may only add texture flags and a
-# start checkpoint.
+# identical to gs3/test.sh; texture experiments may only add texture flags and,
+# for resume comparisons, a start checkpoint.
 
 ROOT="${ROOT:-/home/wangyy/RTS/gs2dgs_gs3copy_notex_fresh}"
 DATA_ROOT="${DATA_ROOT:-/home/wangyy/data_download/gsrelight}"
@@ -16,10 +16,10 @@ MODEL="${MODEL:-Fish}"
 VIEW_NUM="${VIEW_NUM:-2000}"
 ITERATIONS="${ITERATIONS:-100000}"
 CONDA_ENV="${CONDA_ENV:-gs3}"
-PYTHON_BIN="${PYTHON_BIN:-/home/wangyy/miniconda3/bin/conda run -n ${CONDA_ENV} python}"
+PYTHON_BIN="${PYTHON_BIN:-/home/wangyy/miniconda3/envs/${CONDA_ENV}/bin/python -u}"
 read -r -a PYTHON_CMD <<< "${PYTHON_BIN}"
 
-export PYTHONPATH="/home/wangyy/RTS/gs2dgs/submodules/simple-knn:/home/wangyy/RTS/gs2dgs/submodules/diff-surfel-rasterization:/home/wangyy/RTS/gs2dgs/submodules/diff-surfel-rasterization-shadow:/home/wangyy/RTS/gs2dgs/submodules/surfel-texture:/home/wangyy/RTS/gs2dgs/submodules/surfel-texture-deferred:${ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
+export PYTHONPATH="${ROOT}/submodules/simple-knn:${ROOT}/submodules/diff-gaussian-rasterization:${ROOT}/submodules/diff-gaussian-rasterization_light:${ROOT}/submodules/diff-gaussian-rasterization_hgs:${ROOT}/submodules/v_3dgs:${ROOT}/submodules/v_3dgs_ortho:${ROOT}/../2dgs/submodules/surfel-texture:${ROOT}/../2dgs/submodules/surfel-texture-deferred:${ROOT}/../2dgs/submodules/diff-surfel-rasterization-shadow:${ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
 
 COMMON_ARGS=(
   -s "${DATA_ROOT}/${SUBTASK}/${MODEL}/${MODEL}"
@@ -60,6 +60,7 @@ COMMON_ARGS=(
 usage() {
   echo "Usage:"
   echo "  $0 notex-full RUN_NAME"
+  echo "  $0 tex-full RUN_NAME"
   echo "  $0 notex-from-30k RUN_NAME /path/to/chkpnt30000.pth"
   echo "  $0 tex-from-30k RUN_NAME /path/to/chkpnt30000.pth"
 }
@@ -78,6 +79,15 @@ case "${mode}" in
     "${PYTHON_CMD[@]}" train.py \
       "${COMMON_ARGS[@]}" \
       -m "${RUN_ROOT}/${run_name}"
+    ;;
+  tex-full)
+    "${PYTHON_CMD[@]}" train.py \
+      "${COMMON_ARGS[@]}" \
+      -m "${RUN_ROOT}/${run_name}" \
+      --use_textures \
+      --texture_resolution 4 \
+      --texture_effect_mode per_uv_micro_normal \
+      --texture_start_iter 30000
     ;;
   notex-from-30k)
     start_checkpoint="${3:-}"

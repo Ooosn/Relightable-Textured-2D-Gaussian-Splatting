@@ -8,6 +8,8 @@ _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 _SUBMODULE_PATHS = [
     os.path.join(_REPO_ROOT, "submodules", "surfel-texture"),
     os.path.join(_REPO_ROOT, "submodules", "surfel-texture-deferred"),
+    os.path.join(_REPO_ROOT, "..", "2dgs", "submodules", "surfel-texture"),
+    os.path.join(_REPO_ROOT, "..", "2dgs", "submodules", "surfel-texture-deferred"),
     os.path.join(_REPO_ROOT, "..", "gs2dgs", "submodules", "surfel-texture"),
     os.path.join(_REPO_ROOT, "..", "gs2dgs", "submodules", "surfel-texture-deferred"),
 ]
@@ -124,7 +126,6 @@ def rasterize_with_texture_module(viewpoint_camera, pc, pipe, bg_color, scaling_
             cov3D_precomp=cov3D_precomp,
             texture_color=texture_color,
             texture_alpha=texture_alpha,
-            texture_dims=texture_dims,
             use_textures=use_tex,
             transmat_grad_holder=transmat_grad_holder,
         )
@@ -160,7 +161,6 @@ def rasterize_with_texture_module(viewpoint_camera, pc, pipe, bg_color, scaling_
         cov3D_precomp=cov3D_precomp,
         texture_color=texture_color,
         texture_alpha=texture_alpha,
-        texture_dims=texture_dims,
         use_textures=use_tex,
         transmat_grad_holder=transmat_grad_holder,
     )

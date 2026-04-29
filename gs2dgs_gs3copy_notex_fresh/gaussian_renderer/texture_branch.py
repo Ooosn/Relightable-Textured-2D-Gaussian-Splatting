@@ -173,10 +173,15 @@ def _compute_texture_shadow_pass(viewpoint_camera, gau, pipe, bg_color, scaling_
 
     means3d = gau.get_xyz
     lt = _build_light_transform_2dgs(viewpoint_camera, means3d, pipe)
-    use_per_uv_shadow = bool(per_uv)
+    dynamic_textures = bool(getattr(gau, "has_dynamic_textures", False))
+    # The current shadow CUDA path indexes texture_alpha as [P, 1, R, R].
+    # Dynamic flat-atlas textures do not match that interface yet, so keep the
+    # shadow pass per-Gaussian for dynamic atlases instead of passing invalid
+    # texture_dims into the rasterizer.
+    use_per_uv_shadow = bool(per_uv) and not dynamic_textures
     texture_dims = (
         gau.get_texture_dims
-        if use_per_uv_shadow and bool(getattr(gau, "has_dynamic_textures", False))
+        if dynamic_textures
         else torch.empty(0, device="cuda", dtype=torch.int32)
     )
 
@@ -210,7 +215,6 @@ def _compute_texture_shadow_pass(viewpoint_camera, gau, pipe, bg_color, scaling_
         rotations=gau.get_rotation,
         cov3Ds_precomp=None,
         texture_alpha=gau.get_texture_alpha if use_per_uv_shadow else torch.empty(0, device="cuda"),
-        texture_dims=texture_dims,
         texture_sigma_factor=float(getattr(gau, "texture_sigma_factor", 3.0)),
         non_trans=None,
         offset=getattr(pipe, "shadow_offset", 0.015),
