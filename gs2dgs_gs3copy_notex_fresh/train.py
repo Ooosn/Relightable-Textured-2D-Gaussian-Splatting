@@ -582,6 +582,9 @@ def training(modelset, opt, pipe, testing_iterations, saving_iterations, checkpo
     texture_requested = bool(getattr(modelset, "use_textures", False))
     texture_start_iter = int(getattr(opt, "texture_start_iter", 0))
     gaussian_densify_until_iter = int(opt.densify_until_iter)
+    if texture_requested and bool(getattr(opt, "texture_freeze_gaussian_densify", False)):
+        gaussian_densify_until_iter = min(gaussian_densify_until_iter, texture_start_iter)
+        print(f"Gaussian densification capped at iteration {gaussian_densify_until_iter} for texture training")
     if bool(getattr(opt, "texture_rtg_enabled", False)) and bool(getattr(opt, "texture_rtg_freeze_gaussian_densify", True)):
         gaussian_densify_until_iter = min(
             gaussian_densify_until_iter,

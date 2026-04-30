@@ -10,8 +10,6 @@ _SUBMODULE_PATHS = [
     os.path.join(_REPO_ROOT, "submodules", "surfel-texture-deferred"),
     os.path.join(_REPO_ROOT, "..", "2dgs", "submodules", "surfel-texture"),
     os.path.join(_REPO_ROOT, "..", "2dgs", "submodules", "surfel-texture-deferred"),
-    os.path.join(_REPO_ROOT, "..", "gs2dgs", "submodules", "surfel-texture"),
-    os.path.join(_REPO_ROOT, "..", "gs2dgs", "submodules", "surfel-texture-deferred"),
 ]
 for _path in reversed(_SUBMODULE_PATHS):
     if os.path.isdir(_path) and _path not in sys.path:

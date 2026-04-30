@@ -419,17 +419,25 @@ conversion did not change initial rendering at texture start.
    - `neural_phasefunc(..., asg_1=asg_uv, asg_mlp=False)` returns `asg_uv`
      unchanged as `asg_3`.
 
-4. Some Python paths still refer to sibling `gs2dgs/submodules`.
-   - This is a reproducibility/cleanliness issue.
-   - It is not the same thing as a formula bug.
-   - If this copy must be standalone, vendor the surfel texture/shadow
-     submodules into this directory and update path setup.
+4. Runtime paths must not fall back to sibling `gs2dgs/submodules`.
+   - The active Python path setup uses this tree first and the sibling `2dgs`
+     vendored surfel modules as the temporary CUDA source.
+   - Do not add `../gs2dgs/submodules` fallbacks back into renderer imports.
+   - If this copy must be fully standalone, vendor the surfel texture/shadow
+     submodules into this directory and keep this rule unchanged.
 
 5. RTG normal refinement currently uses bilinear upsampling.
    - This is a design choice in the current code, not an exact parent-pixel
      copy.
    - If exact inheritance is desired, change `_resize_dynamic_textures()` and
      `_resize_dynamic_optimizer_state()` for `tex_normal` to nearest/replicate.
+
+6. `--texture_freeze_gaussian_densify` is an experiment control, not a default.
+   - Default is off, so no-texture and historical texture runs keep their normal
+     densification schedule.
+   - Enable it when testing whether texture-space parameters should absorb
+     high-frequency relighting after `texture_start_iter` without continued
+     Gaussian clone/split/prune changes.
 
 ## Common Mistakes To Avoid
 

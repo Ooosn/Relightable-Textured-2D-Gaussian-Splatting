@@ -8,7 +8,8 @@ import torch.nn.functional as F
 
 _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 _SUBMODULE_PATHS = [
-    os.path.join(_REPO_ROOT, "..", "gs2dgs", "submodules", "diff-surfel-rasterization-shadow"),
+    os.path.join(_REPO_ROOT, "submodules", "diff-surfel-rasterization-shadow"),
+    os.path.join(_REPO_ROOT, "..", "2dgs", "submodules", "diff-surfel-rasterization-shadow"),
 ]
 for _path in reversed(_SUBMODULE_PATHS):
     if os.path.isdir(_path) and _path not in sys.path:

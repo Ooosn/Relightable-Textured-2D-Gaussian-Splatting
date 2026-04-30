@@ -23,6 +23,7 @@ CONDA_ENV="${CONDA_ENV:-gs3}"
 PYTHON_BIN="${PYTHON_BIN:-/home/wangyy/miniconda3/envs/${CONDA_ENV}/bin/python -u}"
 TEXTURE_EFFECT_MODE="${TEXTURE_EFFECT_MODE:-per_uv_micro_normal}"
 TEXTURE_NORMAL_LR_SCALE="${TEXTURE_NORMAL_LR_SCALE:-1.0}"
+TEXTURE_FREEZE_GAUSSIAN_DENSIFY="${TEXTURE_FREEZE_GAUSSIAN_DENSIFY:-0}"
 read -r -a PYTHON_CMD <<< "${PYTHON_BIN}"
 
 export PYTHONPATH="${ROOT}/submodules/simple-knn:${ROOT}/submodules/diff-gaussian-rasterization:${ROOT}/submodules/diff-gaussian-rasterization_light:${ROOT}/submodules/diff-gaussian-rasterization_hgs:${ROOT}/submodules/v_3dgs:${ROOT}/submodules/v_3dgs_ortho:${ROOT}/../2dgs/submodules/surfel-texture:${ROOT}/../2dgs/submodules/surfel-texture-deferred:${ROOT}/../2dgs/submodules/diff-surfel-rasterization-shadow:${ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
@@ -63,6 +64,17 @@ COMMON_ARGS=(
   --eval
 )
 
+TEXTURE_ARGS=(
+  --use_textures
+  --texture_resolution 4
+  --texture_effect_mode "${TEXTURE_EFFECT_MODE}"
+  --texture_normal_lr_scale "${TEXTURE_NORMAL_LR_SCALE}"
+  --texture_start_iter 30000
+)
+if [[ "${TEXTURE_FREEZE_GAUSSIAN_DENSIFY}" == "1" || "${TEXTURE_FREEZE_GAUSSIAN_DENSIFY}" == "true" ]]; then
+  TEXTURE_ARGS+=(--texture_freeze_gaussian_densify)
+fi
+
 usage() {
   echo "Usage:"
   echo "  $0 notex-full RUN_NAME"
@@ -90,11 +102,7 @@ case "${mode}" in
     "${PYTHON_CMD[@]}" train.py \
       "${COMMON_ARGS[@]}" \
       -m "${RUN_ROOT}/${run_name}" \
-      --use_textures \
-      --texture_resolution 4 \
-      --texture_effect_mode "${TEXTURE_EFFECT_MODE}" \
-      --texture_normal_lr_scale "${TEXTURE_NORMAL_LR_SCALE}" \
-      --texture_start_iter 30000
+      "${TEXTURE_ARGS[@]}"
     ;;
   notex-from-30k)
     start_checkpoint="${3:-}"
@@ -125,11 +133,7 @@ case "${mode}" in
       "${COMMON_ARGS[@]}" \
       -m "${RUN_ROOT}/${run_name}" \
       --start_checkpoint "${start_checkpoint}" \
-      --use_textures \
-      --texture_resolution 4 \
-      --texture_effect_mode "${TEXTURE_EFFECT_MODE}" \
-      --texture_normal_lr_scale "${TEXTURE_NORMAL_LR_SCALE}" \
-      --texture_start_iter 30000
+      "${TEXTURE_ARGS[@]}"
     ;;
   *)
     usage
