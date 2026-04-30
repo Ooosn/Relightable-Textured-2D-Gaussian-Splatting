@@ -117,6 +117,7 @@ class GaussianModel:
         self.texture_rtg_min_score = 1e-10
         self.texture_rtg_resolution_gamma = 1.0
         self.texture_rtg_chunk_texels = 262_144
+        self.texture_rtg_optimizer_state_scale = 0.5
         self.texture_normal_scale = 0.35
         self._last_rtg_refine_log = {}
         self.setup_functions()
@@ -164,6 +165,7 @@ class GaussianModel:
                 "tex_specular": self._tex_specular,
                 "tex_normal": self._tex_normal,
                 "texture_normal_scale": self.texture_normal_scale,
+                "texture_rtg_optimizer_state_scale": self.texture_rtg_optimizer_state_scale,
             },
         )
 
@@ -265,6 +267,7 @@ class GaussianModel:
             tex_normal = extra_state.get("tex_normal", torch.empty(0))
             self._tex_normal = tex_normal.to(device="cuda", dtype=torch.float32) if isinstance(tex_normal, torch.Tensor) else torch.empty(0, device="cuda")
             self.texture_normal_scale = float(extra_state.get("texture_normal_scale", getattr(self, "texture_normal_scale", 0.35)))
+            self.texture_rtg_optimizer_state_scale = float(extra_state.get("texture_rtg_optimizer_state_scale", getattr(self, "texture_rtg_optimizer_state_scale", 0.5)))
             if self.use_mbrdf:
                 self._initialize_mbrdf_modules()
                 if asg_state is not None:
@@ -752,6 +755,7 @@ class GaussianModel:
         self.texture_rtg_min_score = float(getattr(training_args, "texture_rtg_min_score", 1e-10))
         self.texture_rtg_resolution_gamma = float(getattr(training_args, "texture_rtg_resolution_gamma", 1.0))
         self.texture_rtg_chunk_texels = int(getattr(training_args, "texture_rtg_chunk_texels", 262_144))
+        self.texture_rtg_optimizer_state_scale = float(getattr(training_args, "texture_rtg_optimizer_state_scale", 0.5))
         if self._tex_color.numel() == 0:
             self.initialize_texture_state(neutral_multiplier=True)
         if self.use_mbrdf and self._tex_specular.numel() == 0:
@@ -947,11 +951,10 @@ class GaussianModel:
             value = state.get(key)
             if not isinstance(value, torch.Tensor) or value.shape[0] != self._tex_color.shape[0]:
                 continue
-            selected_value = self._gather_dynamic_tensor_by_mask(value, selected_pts_mask)
-            if selected_value is None:
-                selected_value = torch.zeros((appended_texels, value.shape[1]), dtype=value.dtype, device=value.device)
-            elif repeat_count > 1:
-                selected_value = selected_value.repeat(repeat_count, 1)
+            # Gaussian-level densification duplicates texture values, but new
+            # Gaussians should start with fresh Adam moments, matching gs3's
+            # per-Gaussian parameter behavior.
+            selected_value = torch.zeros((appended_texels, value.shape[1]), dtype=value.dtype, device=value.device)
             appended_state[key] = torch.cat([value, selected_value], dim=0)
         return appended_state or None
 
@@ -969,6 +972,7 @@ class GaussianModel:
         total_texels = int(new_counts.sum().item())
         unchanged = old_resolutions == new_resolutions
         max_texels = max(1, int(getattr(self, "texture_rtg_chunk_texels", 262_144)))
+        inherited_scale = max(0.0, float(getattr(self, "texture_rtg_optimizer_state_scale", 0.5)))
 
         resized_state = {}
         for key in ("exp_avg", "exp_avg_sq"):
@@ -1012,6 +1016,7 @@ class GaussianModel:
                         up_value = up_value.permute(0, 2, 3, 1).reshape(-1, value.shape[1])
                         if key == "exp_avg_sq":
                             up_value = up_value.clamp_min(0.0)
+                        up_value = up_value * inherited_scale
                         dst = new_offsets[chunk_idx, None] + local_new[None, :]
                         new_value[dst.reshape(-1)] = up_value
             resized_state[key] = new_value
@@ -1272,6 +1277,7 @@ class GaussianModel:
         self.texture_rtg_min_score = float(getattr(training_args, "texture_rtg_min_score", 1e-10))
         self.texture_rtg_resolution_gamma = float(getattr(training_args, "texture_rtg_resolution_gamma", 1.0))
         self.texture_rtg_chunk_texels = int(getattr(training_args, "texture_rtg_chunk_texels", 262_144))
+        self.texture_rtg_optimizer_state_scale = float(getattr(training_args, "texture_rtg_optimizer_state_scale", 0.5))
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self._ensure_rtg_buffers()
@@ -1393,6 +1399,7 @@ class GaussianModel:
             "texture_dynamic_resolution": self.texture_dynamic_resolution,
             "texture_min_resolution": self.texture_min_resolution,
             "texture_max_resolution": self.texture_max_resolution,
+            "texture_rtg_optimizer_state_scale": self.texture_rtg_optimizer_state_scale,
         }
         if self.use_textures:
             payload["tex_color"] = self._tex_color.detach().cpu()
@@ -1528,6 +1535,7 @@ class GaussianModel:
         self.texture_min_resolution = int(payload.get("texture_min_resolution", self.texture_min_resolution))
         self.texture_max_resolution = int(payload.get("texture_max_resolution", self.texture_max_resolution))
         self.texture_normal_scale = float(payload.get("texture_normal_scale", getattr(self, "texture_normal_scale", 0.35)))
+        self.texture_rtg_optimizer_state_scale = float(payload.get("texture_rtg_optimizer_state_scale", getattr(self, "texture_rtg_optimizer_state_scale", 0.5)))
         if self.use_textures:
             if "tex_color" in payload:
                 self._tex_color = nn.Parameter(payload["tex_color"].to(device="cuda", dtype=torch.float).requires_grad_(True))
@@ -1991,14 +1999,10 @@ class GaussianModel:
         return extensions or None
 
     def _static_texture_state_extensions(self, selected_pts_mask, repeat_count=1):
-        if not (self.use_textures and not self.has_dynamic_textures):
-            return {}
-        state_extensions = {}
-        for name in ("tex_color", "tex_alpha", "tex_specular", "tex_normal"):
-            extension = self._optimizer_state_extension_from_mask(name, selected_pts_mask, repeat_count)
-            if extension is not None:
-                state_extensions[name] = extension
-        return state_extensions
+        # Gaussian-level densification copies texture values onto new Gaussians,
+        # but Adam moments for those new Gaussian-owned charts should be fresh.
+        # Pixel-level RTG resize still inherits moments in _resize_dynamic_optimizer_state.
+        return {}
 
     def densification_postfix(
         self,

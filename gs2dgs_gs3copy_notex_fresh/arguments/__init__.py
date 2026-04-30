@@ -246,6 +246,7 @@ class OptimizationParams(ParamGroup):
         self.texture_rtg_resolution_gamma = 1.0
         self.texture_rtg_chunk_texels = 262_144
         self.texture_rtg_freeze_gaussian_densify = True
+        self.texture_rtg_optimizer_state_scale = 0.5
         
         super().__init__(parser, "Optimization Parameters")
 
