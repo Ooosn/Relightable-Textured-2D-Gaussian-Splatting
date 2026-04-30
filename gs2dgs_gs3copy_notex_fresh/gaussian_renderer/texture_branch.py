@@ -49,6 +49,32 @@ def _canonicalize_quaternion(q):
     return q
 
 
+def _unit_quaternion(q):
+    return F.normalize(_canonicalize_quaternion(q), dim=1, eps=1e-8)
+
+
+def _quat_multiply(a, b):
+    aw, ax, ay, az = a.unbind(dim=1)
+    bw, bx, by, bz = b.unbind(dim=1)
+    return torch.stack(
+        (
+            aw * bw - ax * bx - ay * by - az * bz,
+            aw * bx + ax * bw + ay * bz - az * by,
+            aw * by - ax * bz + ay * bw + az * bx,
+            aw * bz + ax * by - ay * bx + az * bw,
+        ),
+        dim=1,
+    )
+
+
+def _compose_texture_delta_q(base_local_q, texture_delta_q):
+    if texture_delta_q is None or texture_delta_q.numel() == 0:
+        return base_local_q
+    base = _unit_quaternion(base_local_q)
+    delta = _unit_quaternion(texture_delta_q)
+    return _canonicalize_quaternion(_quat_multiply(delta, base))
+
+
 def _frame_from_texture_local_q(fallback_axises, texture_local_q):
     if texture_local_q is None or texture_local_q.numel() == 0:
         return fallback_axises
@@ -356,6 +382,66 @@ def _compute_texture_mbrdf(viewpoint_camera, gau, shadow_pkg, fix_labert=False):
 
             return {"basecolor": basecolor, "shadow": shadow, "other_effects": other_effects}
 
+        if texture_effect_mode == "uvshadow_micro_normal_residual":
+            point_shadow = shadow_pkg.get("per_point_shadow") if shadow_pkg is not None else None
+            if point_shadow is None:
+                point_shadow = _mean_dynamic_texture_values(
+                    per_uv_shadow,
+                    texture_dims,
+                )
+            decay_g, other_effects_g, _, _ = gau.neural_phasefunc(
+                wi,
+                wo,
+                gau.get_xyz,
+                gau.get_neural_material,
+                hint=point_shadow,
+                asg_1=asg_1,
+                asg_mlp=False,
+            )
+            if decay_g is None:
+                decay_g = torch.ones((num_points, 1), dtype=torch.float32, device=dev)
+            if other_effects_g is None:
+                other_effects_g = torch.zeros((num_points, 3), dtype=torch.float32, device=dev)
+
+            basecolor = torch.empty((total_texels, 3), dtype=torch.float32, device=dev)
+            shadow = torch.empty((total_texels, 1), dtype=torch.float32, device=dev)
+            other_effects = torch.empty((total_texels, 3), dtype=torch.float32, device=dev)
+            texture_multiplier = 2.0 * gau.get_texture_color
+
+            if fix_labert:
+                specular_flat = 0.0
+            else:
+                texture_delta_q = gau.get_texture_local_q
+                if texture_delta_q.numel() == 0:
+                    texture_delta_q = None
+                q = _compose_texture_delta_q(
+                    gau.local_q[texel_ids],
+                    texture_delta_q[flat_ids] if texture_delta_q is not None else None,
+                )
+                local_axes_uv = _frame_from_texture_local_q(local_axises[texel_ids], q)
+                wi_uv = wi[texel_ids]
+                wo_uv = wo[texel_ids]
+                asg_uv = gau.asg_func(
+                    _project_to_local(wi_uv, local_axes_uv),
+                    _project_to_local(wo_uv, local_axes_uv),
+                    gau.get_alpha_asg[texel_ids],
+                    asg_scales,
+                    asg_axises,
+                )
+                specular_flat = gau.get_ks[texel_ids] * asg_uv
+
+            diffuse_flat = gau.get_kd[texel_ids] * texture_multiplier[flat_ids] / math.pi
+            basecolor[flat_ids] = (
+                (diffuse_flat + specular_flat)
+                * cos_theta[texel_ids]
+                * dist_2_inv[texel_ids]
+            )
+            shadow_delta = per_uv_shadow[flat_ids] - point_shadow[texel_ids]
+            shadow[flat_ids] = torch.clamp(decay_g[texel_ids] + shadow_delta, 0.0, 1.0)
+            other_effects[flat_ids] = other_effects_g[texel_ids] * dist_2_inv[texel_ids]
+
+            return {"basecolor": basecolor, "shadow": shadow, "other_effects": other_effects}
+
         if texture_effect_mode == "uv_specular_gain":
             point_shadow = shadow_pkg.get("per_point_shadow") if shadow_pkg is not None else None
             if point_shadow is None:
@@ -402,7 +488,7 @@ def _compute_texture_mbrdf(viewpoint_camera, gau, shadow_pkg, fix_labert=False):
             return {"basecolor": basecolor, "shadow": shadow, "other_effects": other_effects}
 
         if texture_effect_mode != "per_uv":
-            raise ValueError("Dynamic texture resolution currently requires texture_effect_mode='per_uv', 'per_uv_micro_normal', or 'uv_specular_gain'.")
+            raise ValueError("Dynamic texture resolution currently requires texture_effect_mode='per_uv', 'per_uv_micro_normal', 'uv_specular_gain', or 'uvshadow_micro_normal_residual'.")
 
         basecolor = torch.empty((total_texels, 3), dtype=torch.float32, device=dev)
         shadow = torch.empty((total_texels, 1), dtype=torch.float32, device=dev)
@@ -510,6 +596,58 @@ def _compute_texture_mbrdf(viewpoint_camera, gau, shadow_pkg, fix_labert=False):
             * dist_2_inv[texel_ids]
         ).reshape(num_points, tex_res, tex_res, 3).permute(0, 3, 1, 2).contiguous()
 
+        return {"basecolor": basecolor, "shadow": shadow, "other_effects": other_effects}
+
+    if texture_effect_mode == "uvshadow_micro_normal_residual":
+        point_shadow = shadow_pkg.get("per_point_shadow") if shadow_pkg is not None else None
+        if point_shadow is None:
+            point_shadow = per_uv_shadow.mean(dim=(-2, -1), keepdim=False).unsqueeze(-1)
+        decay_g, other_effects_g, _, _ = gau.neural_phasefunc(
+            wi,
+            wo,
+            gau.get_xyz,
+            gau.get_neural_material,
+            hint=point_shadow,
+            asg_1=asg_1,
+            asg_mlp=False,
+        )
+        if decay_g is None:
+            decay_g = torch.ones((num_points, 1), dtype=torch.float32, device=dev)
+        if other_effects_g is None:
+            other_effects_g = torch.zeros((num_points, 3), dtype=torch.float32, device=dev)
+
+        texture_diffuse = gau.get_kd[:, :, None, None] * (2.0 * gau.get_texture_color) / math.pi
+        if fix_labert:
+            specular_uv = 0.0
+        else:
+            num_texels = num_points * tex_res * tex_res
+            texel_ids = torch.arange(num_points, dtype=torch.long, device=dev).repeat_interleave(tex_res * tex_res)
+            texture_delta_q = gau.get_texture_local_q
+            if texture_delta_q.numel() == 0:
+                texture_delta_q = None
+            q_delta = (
+                texture_delta_q.permute(0, 2, 3, 1).reshape(num_texels, 4)
+                if texture_delta_q is not None
+                else None
+            )
+            q = _compose_texture_delta_q(gau.local_q[texel_ids], q_delta)
+            local_axes_uv = _frame_from_texture_local_q(local_axises[texel_ids], q)
+            wi_uv = wi[texel_ids]
+            wo_uv = wo[texel_ids]
+            asg_uv = gau.asg_func(
+                _project_to_local(wi_uv, local_axes_uv),
+                _project_to_local(wo_uv, local_axes_uv),
+                gau.get_alpha_asg[texel_ids],
+                asg_scales,
+                asg_axises,
+            )
+            specular_uv = (gau.get_ks[texel_ids] * asg_uv).reshape(
+                num_points, tex_res, tex_res, 3
+            ).permute(0, 3, 1, 2).contiguous()
+        raw_shadow = per_uv_shadow[:, None, :, :]
+        shadow = torch.clamp(decay_g[:, :, None, None] + raw_shadow - point_shadow[:, :, None, None], 0.0, 1.0)
+        other_effects = (other_effects_g * dist_2_inv)[:, :, None, None].expand(-1, -1, tex_res, tex_res)
+        basecolor = (texture_diffuse + specular_uv) * cos_theta[:, :, None, None] * dist_2_inv[:, :, None, None]
         return {"basecolor": basecolor, "shadow": shadow, "other_effects": other_effects}
 
     if texture_effect_mode == "uv_specular_gain":

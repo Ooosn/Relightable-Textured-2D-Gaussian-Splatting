@@ -22,6 +22,7 @@ ITERATIONS="${ITERATIONS:-100000}"
 CONDA_ENV="${CONDA_ENV:-gs3}"
 PYTHON_BIN="${PYTHON_BIN:-/home/wangyy/miniconda3/envs/${CONDA_ENV}/bin/python -u}"
 TEXTURE_EFFECT_MODE="${TEXTURE_EFFECT_MODE:-per_uv_micro_normal}"
+TEXTURE_NORMAL_LR_SCALE="${TEXTURE_NORMAL_LR_SCALE:-1.0}"
 read -r -a PYTHON_CMD <<< "${PYTHON_BIN}"
 
 export PYTHONPATH="${ROOT}/submodules/simple-knn:${ROOT}/submodules/diff-gaussian-rasterization:${ROOT}/submodules/diff-gaussian-rasterization_light:${ROOT}/submodules/diff-gaussian-rasterization_hgs:${ROOT}/submodules/v_3dgs:${ROOT}/submodules/v_3dgs_ortho:${ROOT}/../2dgs/submodules/surfel-texture:${ROOT}/../2dgs/submodules/surfel-texture-deferred:${ROOT}/../2dgs/submodules/diff-surfel-rasterization-shadow:${ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
@@ -92,6 +93,7 @@ case "${mode}" in
       --use_textures \
       --texture_resolution 4 \
       --texture_effect_mode "${TEXTURE_EFFECT_MODE}" \
+      --texture_normal_lr_scale "${TEXTURE_NORMAL_LR_SCALE}" \
       --texture_start_iter 30000
     ;;
   notex-from-30k)
@@ -126,6 +128,7 @@ case "${mode}" in
       --use_textures \
       --texture_resolution 4 \
       --texture_effect_mode "${TEXTURE_EFFECT_MODE}" \
+      --texture_normal_lr_scale "${TEXTURE_NORMAL_LR_SCALE}" \
       --texture_start_iter 30000
     ;;
   *)

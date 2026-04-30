@@ -69,6 +69,7 @@ class GaussianModel:
         self.texture_dynamic_resolution = texture_dynamic_resolution
         self.texture_min_resolution = texture_min_resolution
         self.texture_max_resolution = texture_max_resolution
+        self.texture_effect_mode = "per_uv_micro_normal"
         self.use_mbrdf = use_mbrdf
         self.basis_asg_num = basis_asg_num
         self.hidden_feature_size = hidden_feature_size
@@ -554,6 +555,36 @@ class GaussianModel:
             return int(tensor.shape[1])
         return 0
 
+    def _uses_texture_normal_residual(self):
+        return str(getattr(self, "texture_effect_mode", "")) in {
+            "uvshadow_micro_normal_residual",
+        }
+
+    def _identity_texture_local_q_like(self, tex):
+        if not isinstance(tex, torch.Tensor) or tex.numel() == 0:
+            device = self.get_xyz.device if isinstance(self.get_xyz, torch.Tensor) and self.get_xyz.numel() > 0 else "cuda"
+            return torch.empty(0, device=device)
+        if tex.ndim == 4:
+            out = torch.zeros((tex.shape[0], 4, tex.shape[2], tex.shape[3]), dtype=tex.dtype, device=tex.device)
+            out[:, 0, :, :] = 1.0
+            return out
+        if tex.ndim == 2:
+            out = torch.zeros((tex.shape[0], 4), dtype=tex.dtype, device=tex.device)
+            out[:, 0] = 1.0
+            return out
+        return torch.empty(0, device=tex.device)
+
+    def _texture_normal_initial_state(self, tex_color=None, texture_dims=None):
+        tex = self._tex_color if tex_color is None else tex_color
+        if self._uses_texture_normal_residual():
+            return self._identity_texture_local_q_like(tex)
+        if isinstance(tex, torch.Tensor) and tex.ndim == 4:
+            return self._texture_local_q_for_static(tex)
+        return self._texture_local_q_for_dynamic(
+            tex,
+            self._texture_dims if texture_dims is None else texture_dims,
+        )
+
     def _ensure_texture_local_q_state(self):
         if not (self.use_textures and self.use_mbrdf):
             return
@@ -666,10 +697,7 @@ class GaussianModel:
         if not isinstance(self._tex_color, torch.Tensor) or self._tex_color.numel() == 0:
             self._tex_normal = torch.empty(0, device=self.get_xyz.device if self.get_xyz.numel() > 0 else "cuda")
             return
-        if self._tex_color.ndim == 4:
-            tex_normal = self._texture_local_q_for_static(self._tex_color)
-        else:
-            tex_normal = self._texture_local_q_for_dynamic(self._tex_color, self._texture_dims)
+        tex_normal = self._texture_normal_initial_state(self._tex_color, self._texture_dims)
         self._tex_normal = nn.Parameter(tex_normal.requires_grad_(True))
 
     def _add_texture_optimizer_groups(self, training_args):
@@ -794,7 +822,7 @@ class GaussianModel:
         if tex_specular is None and self.use_mbrdf:
             tex_specular = torch.zeros((tex_color.shape[0], 1), dtype=tex_color.dtype, device=tex_color.device)
         if tex_normal is None and self.use_mbrdf:
-            tex_normal = self._texture_local_q_for_dynamic(tex_color, texture_dims)
+            tex_normal = self._texture_normal_initial_state(tex_color, texture_dims)
         self._validate_dynamic_texture_layout(tex_color, tex_alpha, texture_dims, tex_specular, tex_normal)
         if self.optimizer is None:
             self._tex_color = nn.Parameter(tex_color.requires_grad_(True))
@@ -829,6 +857,8 @@ class GaussianModel:
 
     def _texture_local_q_optimizer_state(self):
         if self.optimizer is None or not isinstance(self._tex_normal, torch.Tensor) or self._tex_normal.numel() == 0:
+            return None
+        if self._uses_texture_normal_residual():
             return None
         local_state = self._optimizer_state_for_name("local_q")
         if not isinstance(local_state, dict):
@@ -1061,7 +1091,7 @@ class GaussianModel:
         tex_color = base_color[:, None, :].expand(num_points, texels_per_point, 3).reshape(-1, 3)
         tex_alpha = torch.full((num_points * texels_per_point, 1), 1.0 - 1e-6, dtype=torch.float32, device=base_color.device)
         tex_specular = torch.zeros((num_points * texels_per_point, 1), dtype=torch.float32, device=base_color.device)
-        tex_normal = self._texture_local_q_for_dynamic(tex_color, self._texture_dims)
+        tex_normal = self._texture_normal_initial_state(tex_color, self._texture_dims)
         self._validate_dynamic_texture_layout(tex_color, tex_alpha, self._texture_dims, tex_specular, tex_normal)
         self._tex_color = nn.Parameter(inverse_sigmoid(tex_color.clamp(1e-6, 1 - 1e-6)).requires_grad_(True))
         self._tex_alpha = nn.Parameter(inverse_sigmoid(tex_alpha).requires_grad_(True))
