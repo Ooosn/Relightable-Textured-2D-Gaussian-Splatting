@@ -408,19 +408,20 @@ def _compute_texture_mbrdf(viewpoint_camera, gau, shadow_pkg, fix_labert=False):
             other_effects = torch.empty((total_texels, 3), dtype=torch.float32, device=dev)
             texture_multiplier = 2.0 * gau.get_texture_color
 
+            texture_delta_q = gau.get_texture_local_q
+            if texture_delta_q.numel() == 0:
+                texture_delta_q = None
+            q = _compose_texture_delta_q(
+                gau.local_q[texel_ids],
+                texture_delta_q[flat_ids] if texture_delta_q is not None else None,
+            )
+            local_axes_uv = _frame_from_texture_local_q(local_axises[texel_ids], q)
+            wi_uv = wi[texel_ids]
+            wo_uv = wo[texel_ids]
+            cos_theta_uv = _NdotWi(local_axes_uv[:, :, 2], wi_uv, torch.nn.ELU(alpha=0.01), 0.01)
             if fix_labert:
                 specular_flat = 0.0
             else:
-                texture_delta_q = gau.get_texture_local_q
-                if texture_delta_q.numel() == 0:
-                    texture_delta_q = None
-                q = _compose_texture_delta_q(
-                    gau.local_q[texel_ids],
-                    texture_delta_q[flat_ids] if texture_delta_q is not None else None,
-                )
-                local_axes_uv = _frame_from_texture_local_q(local_axises[texel_ids], q)
-                wi_uv = wi[texel_ids]
-                wo_uv = wo[texel_ids]
                 asg_uv = gau.asg_func(
                     _project_to_local(wi_uv, local_axes_uv),
                     _project_to_local(wo_uv, local_axes_uv),
@@ -433,7 +434,7 @@ def _compute_texture_mbrdf(viewpoint_camera, gau, shadow_pkg, fix_labert=False):
             diffuse_flat = gau.get_kd[texel_ids] * texture_multiplier[flat_ids] / math.pi
             basecolor[flat_ids] = (
                 (diffuse_flat + specular_flat)
-                * cos_theta[texel_ids]
+                * cos_theta_uv
                 * dist_2_inv[texel_ids]
             )
             shadow_delta = per_uv_shadow[flat_ids] - point_shadow[texel_ids]
@@ -616,24 +617,27 @@ def _compute_texture_mbrdf(viewpoint_camera, gau, shadow_pkg, fix_labert=False):
         if other_effects_g is None:
             other_effects_g = torch.zeros((num_points, 3), dtype=torch.float32, device=dev)
 
+        num_texels = num_points * tex_res * tex_res
+        texel_ids = torch.arange(num_points, dtype=torch.long, device=dev).repeat_interleave(tex_res * tex_res)
+        texture_delta_q = gau.get_texture_local_q
+        if texture_delta_q.numel() == 0:
+            texture_delta_q = None
+        q_delta = (
+            texture_delta_q.permute(0, 2, 3, 1).reshape(num_texels, 4)
+            if texture_delta_q is not None
+            else None
+        )
+        q = _compose_texture_delta_q(gau.local_q[texel_ids], q_delta)
+        local_axes_uv = _frame_from_texture_local_q(local_axises[texel_ids], q)
+        wi_uv = wi[texel_ids]
+        wo_uv = wo[texel_ids]
+        cos_theta_uv = _NdotWi(local_axes_uv[:, :, 2], wi_uv, torch.nn.ELU(alpha=0.01), 0.01)
+        cos_theta_uv = cos_theta_uv.reshape(num_points, tex_res, tex_res, 1).permute(0, 3, 1, 2).contiguous()
+
         texture_diffuse = gau.get_kd[:, :, None, None] * (2.0 * gau.get_texture_color) / math.pi
         if fix_labert:
             specular_uv = 0.0
         else:
-            num_texels = num_points * tex_res * tex_res
-            texel_ids = torch.arange(num_points, dtype=torch.long, device=dev).repeat_interleave(tex_res * tex_res)
-            texture_delta_q = gau.get_texture_local_q
-            if texture_delta_q.numel() == 0:
-                texture_delta_q = None
-            q_delta = (
-                texture_delta_q.permute(0, 2, 3, 1).reshape(num_texels, 4)
-                if texture_delta_q is not None
-                else None
-            )
-            q = _compose_texture_delta_q(gau.local_q[texel_ids], q_delta)
-            local_axes_uv = _frame_from_texture_local_q(local_axises[texel_ids], q)
-            wi_uv = wi[texel_ids]
-            wo_uv = wo[texel_ids]
             asg_uv = gau.asg_func(
                 _project_to_local(wi_uv, local_axes_uv),
                 _project_to_local(wo_uv, local_axes_uv),
@@ -647,7 +651,7 @@ def _compute_texture_mbrdf(viewpoint_camera, gau, shadow_pkg, fix_labert=False):
         raw_shadow = per_uv_shadow[:, None, :, :]
         shadow = torch.clamp(decay_g[:, :, None, None] + raw_shadow - point_shadow[:, :, None, None], 0.0, 1.0)
         other_effects = (other_effects_g * dist_2_inv)[:, :, None, None].expand(-1, -1, tex_res, tex_res)
-        basecolor = (texture_diffuse + specular_uv) * cos_theta[:, :, None, None] * dist_2_inv[:, :, None, None]
+        basecolor = (texture_diffuse + specular_uv) * cos_theta_uv * dist_2_inv[:, :, None, None]
         return {"basecolor": basecolor, "shadow": shadow, "other_effects": other_effects}
 
     if texture_effect_mode == "uv_specular_gain":
