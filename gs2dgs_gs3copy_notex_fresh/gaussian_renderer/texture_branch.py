@@ -91,6 +91,28 @@ def _dynamic_texture_flat_ids(texture_dims, device):
     return counts.to(device), texel_ids, flat_ids, total_texels
 
 
+_TEXTURE_EFFECT_DEFAULT = "uvshadow_specular_residual"
+_TEXTURE_EFFECT_DEFAULT_ALIASES = {
+    "uvshadow_specular_residual",
+    "microtex",
+    "uv_specular_gain",
+}
+
+
+def _pack_deferred_texture_mbrdf(basecolor, shadow, other_effects_g, dist_2_inv, num_points):
+    """Pack per-UV RGB+shadow into texture, with Gaussian other_effects as channels 4:7."""
+    texture_color = torch.cat([basecolor, shadow], dim=1).contiguous()
+    colors_precomp = torch.zeros((num_points, 7), dtype=texture_color.dtype, device=texture_color.device)
+    colors_precomp[:, 4:7] = other_effects_g * dist_2_inv
+    return {
+        "texture_color": texture_color,
+        "colors_precomp": colors_precomp,
+        "basecolor": basecolor,
+        "shadow": shadow,
+        "other_effects": colors_precomp[:, 4:7],
+    }
+
+
 def _look_at_2dgs(camera_position, target_position, up_dir):
     camera_direction = camera_position - target_position
     camera_direction = camera_direction / np.linalg.norm(camera_direction)
@@ -198,6 +220,9 @@ def _compute_texture_shadow_pass(viewpoint_camera, gau, pipe, bg_color, scaling_
         low_pass_filter_radius=0.3,
         ortho=False,
         use_textures=use_per_uv_shadow,
+        texture_shadow_use_alpha=bool(getattr(pipe, "texture_shadow_use_alpha", False)),
+        texture_shadow_output_uv=bool(getattr(pipe, "texture_shadow_output_uv", True)),
+        texture_shadow_alpha_bilinear=bool(getattr(pipe, "texture_shadow_alpha_bilinear", False)),
     )
     shadow_rasterizer = ShadowRasterizer(raster_settings=shadow_settings)
     light_colors = torch.ones((means3d.shape[0], 3), dtype=torch.float32, device="cuda")
@@ -221,7 +246,8 @@ def _compute_texture_shadow_pass(viewpoint_camera, gau, pipe, bg_color, scaling_
     )
 
     non_trans_safe = torch.clamp_min(non_trans, 1e-6)
-    if not use_per_uv_shadow:
+    shadow_output_uv = bool(getattr(pipe, "texture_shadow_output_uv", True))
+    if not use_per_uv_shadow or not shadow_output_uv:
         per_point_shadow = (out_trans / non_trans_safe).unsqueeze(-1)
         if bool(getattr(gau, "has_dynamic_textures", False)):
             dims = gau.get_texture_dims
@@ -290,11 +316,47 @@ def _compute_texture_mbrdf(viewpoint_camera, gau, shadow_pkg, fix_labert=False):
         raise RuntimeError("Texture rendering requires the texture-aware shadow pass.")
 
     if bool(getattr(gau, "has_dynamic_textures", False)):
-        texture_effect_mode = str(getattr(gau, "texture_effect_mode", "per_uv_micro_normal"))
+        texture_effect_mode = str(getattr(gau, "texture_effect_mode", _TEXTURE_EFFECT_DEFAULT))
 
         texture_dims = gau.get_texture_dims
         counts, texel_ids, flat_ids, total_texels = _dynamic_texture_flat_ids(texture_dims, dev)
         per_uv_shadow = per_uv_shadow.reshape(total_texels, 1)
+
+        if texture_effect_mode in _TEXTURE_EFFECT_DEFAULT_ALIASES:
+            point_shadow = shadow_pkg.get("per_point_shadow") if shadow_pkg is not None else None
+            if point_shadow is None:
+                point_shadow = _mean_dynamic_texture_values(per_uv_shadow, texture_dims)
+            decay_g, other_effects_g, _, _ = gau.neural_phasefunc(
+                wi,
+                wo,
+                gau.get_xyz,
+                gau.get_neural_material,
+                hint=point_shadow,
+            )
+            if decay_g is None:
+                decay_g = torch.ones((num_points, 1), dtype=torch.float32, device=dev)
+            if other_effects_g is None:
+                other_effects_g = torch.zeros((num_points, 3), dtype=torch.float32, device=dev)
+
+            texture_kd = gau.get_texture_color
+            specular_gain = gau.get_texture_specular_gain
+            if specular_gain.numel() == 0:
+                specular_gain = torch.ones((total_texels, 1), dtype=torch.float32, device=dev)
+            diffuse_flat = texture_kd[flat_ids] / math.pi
+            if fix_labert:
+                specular_flat = 0.0
+            else:
+                specular_flat = gau.get_ks[texel_ids] * asg_1[texel_ids] * specular_gain[flat_ids]
+            basecolor = torch.empty((total_texels, 3), dtype=torch.float32, device=dev)
+            shadow = torch.empty((total_texels, 1), dtype=torch.float32, device=dev)
+            basecolor[flat_ids] = (
+                (diffuse_flat + specular_flat)
+                * cos_theta[texel_ids]
+                * dist_2_inv[texel_ids]
+            )
+            shadow_delta = per_uv_shadow[flat_ids] - point_shadow[texel_ids]
+            shadow[flat_ids] = torch.clamp(decay_g[texel_ids] + shadow_delta, 0.0, 1.0)
+            return _pack_deferred_texture_mbrdf(basecolor, shadow, other_effects_g, dist_2_inv, num_points)
 
         if texture_effect_mode == "per_uv_micro_normal":
             basecolor = torch.empty((total_texels, 3), dtype=torch.float32, device=dev)
@@ -420,51 +482,8 @@ def _compute_texture_mbrdf(viewpoint_camera, gau, shadow_pkg, fix_labert=False):
 
             return {"basecolor": basecolor, "shadow": shadow, "other_effects": other_effects}
 
-        if texture_effect_mode == "uv_specular_gain":
-            point_shadow = shadow_pkg.get("per_point_shadow") if shadow_pkg is not None else None
-            if point_shadow is None:
-                point_shadow = _mean_dynamic_texture_values(
-                    per_uv_shadow,
-                    texture_dims,
-                )
-            decay_g, other_effects_g, _, _ = gau.neural_phasefunc(
-                wi,
-                wo,
-                gau.get_xyz,
-                gau.get_neural_material,
-                hint=point_shadow,
-            )
-            if decay_g is None:
-                decay_g = torch.ones((num_points, 1), dtype=torch.float32, device=dev)
-            if other_effects_g is None:
-                other_effects_g = torch.zeros((num_points, 3), dtype=torch.float32, device=dev)
-
-            basecolor = torch.empty((total_texels, 3), dtype=torch.float32, device=dev)
-            shadow = torch.empty((total_texels, 1), dtype=torch.float32, device=dev)
-            other_effects = torch.empty((total_texels, 3), dtype=torch.float32, device=dev)
-            texture_kd = gau.get_texture_color
-            specular_gain = gau.get_texture_specular_gain
-            if specular_gain.numel() == 0:
-                specular_gain = torch.ones((total_texels, 1), dtype=torch.float32, device=dev)
-
-            diffuse_flat = texture_kd[flat_ids] / math.pi
-            if fix_labert:
-                specular_flat = 0.0
-            else:
-                specular_flat = gau.get_ks[texel_ids] * asg_1[texel_ids] * specular_gain[flat_ids]
-            basecolor[flat_ids] = (
-                (diffuse_flat + specular_flat)
-                * cos_theta[texel_ids]
-                * dist_2_inv[texel_ids]
-            )
-            shadow_delta = per_uv_shadow[flat_ids] - point_shadow[texel_ids]
-            shadow[flat_ids] = torch.clamp(decay_g[texel_ids] + shadow_delta, 0.0, 1.0)
-            other_effects[flat_ids] = other_effects_g[texel_ids] * dist_2_inv[texel_ids]
-
-            return {"basecolor": basecolor, "shadow": shadow, "other_effects": other_effects}
-
         if texture_effect_mode != "per_uv":
-            raise ValueError("Dynamic texture resolution currently requires texture_effect_mode='per_uv', 'per_uv_micro_normal', 'uv_specular_gain', 'uvshadow_micro_normal_residual', 'uvshadow_micro_normal_full', 'uvshadow_micro_normal_specular_residual', or 'uvshadow_micro_normal_specular_full'.")
+            raise ValueError("Dynamic texture resolution currently requires texture_effect_mode='uvshadow_specular_residual' (default), 'per_uv', 'per_uv_micro_normal', or a legacy uvshadow_micro_normal mode.")
 
         basecolor = torch.empty((total_texels, 3), dtype=torch.float32, device=dev)
         shadow = torch.empty((total_texels, 1), dtype=torch.float32, device=dev)
@@ -500,7 +519,36 @@ def _compute_texture_mbrdf(viewpoint_camera, gau, shadow_pkg, fix_labert=False):
         return {"basecolor": basecolor, "shadow": shadow, "other_effects": other_effects}
 
     tex_res = per_uv_shadow.shape[-1]
-    texture_effect_mode = str(getattr(gau, "texture_effect_mode", "per_uv_micro_normal"))
+    texture_effect_mode = str(getattr(gau, "texture_effect_mode", _TEXTURE_EFFECT_DEFAULT))
+
+    if texture_effect_mode in _TEXTURE_EFFECT_DEFAULT_ALIASES:
+        point_shadow = shadow_pkg.get("per_point_shadow") if shadow_pkg is not None else None
+        if point_shadow is None:
+            point_shadow = per_uv_shadow.mean(dim=(-2, -1), keepdim=False).unsqueeze(-1)
+        decay_g, other_effects_g, _, _ = gau.neural_phasefunc(
+            wi,
+            wo,
+            gau.get_xyz,
+            gau.get_neural_material,
+            hint=point_shadow,
+        )
+        if decay_g is None:
+            decay_g = torch.ones((num_points, 1), dtype=torch.float32, device=dev)
+        if other_effects_g is None:
+            other_effects_g = torch.zeros((num_points, 3), dtype=torch.float32, device=dev)
+
+        texture_diffuse = gau.get_texture_color / math.pi
+        if fix_labert:
+            specular_uv = 0.0
+        else:
+            specular_gain = gau.get_texture_specular_gain
+            if specular_gain.numel() == 0:
+                specular_gain = torch.ones((num_points, 1, tex_res, tex_res), dtype=torch.float32, device=dev)
+            specular_uv = (gau.get_ks * asg_1)[:, :, None, None] * specular_gain
+        raw_shadow = per_uv_shadow[:, None, :, :]
+        shadow = torch.clamp(decay_g[:, :, None, None] + raw_shadow - point_shadow[:, :, None, None], 0.0, 1.0)
+        basecolor = (texture_diffuse + specular_uv) * cos_theta[:, :, None, None] * dist_2_inv[:, :, None, None]
+        return _pack_deferred_texture_mbrdf(basecolor, shadow, other_effects_g, dist_2_inv, num_points)
 
     if texture_effect_mode == "per_uv_micro_normal":
         basecolor = torch.empty((num_points, 3, tex_res, tex_res), dtype=torch.float32, device=dev)

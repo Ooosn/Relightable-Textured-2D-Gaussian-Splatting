@@ -1,0 +1,139 @@
+/*
+ * Copyright (C) 2023, Inria
+ * GRAPHDECO research group, https://team.inria.fr/graphdeco
+ * All rights reserved.
+ *
+ * This software is free for non-commercial, research and evaluation use 
+ * under the terms of the LICENSE.md file.
+ *
+ * For inquiries contact  george.drettakis@inria.fr
+ */
+
+#ifndef CUDA_RASTERIZER_H_INCLUDED
+#define CUDA_RASTERIZER_H_INCLUDED
+
+#include <vector>
+#include <functional>
+
+namespace CudaRasterizer
+{
+	class Rasterizer
+	{
+	public:
+
+		static void markVisible(
+			int P,
+			float* means3D,
+			float* viewmatrix,
+			float* projmatrix,
+			bool* present);
+
+		static int forward(
+			std::function<char* (size_t)> geometryBuffer,
+			std::function<char* (size_t)> binningBuffer,
+			std::function<char* (size_t)> imageBuffer,
+			const int P, int D, int M,
+			const float* background,
+			const int width, int height,
+			const float* means3D,
+			const float* shs,
+			const float* colors_precomp,
+			const float* opacities,
+			const float* scales,
+			const float scale_modifier,
+			const float* rotations,
+			const float* transMat_precomp,
+			const float* viewmatrix,
+				const float* projmatrix,
+				const float* cam_pos,
+				const float* texture_alpha,
+				const int* texture_dims,
+				const int texture_resolution,
+			const float texture_sigma_factor,
+			const float tan_fovx, float tan_fovy,
+			const bool prefiltered,
+			float* out_color,
+			float* out_weight,
+			float* out_trans,
+			float* non_trans,
+				const float offset,
+				const float thres,
+				const bool is_train,
+				const bool texture_shadow_use_alpha,
+				const bool texture_shadow_output_uv,
+				const bool texture_shadow_alpha_bilinear,
+				int* radii = nullptr,
+				bool debug = false);
+
+		// Second-pass view-space color render with UV-level shadow.
+		// Runs standard alpha blending; returns number of rendered instances.
+		static int forwardColor(
+			std::function<char* (size_t)> geometryBuffer,
+			std::function<char* (size_t)> binningBuffer,
+			std::function<char* (size_t)> imageBuffer,
+			const int P, int D, int M,
+			const float* background,
+			const int width, int height,
+			const float* means3D,
+			const float* shs,
+			const float* colors_precomp,
+			const float* opacities,
+			const float* scales,
+			const float scale_modifier,
+			const float* rotations,
+			const float* transMat_precomp,
+			const float* viewmatrix,
+			const float* projmatrix,
+			const float* cam_pos,
+			const float* texture_color,
+			const float* texture_alpha,
+			const float* texture_shadow,   // [P*R*R] flat, may be nullptr
+			const int texture_resolution,
+			const float texture_sigma_factor,
+			const float tan_fovx, float tan_fovy,
+			const bool prefiltered,
+			float* out_color,
+			int* radii,
+			bool debug);
+
+		static void backward(
+			const int P, int D, int M, int R,
+			const float* background,
+			const int width, int height,
+			const float* means3D,
+			const float* shs,
+			const float* colors_precomp,
+			const float* scales,
+			const float scale_modifier,
+			const float* rotations,
+			const float* transMat_precomp,
+			const float* viewmatrix,
+			const float* projmatrix,
+			const float* campos,
+			const float* texture_color,
+			const float* texture_alpha,
+			const int texture_resolution,
+			const float texture_sigma_factor,
+			const float tan_fovx, float tan_fovy,
+			const int* radii,
+			char* geom_buffer,
+			char* binning_buffer,
+			char* image_buffer,
+			const float* dL_dpix,
+			const float* dL_depths,
+			float* dL_dmean2D,
+			float* dL_dnormal,
+			float* dL_dopacity,
+			float* dL_dcolor,
+			float* dL_dmean3D,
+			float* dL_dtransMat,
+			float* dL_dsh,
+			float* dL_dscale,
+			float* dL_drot,
+			float* dL_dtex_color,
+			float* dL_dtex_alpha,
+			bool debug);
+	};
+};
+
+#endif

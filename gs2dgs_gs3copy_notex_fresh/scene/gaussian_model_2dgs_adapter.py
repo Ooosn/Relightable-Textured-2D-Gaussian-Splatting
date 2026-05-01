@@ -56,6 +56,8 @@ class _LegacyNoTextureAdapter(_LegacyGaussianModel2DGS):
                 param_group["lr"] = self.xyz_scheduler_args(iteration)
             elif param_group["name"] in {"alpha_asg", "asg_sigma", "asg_rotation", "asg_scales"}:
                 param_group["lr"] = self.asg_scheduler_args(max(0, iteration - asg_freeze_step))
+            elif param_group["name"] == "tex_specular":
+                param_group["lr"] = self._texture_specular_lr(iteration, asg_freeze_step)
             elif param_group["name"] == "local_q":
                 param_group["lr"] = self.local_q_scheduler_args(max(0, iteration - local_q_freeze_step))
             elif param_group["name"] in {"neural_phasefunc", "neural_material"}:
@@ -104,14 +106,16 @@ class _NativeTextureAdapter(_TextureGaussianModel2DGS):
             asg_channel_num=getattr(modelset, "asg_channel_num", 1),
             asg_mlp=getattr(modelset, "asg_mlp", False),
             asg_alpha_num=getattr(modelset, "asg_alpha_num", 1),
+            mbrdf_normal_source=getattr(modelset, "mbrdf_normal_source", "local_q"),
         )
         self.rasterizer = getattr(modelset, "rasterizer", "2dgs")
         self.use_MBRDF = self.use_mbrdf
         self.maximum_gs = getattr(modelset, "maximum_gs", 550_000)
         self.light_direction = torch.zeros(3, dtype=torch.float32, device="cuda")
         self.texture_sigma_factor = float(getattr(modelset, "texture_sigma_factor", 3.0))
-        self.texture_effect_mode = str(getattr(modelset, "texture_effect_mode", "per_uv_micro_normal"))
+        self.texture_effect_mode = str(getattr(modelset, "texture_effect_mode", "uvshadow_specular_residual"))
         self.texture_normal_scale = float(getattr(modelset, "texture_normal_scale", 0.35))
+        self.mbrdf_normal_source = str(getattr(modelset, "mbrdf_normal_source", "local_q")).lower()
         self.gs2dgs_backend = "native"
 
     def update_learning_rate(self, iteration, asg_freeze_step=0, local_q_freeze_step=0, freeze_phasefunc_steps=0):
@@ -120,8 +124,15 @@ class _NativeTextureAdapter(_TextureGaussianModel2DGS):
                 param_group["lr"] = self.xyz_scheduler_args(iteration)
             elif param_group["name"] in {"alpha_asg", "asg_sigma", "asg_rotation", "asg_scales"}:
                 param_group["lr"] = self.asg_scheduler_args(max(0, iteration - asg_freeze_step))
+            elif param_group["name"] == "tex_specular":
+                param_group["lr"] = self._texture_specular_lr(iteration, asg_freeze_step)
             elif param_group["name"] == "local_q":
-                param_group["lr"] = self.local_q_scheduler_args(max(0, iteration - local_q_freeze_step))
+                if str(getattr(self, "mbrdf_normal_source", "local_q")) == "2dgs":
+                    param_group["lr"] = 0.0
+                else:
+                    param_group["lr"] = self._local_q_lr(iteration, local_q_freeze_step)
+            elif param_group["name"] == "tex_normal":
+                param_group["lr"] = self._texture_normal_lr(iteration, local_q_freeze_step)
             elif param_group["name"] in {"neural_phasefunc", "neural_material"}:
                 param_group["lr"] = self.neural_phasefunc_scheduler_args(max(0, iteration - freeze_phasefunc_steps))
 
@@ -161,6 +172,7 @@ class GaussianModel2DGSAdapter:
         force_native = bool(getattr(modelset, "force_native_2dgs_core", False))
         use_textures = bool(getattr(modelset, "use_textures", False))
         texture_dynamic = bool(getattr(modelset, "texture_dynamic_resolution", False))
-        if force_native or use_textures or texture_dynamic:
+        nonlegacy_normal_source = str(getattr(modelset, "mbrdf_normal_source", "local_q")).lower() != "local_q"
+        if force_native or use_textures or texture_dynamic or nonlegacy_normal_source:
             return _NativeTextureAdapter(modelset, opt)
         return _LegacyNoTextureAdapter(modelset, opt)

@@ -1,0 +1,108 @@
+/*
+ * Copyright (C) 2023, Inria
+ * GRAPHDECO research group, https://team.inria.fr/graphdeco
+ * All rights reserved.
+ *
+ * This software is free for non-commercial, research and evaluation use 
+ * under the terms of the LICENSE.md file.
+ *
+ * For inquiries contact  george.drettakis@inria.fr
+ */
+
+#pragma once
+#include <torch/extension.h>
+#include <cstdio>
+#include <tuple>
+#include <string>
+	
+// Second-pass color render: standard alpha blending + UV-level shadow modulation.
+// Returns rendered image tensor [C, H, W].
+torch::Tensor RasterizeColorCUDA(
+	const torch::Tensor& background,
+	const torch::Tensor& means3D,
+	const torch::Tensor& colors,
+	const torch::Tensor& opacity,
+	const torch::Tensor& scales,
+	const torch::Tensor& rotations,
+	const float scale_modifier,
+	const torch::Tensor& transMat_precomp,
+	const torch::Tensor& viewmatrix,
+	const torch::Tensor& projmatrix,
+	const float tan_fovx,
+	const float tan_fovy,
+	const int image_height,
+	const int image_width,
+	const torch::Tensor& sh,
+	const int degree,
+	const torch::Tensor& campos,
+	const torch::Tensor& texture_color,   // [N, C, R, R] or empty
+	const torch::Tensor& texture_alpha,   // [N, 1, R, R] or empty
+	const torch::Tensor& texture_shadow,  // [N*R*R] flat or empty
+	const float texture_sigma_factor,
+	const bool prefiltered,
+	const bool debug);
+
+std::tuple<int, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+RasterizeGaussiansCUDA(
+	const torch::Tensor& background,
+	const torch::Tensor& means3D,
+	const torch::Tensor& colors,
+	const torch::Tensor& opacity,
+	const torch::Tensor& scales,
+	const torch::Tensor& rotations,
+	const float scale_modifier,
+	const torch::Tensor& transMat_precomp,
+	const torch::Tensor& viewmatrix,
+	const torch::Tensor& projmatrix,
+	const float tan_fovx, 
+	const float tan_fovy,
+	const int image_height,
+	const int image_width,
+	const torch::Tensor& sh,
+	const int degree,
+	const torch::Tensor& campos,
+	const torch::Tensor& texture_alpha,
+	const torch::Tensor& texture_dims,
+	const float texture_sigma_factor,
+	const bool prefiltered,
+	const bool debug,
+		const torch::Tensor& non_trans,
+		const float offset,
+		const float thres,
+		const bool is_train,
+		const bool texture_shadow_use_alpha,
+		const bool texture_shadow_output_uv,
+		const bool texture_shadow_alpha_bilinear);
+
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+ RasterizeGaussiansBackwardCUDA(
+	 const torch::Tensor& background,
+	const torch::Tensor& means3D,
+	const torch::Tensor& radii,
+	const torch::Tensor& colors,
+	const torch::Tensor& scales,
+	const torch::Tensor& rotations,
+	const float scale_modifier,
+	const torch::Tensor& transMat_precomp,
+	const torch::Tensor& viewmatrix,
+	const torch::Tensor& projmatrix,
+	const float tan_fovx, 
+	const float tan_fovy,
+	const torch::Tensor& dL_dout_color,
+	const torch::Tensor& dL_dout_others,
+	const torch::Tensor& sh,
+	const int degree,
+	const torch::Tensor& campos,
+	const torch::Tensor& texture_color,
+	const torch::Tensor& texture_alpha,
+	const float texture_sigma_factor,
+	const torch::Tensor& geomBuffer,
+	const int R,
+	const torch::Tensor& binningBuffer,
+	const torch::Tensor& imageBuffer,
+	const bool debug);
+		
+torch::Tensor markVisible(
+		torch::Tensor& means3D,
+		torch::Tensor& viewmatrix,
+		torch::Tensor& projmatrix);

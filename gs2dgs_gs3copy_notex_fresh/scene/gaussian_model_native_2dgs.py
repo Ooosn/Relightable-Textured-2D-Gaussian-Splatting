@@ -75,7 +75,7 @@ class GaussianModel:
         self.texture_dynamic_resolution = texture_dynamic_resolution
         self.texture_min_resolution = texture_min_resolution
         self.texture_max_resolution = texture_max_resolution
-        self.texture_effect_mode = "per_uv_micro_normal"
+        self.texture_effect_mode = "uvshadow_specular_residual"
         self.use_mbrdf = use_mbrdf
         self.basis_asg_num = basis_asg_num
         self.hidden_feature_size = hidden_feature_size
@@ -169,6 +169,7 @@ class GaussianModel:
             None if self.neural_phasefunc is None else self.neural_phasefunc.state_dict(),
             {
                 "texture_dynamic_resolution": self.texture_dynamic_resolution,
+                "texture_effect_mode": self.texture_effect_mode,
                 "texture_min_resolution": self.texture_min_resolution,
                 "texture_max_resolution": self.texture_max_resolution,
                 "texture_dims": self._texture_dims,
@@ -265,6 +266,7 @@ class GaussianModel:
                 phase_state,
             ) = model_args[:32]
             checkpoint_dynamic_textures = bool(extra_state.get("texture_dynamic_resolution", self.texture_dynamic_resolution))
+            self.texture_effect_mode = str(extra_state.get("texture_effect_mode", getattr(self, "texture_effect_mode", "uvshadow_specular_residual")))
             self.texture_dynamic_resolution = bool(checkpoint_dynamic_textures or requested_dynamic_textures)
             if requested_dynamic_textures:
                 self.texture_min_resolution = requested_texture_min_resolution
@@ -313,8 +315,10 @@ class GaussianModel:
             self.initialize_texture_state()
         if self.use_textures and self.use_mbrdf and self._tex_specular.numel() == 0:
             self._initialize_texture_specular_state()
-        if self.use_textures and self.use_mbrdf:
+        if self.use_textures and self.use_mbrdf and self._uses_texture_local_q():
             self._ensure_texture_local_q_state()
+        elif self.use_textures and self.use_mbrdf:
+            self._tex_normal = torch.empty(0, device=self.get_xyz.device)
         if self.use_textures and self.has_dynamic_textures:
             self._validate_dynamic_texture_layout(self._tex_color, self._tex_alpha, self._texture_dims, self._tex_specular, self._tex_normal)
         if self.use_mbrdf and not isinstance(self.kd, nn.Parameter):
@@ -584,6 +588,16 @@ class GaussianModel:
     def _uses_texture_normal_residual(self):
         return False
 
+    def _uses_texture_local_q(self):
+        mode = str(getattr(self, "texture_effect_mode", "uvshadow_specular_residual"))
+        return mode in {
+            "per_uv_micro_normal",
+            "uvshadow_micro_normal_residual",
+            "uvshadow_micro_normal_full",
+            "uvshadow_micro_normal_specular_residual",
+            "uvshadow_micro_normal_specular_full",
+        }
+
     def _identity_texture_local_q_like(self, tex):
         if not isinstance(tex, torch.Tensor) or tex.numel() == 0:
             device = self.get_xyz.device if isinstance(self.get_xyz, torch.Tensor) and self.get_xyz.numel() > 0 else "cuda"
@@ -623,7 +637,7 @@ class GaussianModel:
         return self._local_q_lr(iteration, local_q_freeze_step) * float(getattr(self, "texture_normal_lr_scale", 1.0))
 
     def _ensure_texture_local_q_state(self):
-        if not (self.use_textures and self.use_mbrdf):
+        if not (self.use_textures and self.use_mbrdf and self._uses_texture_local_q()):
             return
         if self._texture_normal_channel_count() != 4:
             self._initialize_texture_normal_state()
@@ -779,7 +793,7 @@ class GaussianModel:
             self.optimizer.add_param_group(
                 {"params": [self._tex_specular], "lr": texture_specular_lr, "name": "tex_specular"}
             )
-        if self.use_mbrdf and self._tex_normal.numel() > 0 and "tex_normal" not in existing:
+        if self.use_mbrdf and self._uses_texture_local_q() and self._tex_normal.numel() > 0 and "tex_normal" not in existing:
             self.optimizer.add_param_group(
                 {"params": [self._tex_normal], "lr": texture_normal_lr, "name": "tex_normal"}
             )
@@ -828,8 +842,10 @@ class GaussianModel:
             self.initialize_texture_state(neutral_multiplier=True)
         if self.use_mbrdf and self._tex_specular.numel() == 0:
             self._initialize_texture_specular_state()
-        if self.use_mbrdf:
+        if self.use_mbrdf and self._uses_texture_local_q():
             self._ensure_texture_local_q_state()
+        elif self.use_mbrdf:
+            self._tex_normal = torch.empty(0, device=self.get_xyz.device)
         if self.use_textures and self.texture_dynamic_resolution and not self.has_dynamic_textures:
             self._convert_static_textures_to_dynamic()
         self._sanitize_texture_logits_in_place()
@@ -893,15 +909,17 @@ class GaussianModel:
     ):
         if tex_specular is None and self.use_mbrdf:
             tex_specular = torch.zeros((tex_color.shape[0], 1), dtype=tex_color.dtype, device=tex_color.device)
-        if tex_normal is None and self.use_mbrdf:
+        if tex_normal is None and self.use_mbrdf and self._uses_texture_local_q():
             tex_normal = self._texture_normal_initial_state(tex_color, texture_dims)
+        if tex_normal is None and self.use_mbrdf and not self._uses_texture_local_q():
+            tex_normal = torch.empty(0, device=tex_color.device, dtype=tex_color.dtype)
         self._validate_dynamic_texture_layout(tex_color, tex_alpha, texture_dims, tex_specular, tex_normal)
         if self.optimizer is None:
             self._tex_color = nn.Parameter(tex_color.requires_grad_(True))
             self._tex_alpha = nn.Parameter(tex_alpha.requires_grad_(True))
             if tex_specular is not None:
                 self._tex_specular = nn.Parameter(tex_specular.requires_grad_(True))
-            if tex_normal is not None:
+            if tex_normal is not None and tex_normal.numel() > 0:
                 self._tex_normal = nn.Parameter(tex_normal.requires_grad_(True))
         else:
             optimizable = self.replace_tensor_to_optimizer(tex_color, "tex_color", state_tensors=tex_color_state)
@@ -912,7 +930,7 @@ class GaussianModel:
                 optimizable = self.replace_tensor_to_optimizer(tex_specular, "tex_specular", state_tensors=tex_specular_state)
                 if "tex_specular" in optimizable:
                     self._tex_specular = optimizable["tex_specular"]
-            if tex_normal is not None:
+            if tex_normal is not None and tex_normal.numel() > 0:
                 optimizable = self.replace_tensor_to_optimizer(tex_normal, "tex_normal", state_tensors=tex_normal_state)
                 if "tex_normal" in optimizable:
                     self._tex_normal = optimizable["tex_normal"]
@@ -1143,7 +1161,7 @@ class GaussianModel:
             raise ValueError("Cannot convert non-square static textures to dynamic charts.")
         if self.use_mbrdf and self._tex_specular.numel() == 0:
             self._initialize_texture_specular_state()
-        if self.use_mbrdf:
+        if self.use_mbrdf and self._uses_texture_local_q():
             self._ensure_texture_local_q_state()
         device = self.get_xyz.device
         resolutions = torch.full((self.get_xyz.shape[0],), tex_h, dtype=torch.int32, device=device)
@@ -1164,7 +1182,10 @@ class GaussianModel:
         self._tex_alpha = nn.Parameter(tex_alpha.requires_grad_(True))
         if self.use_mbrdf:
             self._tex_specular = nn.Parameter(tex_specular.requires_grad_(True))
-            self._tex_normal = nn.Parameter(tex_normal.requires_grad_(True))
+            if self._uses_texture_local_q() and tex_normal.numel() > 0:
+                self._tex_normal = nn.Parameter(tex_normal.requires_grad_(True))
+            else:
+                self._tex_normal = torch.empty(0, device=device)
         self._texture_dims = texture_dims
         self._ensure_rtg_buffers()
         return True
@@ -1198,13 +1219,20 @@ class GaussianModel:
         tex_color = base_color[:, None, :].expand(num_points, texels_per_point, 3).reshape(-1, 3)
         tex_alpha = torch.full((num_points * texels_per_point, 1), 1.0 - 1e-6, dtype=torch.float32, device=base_color.device)
         tex_specular = torch.zeros((num_points * texels_per_point, 1), dtype=torch.float32, device=base_color.device)
-        tex_normal = self._texture_normal_initial_state(tex_color, self._texture_dims)
+        tex_normal = (
+            self._texture_normal_initial_state(tex_color, self._texture_dims)
+            if self.use_mbrdf and self._uses_texture_local_q()
+            else torch.empty(0, dtype=torch.float32, device=base_color.device)
+        )
         self._validate_dynamic_texture_layout(tex_color, tex_alpha, self._texture_dims, tex_specular, tex_normal)
         self._tex_color = nn.Parameter(tex_color.requires_grad_(True))
         self._tex_alpha = nn.Parameter(inverse_sigmoid(tex_alpha).requires_grad_(True))
         if self.use_mbrdf:
             self._tex_specular = nn.Parameter(tex_specular.requires_grad_(True))
-            self._tex_normal = nn.Parameter(tex_normal.requires_grad_(True))
+            if tex_normal.numel() > 0:
+                self._tex_normal = nn.Parameter(tex_normal.requires_grad_(True))
+            else:
+                self._tex_normal = torch.empty(0, device=base_color.device)
         self._ensure_rtg_buffers()
 
     def _texel_owner_ids(self, dims=None):
@@ -1280,7 +1308,7 @@ class GaussianModel:
         if selected_specular is None:
             selected_specular = torch.empty((0, 1), dtype=self._tex_color.dtype, device=self._tex_color.device)
         if selected_normal is None:
-            selected_normal = torch.empty((0, 2), dtype=self._tex_color.dtype, device=self._tex_color.device)
+            selected_normal = torch.empty((0, 4), dtype=self._tex_color.dtype, device=self._tex_color.device)
         return selected_color, selected_alpha, selected_specular, selected_normal
 
     def _initialize_mbrdf_modules(self):
@@ -1360,7 +1388,8 @@ class GaussianModel:
                         dtype=torch.float32,
                         device="cuda",
                     ).requires_grad_(True))
-                    self._initialize_texture_normal_state()
+                    if self._uses_texture_local_q():
+                        self._initialize_texture_normal_state()
 
         if self.use_mbrdf:
             self.initialize_mbrdf_state()
@@ -1401,7 +1430,7 @@ class GaussianModel:
             texture_normal_lr = float(training_args.local_q_lr_init) * self.texture_normal_lr_scale
             if self.use_mbrdf and self._tex_specular.numel() == 0:
                 self._initialize_texture_specular_state()
-            if self.use_mbrdf:
+            if self.use_mbrdf and self._uses_texture_local_q():
                 self._ensure_texture_local_q_state()
             groups.extend(
                 [
@@ -1411,7 +1440,7 @@ class GaussianModel:
             )
             if self.use_mbrdf and self._tex_specular.numel() > 0:
                 groups.append({"params": [self._tex_specular], "lr": texture_specular_lr, "name": "tex_specular"})
-            if self.use_mbrdf and self._tex_normal.numel() > 0:
+            if self.use_mbrdf and self._uses_texture_local_q() and self._tex_normal.numel() > 0:
                 groups.append({"params": [self._tex_normal], "lr": texture_normal_lr, "name": "tex_normal"})
         if self.use_mbrdf:
             if self.asg_func is None or self.neural_phasefunc is None:
@@ -1510,6 +1539,7 @@ class GaussianModel:
         payload = {
             "texture_resolution": self.texture_resolution,
             "texture_dynamic_resolution": self.texture_dynamic_resolution,
+            "texture_effect_mode": self.texture_effect_mode,
             "texture_min_resolution": self.texture_min_resolution,
             "texture_max_resolution": self.texture_max_resolution,
             "mbrdf_normal_source": self.mbrdf_normal_source,
@@ -1522,9 +1552,9 @@ class GaussianModel:
             payload["tex_alpha"] = self._tex_alpha.detach().cpu()
             if self.use_mbrdf and self._tex_specular.numel() > 0:
                 payload["tex_specular"] = self._tex_specular.detach().cpu()
-            if self.use_mbrdf and self._tex_normal.numel() > 0:
-                payload["tex_normal"] = self._tex_normal.detach().cpu()
             payload["texture_normal_scale"] = float(getattr(self, "texture_normal_scale", 0.35))
+            if self.use_mbrdf and self._uses_texture_local_q() and self._tex_normal.numel() > 0:
+                payload["tex_normal"] = self._tex_normal.detach().cpu()
             payload["texture_dims"] = self._texture_dims.detach().cpu() if self.has_dynamic_textures else torch.empty(0, dtype=torch.int32)
             payload["rtg_score"] = self._rtg_score.detach().cpu() if self._rtg_score.numel() > 0 else torch.empty(0)
         if self.use_mbrdf:
@@ -1637,7 +1667,8 @@ class GaussianModel:
                 dtype=torch.float32,
                 device="cuda",
             ).requires_grad_(True))
-            self._initialize_texture_normal_state()
+            if self._uses_texture_local_q():
+                self._initialize_texture_normal_state()
 
     def load_appearance(self, path):
         if not self.use_textures and not self.use_mbrdf:
@@ -1650,6 +1681,7 @@ class GaussianModel:
         payload = torch.load(path, map_location="cpu")
         self.texture_resolution = int(payload.get("texture_resolution", self.texture_resolution))
         self.texture_dynamic_resolution = bool(payload.get("texture_dynamic_resolution", self.texture_dynamic_resolution))
+        self.texture_effect_mode = str(payload.get("texture_effect_mode", getattr(self, "texture_effect_mode", "uvshadow_specular_residual")))
         self.texture_min_resolution = int(payload.get("texture_min_resolution", self.texture_min_resolution))
         self.texture_max_resolution = int(payload.get("texture_max_resolution", self.texture_max_resolution))
         self.mbrdf_normal_source = str(payload.get("mbrdf_normal_source", getattr(self, "mbrdf_normal_source", "local_q"))).lower()
@@ -1665,9 +1697,9 @@ class GaussianModel:
                     self._tex_specular = nn.Parameter(payload["tex_specular"].to(device="cuda", dtype=torch.float).requires_grad_(True))
                 elif self.use_mbrdf:
                     self._initialize_texture_specular_state()
-                if "tex_normal" in payload:
+                if "tex_normal" in payload and self._uses_texture_local_q():
                     self._tex_normal = nn.Parameter(payload["tex_normal"].to(device="cuda", dtype=torch.float).requires_grad_(True))
-                elif self.use_mbrdf:
+                elif self.use_mbrdf and self._uses_texture_local_q():
                     self._initialize_texture_normal_state()
                 texture_dims = payload.get("texture_dims", torch.empty(0, dtype=torch.int32))
                 self._texture_dims = texture_dims.to(device="cuda", dtype=torch.int32) if isinstance(texture_dims, torch.Tensor) else torch.empty(0, device="cuda", dtype=torch.int32)
@@ -1688,8 +1720,10 @@ class GaussianModel:
                 self.neural_phasefunc.load_state_dict(payload["neural_phasefunc"])
             else:
                 self.initialize_mbrdf_state()
-        if self.use_textures and self.use_mbrdf:
+        if self.use_textures and self.use_mbrdf and self._uses_texture_local_q():
             self._ensure_texture_local_q_state()
+        elif self.use_textures and self.use_mbrdf:
+            self._tex_normal = torch.empty(0, device=self.get_xyz.device)
         if self.use_textures and self.has_dynamic_textures:
             self._validate_dynamic_texture_layout(self._tex_color, self._tex_alpha, self._texture_dims, self._tex_specular, self._tex_normal)
 
@@ -2245,8 +2279,8 @@ class GaussianModel:
         new_opacity = self._opacity[selected_pts_mask].repeat(N, 1)
         new_tex_color = self._tex_color[selected_pts_mask].repeat(N, 1, 1, 1) if self.use_textures and not self.has_dynamic_textures else None
         new_tex_alpha = self._tex_alpha[selected_pts_mask].repeat(N, 1, 1, 1) if self.use_textures and not self.has_dynamic_textures else None
-        new_tex_specular = self._tex_specular[selected_pts_mask].repeat(N, 1, 1, 1) if self.use_textures and self.use_mbrdf and not self.has_dynamic_textures else None
-        new_tex_normal = self._tex_normal[selected_pts_mask].repeat(N, 1, 1, 1) if self.use_textures and self.use_mbrdf and not self.has_dynamic_textures else None
+        new_tex_specular = self._tex_specular[selected_pts_mask].repeat(N, 1, 1, 1) if self.use_textures and self.use_mbrdf and self._tex_specular.numel() > 0 and not self.has_dynamic_textures else None
+        new_tex_normal = self._tex_normal[selected_pts_mask].repeat(N, 1, 1, 1) if self.use_textures and self.use_mbrdf and self._uses_texture_local_q() and self._tex_normal.numel() > 0 and not self.has_dynamic_textures else None
         new_kd = self.kd[selected_pts_mask].repeat(N, 1) if self.use_mbrdf else None
         new_ks = self.ks[selected_pts_mask].repeat(N, 1) if self.use_mbrdf else None
         new_alpha_asg = self.alpha_asg[selected_pts_mask].repeat(N, 1, 1) if self.use_mbrdf else None
@@ -2295,8 +2329,8 @@ class GaussianModel:
         new_rotation = self._rotation[selected_pts_mask]
         new_tex_color = self._tex_color[selected_pts_mask] if self.use_textures and not self.has_dynamic_textures else None
         new_tex_alpha = self._tex_alpha[selected_pts_mask] if self.use_textures and not self.has_dynamic_textures else None
-        new_tex_specular = self._tex_specular[selected_pts_mask] if self.use_textures and self.use_mbrdf and not self.has_dynamic_textures else None
-        new_tex_normal = self._tex_normal[selected_pts_mask] if self.use_textures and self.use_mbrdf and not self.has_dynamic_textures else None
+        new_tex_specular = self._tex_specular[selected_pts_mask] if self.use_textures and self.use_mbrdf and self._tex_specular.numel() > 0 and not self.has_dynamic_textures else None
+        new_tex_normal = self._tex_normal[selected_pts_mask] if self.use_textures and self.use_mbrdf and self._uses_texture_local_q() and self._tex_normal.numel() > 0 and not self.has_dynamic_textures else None
         new_kd = self.kd[selected_pts_mask] if self.use_mbrdf else None
         new_ks = self.ks[selected_pts_mask] if self.use_mbrdf else None
         new_alpha_asg = self.alpha_asg[selected_pts_mask] if self.use_mbrdf else None

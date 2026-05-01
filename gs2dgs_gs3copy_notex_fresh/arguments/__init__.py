@@ -24,6 +24,10 @@ class ParamGroup:
             "use_shadow_refine_mlp",
             "shadow_backward_stage_enabled",
             "shadow_scale_reg_enabled",
+            "texture_render_use_alpha",
+            "texture_shadow_use_alpha",
+            "texture_shadow_output_uv",
+            "texture_shadow_alpha_bilinear",
             "texture_freeze_gaussian_densify",
             "texture_rtg_freeze_gaussian_densify",
         }
@@ -102,8 +106,9 @@ class ModelParams(ParamGroup):
         self.texture_dynamic_resolution = False
         self.texture_min_resolution = 4
         self.texture_max_resolution = 64
-        self.texture_effect_mode = "per_uv_micro_normal"
+        self.texture_effect_mode = "uvshadow_specular_residual"
         self.texture_normal_scale = 0.35
+        self.mbrdf_normal_source = "local_q"
 
 
         """
@@ -156,6 +161,10 @@ class PipelineParams(ParamGroup):
         self.compute_cov3D_python = False
         self.debug = False
         self.antialiasing = False
+        self.texture_render_use_alpha = False
+        self.texture_shadow_use_alpha = False
+        self.texture_shadow_output_uv = True
+        self.texture_shadow_alpha_bilinear = False
         super().__init__(parser, "Pipeline Parameters")
 
 class OptimizationParams(ParamGroup):
@@ -234,6 +243,7 @@ class OptimizationParams(ParamGroup):
 
         self.bigsize_threshold = 0.1
         self.texture_lr = 0.0025
+        self.texture_specular_lr_scale = 1.0
         self.texture_normal_lr_scale = 1.0
         self.texture_start_iter = 30_000
         self.texture_freeze_gaussian_densify = False
@@ -281,6 +291,10 @@ def get_combined_args(parser : ArgumentParser):
         "use_shadow_refine_mlp": True,
         "shadow_backward_stage_enabled": False,
         "shadow_scale_reg_enabled": False,
+        "texture_render_use_alpha": False,
+        "texture_shadow_use_alpha": False,
+        "texture_shadow_output_uv": True,
+        "texture_shadow_alpha_bilinear": False,
     }
     cmdline_flags = set(cmdlne_string)
     for key, default in volatile_bool_defaults.items():
