@@ -649,7 +649,7 @@ def training(modelset, opt, pipe, testing_iterations, saving_iterations, checkpo
             "colors_precomp_grad": 0, "ks": 0, "kd": 0, "diffuse_grad": 0, "specular_grad": 0,
             "cosTheta_grad": 0, "dist_2_inv_grad": 0, 
             "decay_grad": 0, "other_effects_grad": 0, "shadow_grad": 0,
-            "asg_3_grad": 0, "asg_1_grad": 0, 
+            "asg_1_grad": 0,
             "base_image_grad": 0, "shadow_image_grad": 0, "other_effects_image_grad": 0,
             "base_image": 0, "shadow_image": 0, "other_effects_image": 0,
             }
@@ -661,8 +661,8 @@ def training(modelset, opt, pipe, testing_iterations, saving_iterations, checkpo
             "4_densification": ["radii", "means2D_grad", "num_clone_ratio", "num_split_ratio"],
             "5_before_rasterization": ["colors_precomp_grad", "ks", "kd", "diffuse_grad", "specular_grad", 
                                         "cosTheta_grad", "dist_2_inv_grad",
-                                        "decay_grad", "other_effects_grad", "shadow_grad", 
-                                        "asg_3_grad", "asg_1_grad"],
+                                        "decay_grad", "other_effects_grad", "shadow_grad",
+                                        "asg_1_grad"],
             "6_image_grad": ["base_image_grad", "shadow_image_grad", "other_effects_image_grad"],
             "7_image": ["base_image", "shadow_image", "other_effects_image"],
             }
@@ -699,7 +699,7 @@ def training(modelset, opt, pipe, testing_iterations, saving_iterations, checkpo
             if not hasattr(gaussians, "enable_texture_training"):
                 raise RuntimeError("Texture warmup requires a Gaussian model with enable_texture_training().")
             if gaussians.enable_texture_training(opt):
-                print(f"\n[ITER {iteration}] Texture training enabled from neutral kd multiplier")
+                print(f"\n[ITER {iteration}] Texture training enabled from Gaussian kd/local material state")
 
         # update lr of asg
         gaussians.update_learning_rate(iteration, \
@@ -1167,10 +1167,7 @@ def training(modelset, opt, pipe, testing_iterations, saving_iterations, checkpo
             
 
 
-            if modelset.asg_mlp and iteration == opt.asg_mlp_freeze: # 40000
-                asg_mlp = True
-            
-            elif modelset.alpha_change and iteration == opt.asg_change_freeze:
+            if modelset.alpha_change and iteration == opt.asg_change_freeze:
                 gaussians.change_alpha_asg(gaussians.alpha_asg)
                 print("alpha changed")
 

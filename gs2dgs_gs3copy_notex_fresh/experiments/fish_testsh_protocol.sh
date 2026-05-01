@@ -21,12 +21,27 @@ VIEW_NUM="${VIEW_NUM:-2000}"
 ITERATIONS="${ITERATIONS:-100000}"
 CONDA_ENV="${CONDA_ENV:-gs3}"
 PYTHON_BIN="${PYTHON_BIN:-/home/wangyy/miniconda3/envs/${CONDA_ENV}/bin/python -u}"
-TEXTURE_EFFECT_MODE="${TEXTURE_EFFECT_MODE:-per_uv_micro_normal}"
+TEXTURE_EFFECT_MODE="${TEXTURE_EFFECT_MODE:-uvshadow_micro_normal_specular_full}"
+TEXTURE_RESOLUTION="${TEXTURE_RESOLUTION:-4}"
+TEXTURE_START_ITER="${TEXTURE_START_ITER:-30000}"
+TEXTURE_SPECULAR_LR_SCALE="${TEXTURE_SPECULAR_LR_SCALE:-1.0}"
 TEXTURE_NORMAL_LR_SCALE="${TEXTURE_NORMAL_LR_SCALE:-1.0}"
+MBRDF_NORMAL_SOURCE="${MBRDF_NORMAL_SOURCE:-local_q}"
 TEXTURE_FREEZE_GAUSSIAN_DENSIFY="${TEXTURE_FREEZE_GAUSSIAN_DENSIFY:-0}"
+TEXTURE_REFINE="${TEXTURE_REFINE:-0}"
+TEXTURE_MIN_RESOLUTION="${TEXTURE_MIN_RESOLUTION:-4}"
+TEXTURE_MAX_RESOLUTION="${TEXTURE_MAX_RESOLUTION:-64}"
+TEXTURE_RTG_REFINE_FROM_ITER="${TEXTURE_RTG_REFINE_FROM_ITER:-30000}"
+TEXTURE_RTG_REFINE_UNTIL_ITER="${TEXTURE_RTG_REFINE_UNTIL_ITER:-100000}"
+TEXTURE_RTG_REFINE_INTERVAL="${TEXTURE_RTG_REFINE_INTERVAL:-1000}"
+TEXTURE_RTG_REFINE_FRACTION="${TEXTURE_RTG_REFINE_FRACTION:-0.02}"
+TEXTURE_RTG_MIN_SCORE="${TEXTURE_RTG_MIN_SCORE:-1e-10}"
+TEXTURE_RTG_RESOLUTION_GAMMA="${TEXTURE_RTG_RESOLUTION_GAMMA:-1.0}"
+TEXTURE_RTG_ALPHA_WEIGHT="${TEXTURE_RTG_ALPHA_WEIGHT:-0.0}"
+TEXTURE_RTG_OPTIMIZER_STATE_SCALE="${TEXTURE_RTG_OPTIMIZER_STATE_SCALE:-0.5}"
 read -r -a PYTHON_CMD <<< "${PYTHON_BIN}"
 
-export PYTHONPATH="${ROOT}/submodules/simple-knn:${ROOT}/submodules/diff-gaussian-rasterization:${ROOT}/submodules/diff-gaussian-rasterization_light:${ROOT}/submodules/diff-gaussian-rasterization_hgs:${ROOT}/submodules/v_3dgs:${ROOT}/submodules/v_3dgs_ortho:${ROOT}/../2dgs/submodules/surfel-texture:${ROOT}/../2dgs/submodules/surfel-texture-deferred:${ROOT}/../2dgs/submodules/diff-surfel-rasterization-shadow:${ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
+export PYTHONPATH="${ROOT}/submodules/simple-knn:${ROOT}/submodules/diff-gaussian-rasterization:${ROOT}/submodules/diff-gaussian-rasterization_light:${ROOT}/submodules/diff-gaussian-rasterization_hgs:${ROOT}/submodules/v_3dgs:${ROOT}/submodules/v_3dgs_ortho:${ROOT}/../gs3/submodules/diff-gaussian-rasterization:${ROOT}/../gs3/submodules/diff-gaussian-rasterization_light:${ROOT}/../gs3/submodules/diff-gaussian-rasterization_hgs:${ROOT}/../gs3/submodules/v_3dgs:${ROOT}/../gs3/submodules/v_3dgs_ortho:${ROOT}/submodules/surfel-texture:${ROOT}/submodules/surfel-texture-deferred:${ROOT}/submodules/diff-surfel-rasterization-shadow:${ROOT}/../2dgs/submodules/surfel-texture:${ROOT}/../2dgs/submodules/surfel-texture-deferred:${ROOT}/../2dgs/submodules/diff-surfel-rasterization-shadow:${ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
 
 COMMON_ARGS=(
   -s "${DATA_ROOT}/${SUBTASK}/${MODEL}/${MODEL}"
@@ -34,6 +49,7 @@ COMMON_ARGS=(
   --view_num "${VIEW_NUM}"
   --iterations "${ITERATIONS}"
   --rasterizer 2dgs
+  --mbrdf_normal_source "${MBRDF_NORMAL_SOURCE}"
   --sh_degree 0
   --resolution 1
   --asg_freeze_step 22000
@@ -66,13 +82,30 @@ COMMON_ARGS=(
 
 TEXTURE_ARGS=(
   --use_textures
-  --texture_resolution 4
+  --texture_resolution "${TEXTURE_RESOLUTION}"
   --texture_effect_mode "${TEXTURE_EFFECT_MODE}"
+  --texture_specular_lr_scale "${TEXTURE_SPECULAR_LR_SCALE}"
   --texture_normal_lr_scale "${TEXTURE_NORMAL_LR_SCALE}"
-  --texture_start_iter 30000
+  --texture_start_iter "${TEXTURE_START_ITER}"
 )
 if [[ "${TEXTURE_FREEZE_GAUSSIAN_DENSIFY}" == "1" || "${TEXTURE_FREEZE_GAUSSIAN_DENSIFY}" == "true" ]]; then
   TEXTURE_ARGS+=(--texture_freeze_gaussian_densify)
+fi
+if [[ "${TEXTURE_REFINE}" == "1" || "${TEXTURE_REFINE}" == "true" ]]; then
+  TEXTURE_ARGS+=(
+    --texture_dynamic_resolution
+    --texture_min_resolution "${TEXTURE_MIN_RESOLUTION}"
+    --texture_max_resolution "${TEXTURE_MAX_RESOLUTION}"
+    --texture_rtg_enabled
+    --texture_rtg_refine_from_iter "${TEXTURE_RTG_REFINE_FROM_ITER}"
+    --texture_rtg_refine_until_iter "${TEXTURE_RTG_REFINE_UNTIL_ITER}"
+    --texture_rtg_refine_interval "${TEXTURE_RTG_REFINE_INTERVAL}"
+    --texture_rtg_refine_fraction "${TEXTURE_RTG_REFINE_FRACTION}"
+    --texture_rtg_min_score "${TEXTURE_RTG_MIN_SCORE}"
+    --texture_rtg_resolution_gamma "${TEXTURE_RTG_RESOLUTION_GAMMA}"
+    --texture_rtg_alpha_weight "${TEXTURE_RTG_ALPHA_WEIGHT}"
+    --texture_rtg_optimizer_state_scale "${TEXTURE_RTG_OPTIMIZER_STATE_SCALE}"
+  )
 fi
 
 usage() {

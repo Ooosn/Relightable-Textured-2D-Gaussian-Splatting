@@ -26,6 +26,11 @@ from utils.sh_utils import RGB2SH, SH2RGB
 from utils.system_utils import mkdir_p
 
 
+def inverse_softplus(x, eps=1e-8):
+    x = x.clamp_min(eps)
+    return torch.where(x > 20.0, x, torch.log(torch.expm1(x)))
+
+
 class GaussianModel:
     def setup_functions(self):
         def build_covariance_from_scaling_rotation(center, scaling, scaling_modifier, rotation):
@@ -61,6 +66,7 @@ class GaussianModel:
         asg_channel_num: int = 1,
         asg_mlp: bool = False,
         asg_alpha_num: int = 1,
+        mbrdf_normal_source: str = "local_q",
     ):
         self.active_sh_degree = 0
         self.max_sh_degree = sh_degree
@@ -79,6 +85,9 @@ class GaussianModel:
         self.asg_channel_num = asg_channel_num
         self.asg_mlp = asg_mlp
         self.asg_alpha_num = asg_alpha_num
+        self.mbrdf_normal_source = str(mbrdf_normal_source).lower()
+        if self.mbrdf_normal_source not in {"local_q", "2dgs"}:
+            raise ValueError("mbrdf_normal_source must be 'local_q' or '2dgs'.")
 
         self._xyz = torch.empty(0)
         self._features_dc = torch.empty(0)
@@ -118,6 +127,8 @@ class GaussianModel:
         self.texture_rtg_resolution_gamma = 1.0
         self.texture_rtg_chunk_texels = 262_144
         self.texture_rtg_optimizer_state_scale = 0.5
+        self.texture_specular_lr_scale = 1.0
+        self.texture_normal_lr_scale = 1.0
         self.texture_normal_scale = 0.35
         self._last_rtg_refine_log = {}
         self.setup_functions()
@@ -164,7 +175,10 @@ class GaussianModel:
                 "rtg_score": self._rtg_score,
                 "tex_specular": self._tex_specular,
                 "tex_normal": self._tex_normal,
+                "mbrdf_normal_source": self.mbrdf_normal_source,
                 "texture_normal_scale": self.texture_normal_scale,
+                "texture_specular_lr_scale": self.texture_specular_lr_scale,
+                "texture_normal_lr_scale": self.texture_normal_lr_scale,
                 "texture_rtg_optimizer_state_scale": self.texture_rtg_optimizer_state_scale,
             },
         )
@@ -266,7 +280,10 @@ class GaussianModel:
             self._tex_specular = tex_specular.to(device="cuda", dtype=torch.float32) if isinstance(tex_specular, torch.Tensor) else torch.empty(0, device="cuda")
             tex_normal = extra_state.get("tex_normal", torch.empty(0))
             self._tex_normal = tex_normal.to(device="cuda", dtype=torch.float32) if isinstance(tex_normal, torch.Tensor) else torch.empty(0, device="cuda")
+            self.mbrdf_normal_source = str(extra_state.get("mbrdf_normal_source", getattr(self, "mbrdf_normal_source", "local_q"))).lower()
             self.texture_normal_scale = float(extra_state.get("texture_normal_scale", getattr(self, "texture_normal_scale", 0.35)))
+            self.texture_specular_lr_scale = float(extra_state.get("texture_specular_lr_scale", getattr(self, "texture_specular_lr_scale", 1.0)))
+            self.texture_normal_lr_scale = float(extra_state.get("texture_normal_lr_scale", getattr(self, "texture_normal_lr_scale", 1.0)))
             self.texture_rtg_optimizer_state_scale = float(extra_state.get("texture_rtg_optimizer_state_scale", getattr(self, "texture_rtg_optimizer_state_scale", 0.5)))
             if self.use_mbrdf:
                 self._initialize_mbrdf_modules()
@@ -339,7 +356,7 @@ class GaussianModel:
 
     @property
     def get_texture_color(self):
-        return torch.sigmoid(self._tex_color)
+        return self.material_activation(self._tex_color)
 
     @property
     def get_texture_alpha(self):
@@ -369,7 +386,7 @@ class GaussianModel:
         n_points = int(self.get_xyz.shape[0]) if isinstance(self.get_xyz, torch.Tensor) and self.get_xyz.numel() > 0 else 0
         device = self.get_xyz.device if device is None and n_points > 0 else (device or "cuda")
         dtype = dtype or torch.float32
-        local_q = getattr(self, "local_q", None)
+        local_q = self.get_mbrdf_base_local_q
         if isinstance(local_q, torch.Tensor) and local_q.numel() > 0 and local_q.shape[0] == n_points and local_q.shape[1] == 4:
             return local_q.detach().to(device=device, dtype=dtype)
         q = torch.zeros((n_points, 4), dtype=dtype, device=device)
@@ -446,8 +463,14 @@ class GaussianModel:
         return self.material_activation(self.alpha_asg)
 
     @property
+    def get_mbrdf_base_local_q(self):
+        if str(getattr(self, "mbrdf_normal_source", "local_q")) == "2dgs":
+            return self.get_rotation
+        return self.local_q
+
+    @property
     def get_local_axis(self):
-        return build_rotation(self.local_q)
+        return build_rotation(self.get_mbrdf_base_local_q)
 
     @property
     def get_neural_material(self):
@@ -559,9 +582,7 @@ class GaussianModel:
         return 0
 
     def _uses_texture_normal_residual(self):
-        return str(getattr(self, "texture_effect_mode", "")) in {
-            "uvshadow_micro_normal_residual",
-        }
+        return False
 
     def _identity_texture_local_q_like(self, tex):
         if not isinstance(tex, torch.Tensor) or tex.numel() == 0:
@@ -588,6 +609,19 @@ class GaussianModel:
             self._texture_dims if texture_dims is None else texture_dims,
         )
 
+    def _local_q_lr(self, iteration, local_q_freeze_step=0):
+        if not hasattr(self, "local_q_scheduler_args"):
+            return 0.0
+        return self.local_q_scheduler_args(max(0, iteration - local_q_freeze_step))
+
+    def _texture_specular_lr(self, iteration=0, asg_freeze_step=0):
+        if not hasattr(self, "asg_scheduler_args"):
+            return 0.0
+        return self.asg_scheduler_args(max(0, iteration - asg_freeze_step)) * float(getattr(self, "texture_specular_lr_scale", 1.0))
+
+    def _texture_normal_lr(self, iteration=0, local_q_freeze_step=0):
+        return self._local_q_lr(iteration, local_q_freeze_step) * float(getattr(self, "texture_normal_lr_scale", 1.0))
+
     def _ensure_texture_local_q_state(self):
         if not (self.use_textures and self.use_mbrdf):
             return
@@ -602,6 +636,13 @@ class GaussianModel:
         values = torch.sigmoid(torch.nan_to_num(tensor.detach(), nan=0.0, posinf=20.0, neginf=-20.0))
         values = torch.nan_to_num(values, nan=0.5, posinf=1.0, neginf=0.0).clamp(eps, 1.0 - eps)
         return inverse_sigmoid(values)
+
+    def _sanitize_texture_kd(self, tensor):
+        if not isinstance(tensor, torch.Tensor) or tensor.numel() == 0:
+            return tensor
+        if torch.isfinite(tensor).all():
+            return tensor
+        return torch.nan_to_num(tensor.detach(), nan=0.0, posinf=20.0, neginf=-20.0)
 
     def _sanitize_texture_local_q(self, tensor):
         if not isinstance(tensor, torch.Tensor) or tensor.numel() == 0:
@@ -623,7 +664,17 @@ class GaussianModel:
         return fixed
 
     def _sanitize_texture_logits_in_place(self):
-        for name in ("_tex_color", "_tex_alpha"):
+        tex_color = getattr(self, "_tex_color", None)
+        fixed_color = self._sanitize_texture_kd(tex_color)
+        if fixed_color is not tex_color:
+            if isinstance(tex_color, nn.Parameter):
+                with torch.no_grad():
+                    tex_color.copy_(fixed_color.to(device=tex_color.device, dtype=tex_color.dtype))
+            else:
+                fixed_color = fixed_color.to(device=tex_color.device, dtype=tex_color.dtype)
+                self._tex_color = nn.Parameter(fixed_color.requires_grad_(True)) if getattr(tex_color, "requires_grad", False) else fixed_color
+
+        for name in ("_tex_alpha",):
             tensor = getattr(self, name, None)
             fixed = self._sanitize_texture_logits(tensor)
             if fixed is tensor:
@@ -708,18 +759,25 @@ class GaussianModel:
             return
         existing = {group.get("name") for group in self.optimizer.param_groups}
         texture_lr = float(training_args.texture_lr)
-        texture_normal_lr = texture_lr * float(getattr(training_args, "texture_normal_lr_scale", 1.0))
+        texture_kd_lr = float(getattr(training_args, "kd_lr", texture_lr))
+        self.texture_specular_lr_scale = float(getattr(training_args, "texture_specular_lr_scale", 1.0))
+        self.texture_normal_lr_scale = float(getattr(training_args, "texture_normal_lr_scale", 1.0))
+        texture_specular_lr = float(getattr(training_args, "asg_lr_init", 0.01)) * self.texture_specular_lr_scale
+        texture_normal_lr = float(getattr(training_args, "local_q_lr_init", 0.01)) * self.texture_normal_lr_scale
         if "tex_color" not in existing:
             self.optimizer.add_param_group(
-                {"params": [self._tex_color], "lr": texture_lr, "name": "tex_color"}
+                {"params": [self._tex_color], "lr": texture_kd_lr, "name": "tex_color"}
             )
+            tex_kd_state = self._texture_kd_optimizer_state()
+            if tex_kd_state is not None:
+                self.optimizer.state[self._tex_color] = tex_kd_state
         if "tex_alpha" not in existing:
             self.optimizer.add_param_group(
                 {"params": [self._tex_alpha], "lr": texture_lr, "name": "tex_alpha"}
             )
         if self.use_mbrdf and self._tex_specular.numel() > 0 and "tex_specular" not in existing:
             self.optimizer.add_param_group(
-                {"params": [self._tex_specular], "lr": texture_lr, "name": "tex_specular"}
+                {"params": [self._tex_specular], "lr": texture_specular_lr, "name": "tex_specular"}
             )
         if self.use_mbrdf and self._tex_normal.numel() > 0 and "tex_normal" not in existing:
             self.optimizer.add_param_group(
@@ -733,11 +791,19 @@ class GaussianModel:
         if self.optimizer is None:
             return
         texture_lr = float(training_args.texture_lr)
-        texture_normal_lr = texture_lr * float(getattr(training_args, "texture_normal_lr_scale", 1.0))
+        texture_kd_lr = float(getattr(training_args, "kd_lr", texture_lr))
+        self.texture_specular_lr_scale = float(getattr(training_args, "texture_specular_lr_scale", 1.0))
+        self.texture_normal_lr_scale = float(getattr(training_args, "texture_normal_lr_scale", 1.0))
+        texture_specular_lr = float(getattr(training_args, "asg_lr_init", 0.01)) * self.texture_specular_lr_scale
+        texture_normal_lr = float(getattr(training_args, "local_q_lr_init", 0.01)) * self.texture_normal_lr_scale
         for group in self.optimizer.param_groups:
             name = group.get("name")
-            if name in {"tex_color", "tex_alpha", "tex_specular"}:
+            if name == "tex_color":
+                group["lr"] = texture_kd_lr
+            elif name == "tex_alpha":
                 group["lr"] = texture_lr
+            elif name == "tex_specular":
+                group["lr"] = texture_specular_lr
             elif name == "tex_normal":
                 group["lr"] = texture_normal_lr
 
@@ -756,6 +822,8 @@ class GaussianModel:
         self.texture_rtg_resolution_gamma = float(getattr(training_args, "texture_rtg_resolution_gamma", 1.0))
         self.texture_rtg_chunk_texels = int(getattr(training_args, "texture_rtg_chunk_texels", 262_144))
         self.texture_rtg_optimizer_state_scale = float(getattr(training_args, "texture_rtg_optimizer_state_scale", 0.5))
+        self.texture_specular_lr_scale = float(getattr(training_args, "texture_specular_lr_scale", 1.0))
+        self.texture_normal_lr_scale = float(getattr(training_args, "texture_normal_lr_scale", 1.0))
         if self._tex_color.numel() == 0:
             self.initialize_texture_state(neutral_multiplier=True)
         if self.use_mbrdf and self._tex_specular.numel() == 0:
@@ -864,7 +932,8 @@ class GaussianModel:
             return None
         if self._uses_texture_normal_residual():
             return None
-        local_state = self._optimizer_state_for_name("local_q")
+        source_group = "rotation" if str(getattr(self, "mbrdf_normal_source", "local_q")) == "2dgs" else "local_q"
+        local_state = self._optimizer_state_for_name(source_group)
         if not isinstance(local_state, dict):
             return None
         out = {}
@@ -889,6 +958,39 @@ class GaussianModel:
                     expanded = torch.zeros_like(self._tex_normal)
             else:
                 expanded = torch.zeros_like(self._tex_normal)
+            if key == "exp_avg_sq":
+                expanded = expanded.clamp_min(0.0)
+            out[key] = expanded
+        return out or None
+
+    def _texture_kd_optimizer_state(self):
+        if self.optimizer is None or not isinstance(self._tex_color, torch.Tensor) or self._tex_color.numel() == 0:
+            return None
+        kd_state = self._optimizer_state_for_name("kd")
+        if not isinstance(kd_state, dict):
+            return None
+        out = {}
+        for key, value in kd_state.items():
+            if not isinstance(value, torch.Tensor):
+                out[key] = value
+                continue
+            if key not in {"exp_avg", "exp_avg_sq"} or value.ndim != 2 or value.shape[1] != 3:
+                out[key] = value.detach().clone().to(device=self._tex_color.device)
+                continue
+            value = value.detach().to(device=self._tex_color.device, dtype=self._tex_color.dtype)
+            if self._tex_color.ndim == 4:
+                expanded = value[:, :, None, None].expand(-1, -1, self._tex_color.shape[2], self._tex_color.shape[3]).contiguous()
+            elif self._tex_color.ndim == 2:
+                dims = self._texture_dims
+                if isinstance(dims, torch.Tensor) and dims.numel() > 0 and dims.shape[0] == value.shape[0]:
+                    counts = (dims[:, 0].to(device=value.device, dtype=torch.long) * dims[:, 1].to(device=value.device, dtype=torch.long)).clamp_min(1)
+                    expanded = torch.repeat_interleave(value, counts, dim=0)
+                elif value.shape[0] == self._tex_color.shape[0]:
+                    expanded = value
+                else:
+                    expanded = torch.zeros_like(self._tex_color)
+            else:
+                expanded = torch.zeros_like(self._tex_color)
             if key == "exp_avg_sq":
                 expanded = expanded.clamp_min(0.0)
             out[key] = expanded
@@ -1098,7 +1200,7 @@ class GaussianModel:
         tex_specular = torch.zeros((num_points * texels_per_point, 1), dtype=torch.float32, device=base_color.device)
         tex_normal = self._texture_normal_initial_state(tex_color, self._texture_dims)
         self._validate_dynamic_texture_layout(tex_color, tex_alpha, self._texture_dims, tex_specular, tex_normal)
-        self._tex_color = nn.Parameter(inverse_sigmoid(tex_color.clamp(1e-6, 1 - 1e-6)).requires_grad_(True))
+        self._tex_color = nn.Parameter(tex_color.requires_grad_(True))
         self._tex_alpha = nn.Parameter(inverse_sigmoid(tex_alpha).requires_grad_(True))
         if self.use_mbrdf:
             self._tex_specular = nn.Parameter(tex_specular.requires_grad_(True))
@@ -1235,8 +1337,8 @@ class GaussianModel:
 
         if self.use_textures:
             if self.texture_dynamic_resolution:
-                neutral_texture = torch.full_like(fused_color_rgb, 0.5)
-                self._init_dynamic_textures_from_base_color(neutral_texture)
+                initial_kd = torch.full_like(fused_color_rgb, 0.5)
+                self._init_dynamic_textures_from_base_color(initial_kd)
             else:
                 tex_color = torch.full(
                     (fused_point_cloud.shape[0], 3, self.texture_resolution, self.texture_resolution),
@@ -1250,7 +1352,7 @@ class GaussianModel:
                     dtype=torch.float32,
                     device="cuda",
                 )
-                self._tex_color = nn.Parameter(inverse_sigmoid(tex_color).requires_grad_(True))
+                self._tex_color = nn.Parameter(tex_color.requires_grad_(True))
                 self._tex_alpha = nn.Parameter(inverse_sigmoid(tex_alpha).requires_grad_(True))
                 if self.use_mbrdf:
                     self._tex_specular = nn.Parameter(torch.zeros(
@@ -1278,6 +1380,8 @@ class GaussianModel:
         self.texture_rtg_resolution_gamma = float(getattr(training_args, "texture_rtg_resolution_gamma", 1.0))
         self.texture_rtg_chunk_texels = int(getattr(training_args, "texture_rtg_chunk_texels", 262_144))
         self.texture_rtg_optimizer_state_scale = float(getattr(training_args, "texture_rtg_optimizer_state_scale", 0.5))
+        self.texture_specular_lr_scale = float(getattr(training_args, "texture_specular_lr_scale", 1.0))
+        self.texture_normal_lr_scale = float(getattr(training_args, "texture_normal_lr_scale", 1.0))
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self._ensure_rtg_buffers()
@@ -1292,19 +1396,21 @@ class GaussianModel:
         ]
         if self.use_textures:
             texture_lr = float(training_args.texture_lr)
-            texture_normal_lr = texture_lr * float(getattr(training_args, "texture_normal_lr_scale", 1.0))
+            texture_kd_lr = float(getattr(training_args, "kd_lr", texture_lr))
+            texture_specular_lr = float(training_args.asg_lr_init) * self.texture_specular_lr_scale
+            texture_normal_lr = float(training_args.local_q_lr_init) * self.texture_normal_lr_scale
             if self.use_mbrdf and self._tex_specular.numel() == 0:
                 self._initialize_texture_specular_state()
             if self.use_mbrdf:
                 self._ensure_texture_local_q_state()
             groups.extend(
                 [
-                    {"params": [self._tex_color], "lr": texture_lr, "name": "tex_color"},
+                    {"params": [self._tex_color], "lr": texture_kd_lr, "name": "tex_color"},
                     {"params": [self._tex_alpha], "lr": texture_lr, "name": "tex_alpha"},
                 ]
             )
             if self.use_mbrdf and self._tex_specular.numel() > 0:
-                groups.append({"params": [self._tex_specular], "lr": texture_lr, "name": "tex_specular"})
+                groups.append({"params": [self._tex_specular], "lr": texture_specular_lr, "name": "tex_specular"})
             if self.use_mbrdf and self._tex_normal.numel() > 0:
                 groups.append({"params": [self._tex_normal], "lr": texture_normal_lr, "name": "tex_normal"})
         if self.use_mbrdf:
@@ -1356,8 +1462,15 @@ class GaussianModel:
                 param_group["lr"] = self.xyz_scheduler_args(iteration)
             elif param_group["name"] in {"alpha_asg", "asg_sigma", "asg_rotation", "asg_scales"}:
                 param_group["lr"] = self.asg_scheduler_args(max(0, iteration - asg_freeze_step))
+            elif param_group["name"] == "tex_specular":
+                param_group["lr"] = self._texture_specular_lr(iteration, asg_freeze_step)
             elif param_group["name"] == "local_q":
-                param_group["lr"] = self.local_q_scheduler_args(max(0, iteration - local_q_freeze_step))
+                if str(getattr(self, "mbrdf_normal_source", "local_q")) == "2dgs":
+                    param_group["lr"] = 0.0
+                else:
+                    param_group["lr"] = self._local_q_lr(iteration, local_q_freeze_step)
+            elif param_group["name"] == "tex_normal":
+                param_group["lr"] = self._texture_normal_lr(iteration, local_q_freeze_step)
             elif param_group["name"] in {"neural_phasefunc", "neural_material"}:
                 param_group["lr"] = self.neural_phasefunc_scheduler_args(max(0, iteration - freeze_phasefunc_steps))
 
@@ -1399,6 +1512,9 @@ class GaussianModel:
             "texture_dynamic_resolution": self.texture_dynamic_resolution,
             "texture_min_resolution": self.texture_min_resolution,
             "texture_max_resolution": self.texture_max_resolution,
+            "mbrdf_normal_source": self.mbrdf_normal_source,
+            "texture_specular_lr_scale": self.texture_specular_lr_scale,
+            "texture_normal_lr_scale": self.texture_normal_lr_scale,
             "texture_rtg_optimizer_state_scale": self.texture_rtg_optimizer_state_scale,
         }
         if self.use_textures:
@@ -1502,16 +1618,18 @@ class GaussianModel:
             self._rtg_score = torch.empty(0, device="cuda")
             return
 
-        if neutral_multiplier:
+        if self.use_mbrdf and isinstance(self.kd, torch.Tensor) and self.kd.numel() == num_points * 3:
+            base_color = self.kd.detach().to(device=self._xyz.device, dtype=torch.float32)
+        elif neutral_multiplier:
             base_color = torch.full((num_points, 3), 0.5, dtype=torch.float32, device=self._xyz.device)
         else:
-            base_color = torch.clamp(SH2RGB(self._features_dc.detach().squeeze(1)), 1e-6, 1 - 1e-6)
+            base_color = inverse_softplus(torch.clamp(SH2RGB(self._features_dc.detach().squeeze(1)), 1e-6))
         if self.texture_dynamic_resolution:
             self._init_dynamic_textures_from_base_color(base_color)
             return
-        tex_color = base_color.clamp(1e-6, 1 - 1e-6)[:, :, None, None].repeat(1, 1, tex_res, tex_res)
+        tex_color = base_color[:, :, None, None].repeat(1, 1, tex_res, tex_res)
         tex_alpha = torch.full((num_points, 1, tex_res, tex_res), 1.0 - 1e-6, dtype=torch.float32, device="cuda")
-        self._tex_color = nn.Parameter(inverse_sigmoid(tex_color).requires_grad_(True))
+        self._tex_color = nn.Parameter(tex_color.requires_grad_(True))
         self._tex_alpha = nn.Parameter(inverse_sigmoid(tex_alpha).requires_grad_(True))
         if self.use_mbrdf:
             self._tex_specular = nn.Parameter(torch.zeros(
@@ -1534,6 +1652,9 @@ class GaussianModel:
         self.texture_dynamic_resolution = bool(payload.get("texture_dynamic_resolution", self.texture_dynamic_resolution))
         self.texture_min_resolution = int(payload.get("texture_min_resolution", self.texture_min_resolution))
         self.texture_max_resolution = int(payload.get("texture_max_resolution", self.texture_max_resolution))
+        self.mbrdf_normal_source = str(payload.get("mbrdf_normal_source", getattr(self, "mbrdf_normal_source", "local_q"))).lower()
+        self.texture_specular_lr_scale = float(payload.get("texture_specular_lr_scale", getattr(self, "texture_specular_lr_scale", 1.0)))
+        self.texture_normal_lr_scale = float(payload.get("texture_normal_lr_scale", getattr(self, "texture_normal_lr_scale", 1.0)))
         self.texture_normal_scale = float(payload.get("texture_normal_scale", getattr(self, "texture_normal_scale", 0.35)))
         self.texture_rtg_optimizer_state_scale = float(payload.get("texture_rtg_optimizer_state_scale", getattr(self, "texture_rtg_optimizer_state_scale", 0.5)))
         if self.use_textures:
@@ -1671,13 +1792,13 @@ class GaussianModel:
             for chunk_start in range(0, int(idx.numel()), charts_per_chunk):
                 chunk_idx = idx[chunk_start:chunk_start + charts_per_chunk]
                 src = old_offsets[chunk_idx, None] + local_old[None, :]
-                color_values = torch.sigmoid(self._tex_color.detach()[src.reshape(-1)]).view(chunk_idx.numel(), res_value, res_value, color_channels)
+                color_values = self.material_activation(self._tex_color.detach()[src.reshape(-1)]).view(chunk_idx.numel(), res_value, res_value, color_channels)
                 alpha_values = torch.sigmoid(self._tex_alpha.detach()[src.reshape(-1)]).view(chunk_idx.numel(), res_value, res_value, alpha_channels)
                 color_values = color_values.permute(0, 3, 1, 2).contiguous()
                 alpha_values = alpha_values.permute(0, 3, 1, 2).contiguous()
                 color_up = F.interpolate(color_values, size=(target_res, target_res), mode="bilinear", align_corners=True)
                 alpha_up = F.interpolate(alpha_values, size=(target_res, target_res), mode="bilinear", align_corners=True)
-                color_up = inverse_sigmoid(color_up.permute(0, 2, 3, 1).reshape(-1, color_channels).clamp(1e-6, 1 - 1e-6))
+                color_up = inverse_softplus(color_up.permute(0, 2, 3, 1).reshape(-1, color_channels))
                 alpha_up = inverse_sigmoid(alpha_up.permute(0, 2, 3, 1).reshape(-1, alpha_channels).clamp(1e-6, 1 - 1e-6))
                 dst = new_offsets[chunk_idx, None] + local_new[None, :]
                 new_color[dst.reshape(-1)] = color_up
