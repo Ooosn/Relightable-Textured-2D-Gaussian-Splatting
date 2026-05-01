@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import inspect
 import json
+import math
 import os
 import statistics
 import sys
@@ -34,7 +35,14 @@ print(f"[profile] preloaded texture module: {_fresh_texture_module.__file__}", f
 print(f"[profile] preloaded texture deferred module: {_fresh_texture_deferred_module.__file__}", flush=True)
 
 from arguments import ModelParams, OptimizationParams, PipelineParams  # noqa: E402
-from gaussian_renderer import render  # noqa: E402
+from gaussian_renderer import (  # noqa: E402
+    _NdotWi,
+    _build_2dgs_raster_settings,
+    _compute_shadow_pass_2dgs_native,
+    _safe_normalize,
+    render,
+    surfel_rasterizer_deferred,
+)
 from gaussian_renderer.texture_branch import (  # noqa: E402
     _compute_texture_mbrdf,
     _compute_texture_shadow_pass,
@@ -160,6 +168,90 @@ def _texture_stats(gau):
     return stats
 
 
+def _compute_native_mbrdf(viewpoint_camera, gau, shadow_pkg, fix_labert=False):
+    means3d = gau.get_xyz
+    pl_pos_expand = viewpoint_camera.pl_pos.expand(means3d.shape[0], -1)
+    wi_ray = pl_pos_expand - means3d
+    wi_dist2 = torch.sum(wi_ray**2, dim=-1, keepdim=True).clamp_min(1e-12)
+    dist_2_inv = 1.0 / wi_dist2
+    wi = wi_ray * torch.sqrt(dist_2_inv)
+    camera_center_for_brdf = viewpoint_camera.camera_center
+    if os.getenv("GS3_2DGS_DETACH_VIEWDIR", "0") == "1":
+        camera_center_for_brdf = camera_center_for_brdf.detach()
+    wo = _safe_normalize(camera_center_for_brdf - means3d)
+
+    local_axises = gau.get_local_axis
+    local_z = local_axises[:, :, 2]
+    wi_local = torch.einsum("Ki,Kij->Kj", wi, local_axises)
+    wo_local = torch.einsum("Ki,Kij->Kj", wo, local_axises)
+    cos_theta = _NdotWi(local_z, wi, torch.nn.ELU(alpha=0.01), 0.01)
+    diffuse = gau.get_kd / math.pi
+    asg_scales = gau.asg_func.get_asg_lam_miu
+    asg_axises = gau.asg_func.get_asg_axis
+    asg_1 = gau.asg_func(wi_local, wo_local, gau.get_alpha_asg, asg_scales, asg_axises)
+    shadow_hint = None if shadow_pkg is None else shadow_pkg["per_point_shadow"]
+    decay, other_effects, _, _ = gau.neural_phasefunc(
+        wi,
+        wo,
+        means3d,
+        gau.get_neural_material,
+        hint=shadow_hint,
+    )
+    if decay is None:
+        decay = torch.ones((means3d.shape[0], 1), dtype=torch.float32, device=means3d.device)
+    if fix_labert:
+        basecolor = diffuse * cos_theta * dist_2_inv
+    else:
+        specular = gau.get_ks * asg_1
+        basecolor = (diffuse + specular) * cos_theta * dist_2_inv
+    if other_effects is None:
+        other_effects = torch.zeros_like(basecolor)
+    else:
+        other_effects = other_effects * dist_2_inv
+    return torch.cat([basecolor, decay, other_effects], dim=1)
+
+
+def _rasterize_native_deferred(viewpoint_camera, gau, pipe, bg_color, colors_precomp, scaling_modifier=1.0):
+    means3d = gau.get_xyz
+    means2d = torch.zeros_like(means3d, dtype=torch.float32, requires_grad=True, device=means3d.device)
+    transmat_grad_holder = None
+    if getattr(viewpoint_camera, "cam_pose_adj", None) is not None and viewpoint_camera.cam_pose_adj.requires_grad:
+        transmat_grad_holder = torch.zeros(
+            (means3d.shape[0], 9),
+            dtype=torch.float32,
+            device=means3d.device,
+            requires_grad=True,
+        )
+    surfel_bg = bg_color
+    if surfel_bg.shape[0] == 3:
+        surfel_bg = torch.cat(
+            [surfel_bg, torch.zeros(4, dtype=surfel_bg.dtype, device=surfel_bg.device)],
+            dim=0,
+        )
+    raster_settings = _build_2dgs_raster_settings(
+        viewpoint_camera,
+        pipe,
+        surfel_bg,
+        scaling_modifier,
+        gau.active_sh_degree,
+    )
+    rasterizer = surfel_rasterizer_deferred(raster_settings=raster_settings)
+    return rasterizer(
+        means3D=means3d,
+        means2D=means2d,
+        opacities=gau.get_opacity,
+        shs=None,
+        colors_precomp=colors_precomp,
+        scales=gau.get_scaling,
+        rotations=gau.get_rotation,
+        cov3D_precomp=None,
+        texture_color=None,
+        texture_alpha=None,
+        use_textures=False,
+        transmat_grad_holder=transmat_grad_holder,
+    )
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--source_path", "--source", dest="source_path", required=True)
@@ -249,8 +341,26 @@ def main():
 
     with torch.no_grad():
         if args.no_textures:
-            print("[profile] timing full_render only (no textures)", flush=True)
+            print("[profile] priming native no-texture stages", flush=True)
+            native_shadow_pkg = _compute_shadow_pass_2dgs_native(view, gaussians, pipe, background, 1.0)
+            native_colors = _compute_native_mbrdf(view, gaussians, native_shadow_pkg, fix_labert=False)
+            print("[profile] timing native no-texture stages", flush=True)
             timings = {
+                "native_shadow_pass": _cuda_ms(
+                    lambda: _compute_shadow_pass_2dgs_native(view, gaussians, pipe, background, 1.0),
+                    args.warmup,
+                    args.repeat,
+                ),
+                "native_mbrdf_precompute": _cuda_ms(
+                    lambda: _compute_native_mbrdf(view, gaussians, native_shadow_pkg, fix_labert=False),
+                    args.warmup,
+                    args.repeat,
+                ),
+                "native_raster": _cuda_ms(
+                    lambda: _rasterize_native_deferred(view, gaussians, pipe, background, native_colors, 1.0),
+                    args.warmup,
+                    args.repeat,
+                ),
                 "full_render": _cuda_ms(
                     full_render_fn,
                     args.warmup,
@@ -272,6 +382,12 @@ def main():
         print("[profile] timing shadow_pass", flush=True)
         timings["shadow_pass"] = _cuda_ms(
             lambda: _compute_texture_shadow_pass(view, gaussians, pipe, background, 1.0),
+            args.warmup,
+            args.repeat,
+        )
+        print("[profile] timing shadow_pass_point", flush=True)
+        timings["shadow_pass_point"] = _cuda_ms(
+            lambda: _compute_texture_shadow_pass(view, gaussians, pipe, background, 1.0, per_uv=False),
             args.warmup,
             args.repeat,
         )
