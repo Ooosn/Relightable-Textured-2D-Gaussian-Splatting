@@ -79,7 +79,6 @@ def _build_gs_args(profile_args: argparse.Namespace):
         "--resolution",
         "1",
         "--use_nerual_phasefunc",
-        "--use_textures",
         "--texture_effect_mode",
         profile_args.texture_effect_mode,
         "--mbrdf_normal_source",
@@ -88,6 +87,8 @@ def _build_gs_args(profile_args: argparse.Namespace):
         "--pl_opt",
         "--eval",
     ]
+    if not profile_args.no_textures:
+        argv.append("--use_textures")
     if profile_args.texture_dynamic_resolution:
         argv.extend(
             [
@@ -132,6 +133,13 @@ def _cuda_ms(fn: Callable[[], object], warmup: int, repeat: int):
 def _texture_stats(gau):
     num_points = int(gau.get_xyz.shape[0])
     stats = {"num_points": num_points}
+    if not bool(getattr(gau, "use_textures", False)):
+        stats["dynamic"] = False
+        stats["use_textures"] = False
+        stats["total_texels"] = 0
+        stats["avg_texels_per_point"] = 0.0
+        return stats
+    stats["use_textures"] = True
     if bool(getattr(gau, "has_dynamic_textures", False)):
         dims = gau.get_texture_dims
         counts = (dims[:, 0].long() * dims[:, 1].long()).clamp_min(1)
@@ -165,6 +173,7 @@ def main():
     ap.add_argument("--warmup", type=int, default=3)
     ap.add_argument("--repeat", type=int, default=10)
     ap.add_argument("--texture_dynamic_resolution", action="store_true")
+    ap.add_argument("--no_textures", action="store_true")
     ap.add_argument("--texture_min_resolution", type=int, default=4)
     ap.add_argument("--texture_max_resolution", type=int, default=64)
     ap.add_argument("--profile_backward", action="store_true")
@@ -221,7 +230,40 @@ def main():
         }
     )
 
+    def full_render_fn():
+        return render(
+            view,
+            gaussians,
+            None,
+            None,
+            None,
+            None,
+            None,
+            pipe,
+            background,
+            modelset,
+            scaling_modifier=1.0,
+            fix_labert=False,
+            iteration=int(first_iter or 0),
+        )
+
     with torch.no_grad():
+        if args.no_textures:
+            print("[profile] timing full_render only (no textures)", flush=True)
+            timings = {
+                "full_render": _cuda_ms(
+                    full_render_fn,
+                    args.warmup,
+                    args.repeat,
+                )
+            }
+            result = {"stats": stats, "timings": timings}
+            print(json.dumps(result, indent=2, sort_keys=True))
+            if args.output_json:
+                with open(args.output_json, "w", encoding="utf8") as f:
+                    json.dump(result, f, indent=2, sort_keys=True)
+            return
+
         print("[profile] priming shadow and mbrdf", flush=True)
         shadow_pkg = _compute_texture_shadow_pass(view, gaussians, pipe, background, 1.0)
         mbrdf = _compute_texture_mbrdf(view, gaussians, shadow_pkg, fix_labert=False)
@@ -259,21 +301,7 @@ def main():
         )
         print("[profile] timing full_render", flush=True)
         timings["full_render"] = _cuda_ms(
-            lambda: render(
-                view,
-                gaussians,
-                None,
-                None,
-                None,
-                None,
-                None,
-                pipe,
-                background,
-                modelset,
-                scaling_modifier=1.0,
-                fix_labert=False,
-                iteration=int(first_iter or 0),
-            ),
+            full_render_fn,
             args.warmup,
             args.repeat,
         )
