@@ -192,6 +192,30 @@ def write_run_manifest(args):
     )
 
 
+def log_texture_architecture(path: Path, iteration: int, event: str, gaussians, modelset=None, pipe=None, opt=None, print_summary=True):
+    if not hasattr(gaussians, "texture_architecture_state"):
+        return
+    payload = gaussians.texture_architecture_state(include_optimizer=True)
+    payload.update({"iteration": int(iteration), "event": event})
+    if modelset is not None:
+        payload["model_flags"] = {
+            "use_textures": bool(getattr(modelset, "use_textures", False)),
+            "texture_effect_mode": getattr(modelset, "texture_effect_mode", None),
+            "texture_start_iter": getattr(opt, "texture_start_iter", None) if opt is not None else None,
+            "mbrdf_normal_source": getattr(modelset, "mbrdf_normal_source", None),
+        }
+    if pipe is not None:
+        payload["pipeline_flags"] = {
+            "texture_render_use_alpha": bool(getattr(pipe, "texture_render_use_alpha", False)),
+            "texture_shadow_use_alpha": bool(getattr(pipe, "texture_shadow_use_alpha", False)),
+            "texture_shadow_output_uv": bool(getattr(pipe, "texture_shadow_output_uv", True)),
+            "texture_shadow_alpha_bilinear": bool(getattr(pipe, "texture_shadow_alpha_bilinear", False)),
+        }
+    append_jsonl(path, payload)
+    if print_summary and hasattr(gaussians, "texture_architecture_log_string"):
+        print(f"\n[ITER {iteration}] Texture architecture ({event}) | {gaussians.texture_architecture_log_string()}")
+
+
 def _tensor_finite(tensor):
     if tensor is None:
         return True
@@ -622,6 +646,16 @@ def training(modelset, opt, pipe, testing_iterations, saving_iterations, checkpo
     convergence_dir = Path(scene.model_path) / "convergence"
     health_log_path = convergence_dir / "train_health.jsonl"
     densify_log_path = convergence_dir / "densify_events.jsonl"
+    texture_arch_log_path = convergence_dir / "texture_architecture.jsonl"
+    log_texture_architecture(
+        texture_arch_log_path,
+        first_iter,
+        "train_start",
+        gaussians,
+        modelset=modelset,
+        pipe=pipe,
+        opt=opt,
+    )
     train_health_interval = max(_get_env_int("SSGS_TRAIN_HEALTH", 0), 0)
     collect_backward_stats = os.environ.get("SSGS_BACKWARD_INFO", "0") == "1"
     """
@@ -700,6 +734,15 @@ def training(modelset, opt, pipe, testing_iterations, saving_iterations, checkpo
                 raise RuntimeError("Texture warmup requires a Gaussian model with enable_texture_training().")
             if gaussians.enable_texture_training(opt):
                 print(f"\n[ITER {iteration}] Texture training enabled from Gaussian kd/local material state")
+                log_texture_architecture(
+                    texture_arch_log_path,
+                    iteration,
+                    "texture_enabled",
+                    gaussians,
+                    modelset=modelset,
+                    pipe=pipe,
+                    opt=opt,
+                )
 
         # update lr of asg
         gaussians.update_learning_rate(iteration, \
@@ -938,6 +981,15 @@ def training(modelset, opt, pipe, testing_iterations, saving_iterations, checkpo
 
             if (iteration in checkpoint_iterations):
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))
+                log_texture_architecture(
+                    texture_arch_log_path,
+                    iteration,
+                    "checkpoint",
+                    gaussians,
+                    modelset=modelset,
+                    pipe=pipe,
+                    opt=opt,
+                )
                 torch.save((gaussians.capture(), iteration, scene.capture()), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
 
 
@@ -1119,6 +1171,16 @@ def training(modelset, opt, pipe, testing_iterations, saving_iterations, checkpo
                                 print(f"\n[ITER {iteration}] RTG skipped | {rtg_log}")
                             if hasattr(gaussians, "reset_texture_rtg_scores"):
                                 gaussians.reset_texture_rtg_scores()
+                            log_texture_architecture(
+                                texture_arch_log_path,
+                                iteration,
+                                "rtg_refine" if rtg_refined > 0 else "rtg_skip",
+                                gaussians,
+                                modelset=modelset,
+                                pipe=pipe,
+                                opt=opt,
+                                print_summary=False,
+                            )
 
             """
             1. 默认冻结 高斯点相位函数，初期训练高斯点场景空间为主，并只简单优化漫反射 kd (阴影和次要效果为 0)

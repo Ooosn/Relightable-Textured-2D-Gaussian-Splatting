@@ -120,6 +120,51 @@ Full checkpoints preserve:
 Point-cloud appearance saves preserve texture and mBRDF tensors needed for
 offline rendering, but full training resume should use `chkpnt*.pth`.
 
+## Runtime Audit Logs
+
+Training writes a structured texture audit stream to:
+
+```text
+MODEL_PATH/convergence/texture_architecture.jsonl
+```
+
+Rows are emitted at:
+
+- `train_start`
+- `texture_enabled`
+- every RTG refine or skip event
+- every full checkpoint save
+
+Each row records:
+
+- texture mode and active route;
+- static/dynamic layout;
+- Gaussian count, total texels, average texels per Gaussian;
+- resolution histogram;
+- RTG schedule and gate settings;
+- tensor shapes for `tex_color`, `tex_alpha`, `tex_specular`, `tex_normal`,
+  `texture_dims`, and `rtg_score`;
+- optimizer groups, learning rates, and Adam moment tensor shapes;
+- pipeline alpha flags.
+
+The same state is available in code through:
+
+```python
+gaussians.texture_architecture_state()
+gaussians.texture_architecture_log_string()
+```
+
+Use this file when checking whether a run is actually using the intended
+algorithm. The default clean route should report:
+
+```text
+route kd_uv+shadow_residual_uv+specular_residual_uv
+deferred_tex_ch 4
+tex_normal present false
+texture_render_use_alpha false
+texture_shadow_use_alpha false
+```
+
 ## Files To Read First
 
 - `arguments/__init__.py`

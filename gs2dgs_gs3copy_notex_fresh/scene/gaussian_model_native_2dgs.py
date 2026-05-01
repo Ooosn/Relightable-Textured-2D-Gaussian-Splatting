@@ -522,6 +522,153 @@ class GaussianModel:
             "hist": [(int(r.item()), int(c.item())) for r, c in zip(unique_res, unique_counts)],
         }
 
+    def _texture_tensor_summary(self, tensor):
+        if not isinstance(tensor, torch.Tensor):
+            return {"present": False, "shape": []}
+        return {
+            "present": bool(tensor.numel() > 0),
+            "shape": [int(v) for v in tensor.shape],
+            "requires_grad": bool(getattr(tensor, "requires_grad", False)),
+            "dtype": str(tensor.dtype).replace("torch.", ""),
+        }
+
+    def _optimizer_group_summary(self):
+        if self.optimizer is None:
+            return []
+        groups = []
+        for group in self.optimizer.param_groups:
+            params = group.get("params", [])
+            param = params[0] if params else None
+            state = self.optimizer.state.get(param, {}) if param is not None else {}
+            state_summary = {}
+            if isinstance(state, dict):
+                for key in ("step", "exp_avg", "exp_avg_sq"):
+                    value = state.get(key)
+                    if isinstance(value, torch.Tensor):
+                        state_summary[key] = {
+                            "shape": [int(v) for v in value.shape],
+                            "dtype": str(value.dtype).replace("torch.", ""),
+                        }
+                    elif value is not None:
+                        state_summary[key] = value
+            groups.append(
+                {
+                    "name": group.get("name"),
+                    "lr": float(group.get("lr", 0.0)),
+                    "num_param_tensors": int(len(params)),
+                    "param_shape": [int(v) for v in param.shape] if isinstance(param, torch.Tensor) else [],
+                    "has_state": bool(state_summary),
+                    "state": state_summary,
+                }
+            )
+        return groups
+
+    def texture_architecture_state(self, include_optimizer=True):
+        mode = str(getattr(self, "texture_effect_mode", "uvshadow_specular_residual"))
+        has_textures = bool(getattr(self, "use_textures", False))
+        has_dynamic = bool(self.has_dynamic_textures)
+        if has_dynamic:
+            stats = self._dynamic_texture_stats()
+            layout = "dynamic"
+        elif isinstance(self._tex_color, torch.Tensor) and self._tex_color.numel() > 0:
+            texels = int(self._tex_color.numel() // max(1, int(self._tex_color.shape[1])))
+            stats = {
+                "points": int(self._tex_color.shape[0]) if self._tex_color.ndim >= 1 else 0,
+                "total_texels": texels,
+                "avg_texels": float(texels) / max(1, int(self._tex_color.shape[0])),
+                "hist": [(int(getattr(self, "texture_resolution", 0)), int(self._tex_color.shape[0]))],
+            }
+            layout = "static"
+        else:
+            stats = {
+                "points": int(self.get_xyz.shape[0]) if isinstance(self.get_xyz, torch.Tensor) else 0,
+                "total_texels": 0,
+                "avg_texels": 0.0,
+                "hist": [],
+            }
+            layout = "none"
+
+        state = {
+            "use_textures": has_textures,
+            "texture_effect_mode": mode,
+            "layout": layout,
+            "texture_resolution": int(getattr(self, "texture_resolution", 0)),
+            "texture_dynamic_resolution": bool(getattr(self, "texture_dynamic_resolution", False)),
+            "texture_min_resolution": int(getattr(self, "texture_min_resolution", 0)),
+            "texture_max_resolution": int(getattr(self, "texture_max_resolution", 0)),
+            "gaussians": int(self.get_xyz.shape[0]) if isinstance(self.get_xyz, torch.Tensor) else 0,
+            "texels": int(stats["total_texels"]),
+            "avg_texels_per_gaussian": float(stats["avg_texels"]),
+            "resolution_hist": stats["hist"],
+            "route": {
+                "per_uv_kd_albedo": has_textures,
+                "per_uv_shadow_residual": mode != "per_uv",
+                "per_uv_specular_residual": "specular" in mode or mode == "uv_specular_gain",
+                "per_uv_local_q": bool(self._uses_texture_local_q()),
+                "per_uv_neural_phasefunc": mode == "per_uv",
+                "deferred_texture_channels": 4 if mode == "uvshadow_specular_residual" else 7,
+                "gaussian_other_effects": mode == "uvshadow_specular_residual",
+            },
+            "mbrdf": {
+                "use_mbrdf": bool(getattr(self, "use_mbrdf", False)),
+                "mbrdf_normal_source": str(getattr(self, "mbrdf_normal_source", "local_q")),
+                "asg_mlp": bool(getattr(self, "asg_mlp", False)),
+                "basis_asg_num": int(getattr(self, "basis_asg_num", 0)),
+            },
+            "rtg": {
+                "enabled": bool(getattr(self, "texture_rtg_enabled", False)),
+                "refine_from_iter": int(getattr(self, "texture_rtg_refine_from_iter", 0)),
+                "refine_until_iter": int(getattr(self, "texture_rtg_refine_until_iter", 0)),
+                "refine_interval": int(getattr(self, "texture_rtg_refine_interval", 0)),
+                "refine_fraction": float(getattr(self, "texture_rtg_refine_fraction", 0.0)),
+                "min_score": float(getattr(self, "texture_rtg_min_score", 0.0)),
+                "resolution_gamma": float(getattr(self, "texture_rtg_resolution_gamma", 0.0)),
+                "alpha_weight": float(getattr(self, "texture_rtg_alpha_weight", 0.0)),
+                "optimizer_state_scale": float(getattr(self, "texture_rtg_optimizer_state_scale", 0.0)),
+            },
+            "tensors": {
+                "tex_color": self._texture_tensor_summary(getattr(self, "_tex_color", None)),
+                "tex_alpha": self._texture_tensor_summary(getattr(self, "_tex_alpha", None)),
+                "tex_specular": self._texture_tensor_summary(getattr(self, "_tex_specular", None)),
+                "tex_normal": self._texture_tensor_summary(getattr(self, "_tex_normal", None)),
+                "texture_dims": self._texture_tensor_summary(getattr(self, "_texture_dims", None)),
+                "rtg_score": self._texture_tensor_summary(getattr(self, "_rtg_score", None)),
+            },
+            "lr_scales": {
+                "texture_specular_lr_scale": float(getattr(self, "texture_specular_lr_scale", 1.0)),
+                "texture_normal_lr_scale": float(getattr(self, "texture_normal_lr_scale", 1.0)),
+            },
+        }
+        if include_optimizer:
+            state["optimizer_groups"] = self._optimizer_group_summary()
+        return state
+
+    def texture_architecture_log_string(self):
+        state = self.texture_architecture_state(include_optimizer=False)
+        hist = ", ".join(f"{res}x{res}:{count}" for res, count in state["resolution_hist"])
+        hist = hist if hist else "none"
+        route = state["route"]
+        active = []
+        if route["per_uv_kd_albedo"]:
+            active.append("kd_uv")
+        if route["per_uv_shadow_residual"]:
+            active.append("shadow_residual_uv")
+        if route["per_uv_specular_residual"]:
+            active.append("specular_residual_uv")
+        if route["per_uv_local_q"]:
+            active.append("local_q_uv")
+        if route["per_uv_neural_phasefunc"]:
+            active.append("phasefunc_uv")
+        active = "+".join(active) if active else "none"
+        return (
+            f"mode {state['texture_effect_mode']} | layout {state['layout']} | "
+            f"G {state['gaussians']:,} | texels {state['texels']:,} "
+            f"({state['avg_texels_per_gaussian']:.1f}/G) | res {{{hist}}} | "
+            f"route {active} | deferred_tex_ch {route['deferred_texture_channels']} | "
+            f"rtg enabled={state['rtg']['enabled']} interval={state['rtg']['refine_interval']} "
+            f"fraction={state['rtg']['refine_fraction']}"
+        )
+
     def texture_rtg_log_string(self):
         log = getattr(self, "_last_rtg_refine_log", None)
         if not log:
